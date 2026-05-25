@@ -1,0 +1,108 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.venv/
+venv/
+ENV/
+env/
+.venv*
+.env
+.env.local
+
+# Python testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+*.iws
+*.ipr
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# Flutter/Dart
+flutter_client/.dart_tool/
+flutter_client/build/
+flutter_client/.flutter-plugins
+flutter_client/.flutter-plugins-dependencies
+flutter_client/pubspec.lock
+flutter_client/.packages
+flutter_client/.metadata
+
+# Docker
+.docker/
+docker-compose.override.yml
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+.#*
+
+# Local development
+local.properties
+.gradle/
+*.class
+
+# Node modules (if used)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Large files / artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.out
+
+# Server-specific (keep only config templates)
+servers/*/world_templates/
+servers/*/worlds/
+servers/*/minecraftpe/
+servers/*/premium_cache/
+
+# Build artifacts
+*.jar
+*.war
+*.zip

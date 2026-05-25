@@ -1,0 +1,27 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Worker needs Docker CLI to control containers on the host via mounted socket.
+# Use `docker-cli` (the client binary). Avoid `docker.io` here because it may not
+# include the CLI when installed without recommends.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends docker-cli ca-certificates \
+    && command -v docker \
+    && docker --version \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir "uv_build>=0.11.7,<0.12.0"
+
+COPY pyproject.toml uv.lock README.md /app/
+COPY src /app/src
+
+RUN pip install --no-cache-dir -e .
+
+EXPOSE 9000
+
+CMD ["uvicorn", "blockhost_worker.main:app", "--host", "0.0.0.0", "--port", "9000"]

@@ -96,11 +96,8 @@ yarn-error.log
 *.exe
 *.out
 
-# Server-specific (keep only config templates)
-servers/*/world_templates/
-servers/*/worlds/
-servers/*/minecraftpe/
-servers/*/premium_cache/
+# Servers (large files)
+servers/
 
 # Build artifacts
 *.jar

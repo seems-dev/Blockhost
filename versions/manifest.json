@@ -12,7 +12,7 @@
         "sha256": ""
       }
     },
-    "1.21.130.30":{
+    "1.21.130":{
       "linux_x86_64":{
         "url":"https://www.minecraft.net/bedrockdedicatedserver/bin-linux/bedrock-server-1.21.130.3.zip",
         "sha256":""

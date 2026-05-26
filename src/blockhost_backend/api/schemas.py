@@ -71,6 +71,8 @@ class ServerOut(BaseModel):
     vm_provider: VMProvider
     vm_ipv4: str | None
     vm_port: int
+    owner_id: uuid.UUID
+    owner_nickname: str
     created_at: datetime
     last_activity: datetime
     mc_config: dict

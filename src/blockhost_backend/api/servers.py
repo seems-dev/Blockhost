@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import socket
 import uuid
+from contextlib import closing
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -35,6 +37,27 @@ from blockhost_backend.utils import generate_join_code
 router = APIRouter(prefix="/api/servers", tags=["servers"])
 
 _RUNTIME = BedrockRuntimeRegistry()
+
+
+def _server_to_out(server: Server, owner: User | None = None) -> ServerOut:
+    """Convert a Server object to ServerOut, including owner information."""
+    # If owner not provided, use the relationship (assumes it's loaded)
+    owner_obj = owner or server.owner
+    owner_nickname = owner_obj.nickname if owner_obj else "Unknown"
+    return ServerOut(
+        id=server.id,
+        world_name=server.world_name,
+        join_code=server.join_code,
+        state=server.state,
+        vm_provider=server.vm_provider,
+        vm_ipv4=server.vm_ipv4,
+        vm_port=server.vm_port,
+        owner_id=server.owner_id,
+        owner_nickname=owner_nickname,
+        created_at=server.created_at,
+        last_activity=server.last_activity,
+        mc_config=server.mc_config,
+    )
 
 
 def _server_dirs() -> tuple[Path, Path, Path]:
@@ -81,12 +104,55 @@ def _normalize_requested_version(requested_version: str | None) -> str | None:
     return rv
 
 
+def _is_port_available(port: int) -> bool:
+    """Check if a UDP port is actually available on the system.
+    
+    This verifies the port can be bound to, catching the case where:
+    - Database says port is free
+    - But system has a process listening on it
+    """
+    try:
+        with closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(('0.0.0.0', port))
+            return True
+    except OSError:
+        return False
+
+
 def _allocate_port(*, db: Session) -> int:
+    """Allocate a free UDP port for Bedrock server.
+    
+    FIXED: Checks both database allocation AND system availability.
+    This prevents "port in use" errors from other processes.
+    """
     settings = get_settings()
-    used = set(db.execute(select(Server.vm_port)).scalars().all())
-    return pick_free_udp_port(
-        port_range=PortRange(start=settings.bedrock_port_range_start, end=settings.bedrock_port_range_end),
-        used_ports=used,
+    
+    # Get database-allocated ports (filter out None)
+    used = set(
+        p for p in db.execute(select(Server.vm_port)).scalars().all() 
+        if p is not None
+    )
+    
+    port_range = PortRange(
+        start=settings.bedrock_port_range_start, 
+        end=settings.bedrock_port_range_end
+    )
+    
+    # Try each port in the range
+    for port in range(port_range.start, port_range.end + 1):
+        # Skip ports already in database
+        if port in used:
+            continue
+        
+        # Check if port is actually available on the system
+        if _is_port_available(port):
+            return port
+    
+    # No available ports found
+    raise RuntimeError(
+        f"No free UDP ports in range {port_range.start}-{port_range.end}. "
+        f"Database has {len(used)} allocated: {sorted(used)}"
     )
 
 
@@ -103,7 +169,39 @@ def _server_props_from_config(*, server: Server, port: int) -> BedrockServerProp
         level_name=cfg.get("level_name") or server.world_name,
         level_seed=cfg.get("level_seed"),
         server_port=port,
+        
     )
+
+
+def _start_bedrock_process(*, server: Server, settings) -> None:
+    """Start a Bedrock process and update server state.
+    
+    Extracted common logic to avoid duplication across create/start/toggle endpoints.
+    """
+    if not server.vm_port:
+        raise RuntimeError(f"Server {server.id} has no port allocated")
+    
+    if not (server.mc_config or {}).get("server_dir"):
+        raise RuntimeError(f"Server {server.id} has no server_dir configured")
+    
+    proc = _RUNTIME.ensure_process(
+        server_id=str(server.id),
+        server_dir=Path(server.mc_config["server_dir"]),
+        port=server.vm_port,
+        requested_version=str(server.mc_config.get("template_version") or ""),
+    )
+    proc.start(executable_name=settings.bedrock_executable_name or None)
+    info = proc.wait_for_ready()
+    
+    if server.mc_config.get("template_version") and info.actual_version:
+        requested = str(server.mc_config["template_version"])
+        if requested not in {"LATEST", "PREVIEW"} and not str(info.actual_version).startswith(requested):
+            proc.stop()
+            raise RuntimeError(f"Runtime version mismatch (requested={requested}, actual={info.actual_version})")
+    
+    server.vm_id = str(info.pid)
+    server.vm_ipv4 = settings.minecraft_public_host
+    server.state = ServerState.running
 
 
 @router.post("", response_model=ServerOut, status_code=status.HTTP_201_CREATED)
@@ -121,11 +219,13 @@ def create_server(
     config = payload.config.model_dump(exclude_none=True) if payload.config else {}
     config.pop("bedrock_image", None)  # Docker-only
 
+    # Allocate port FIRST with proper error handling
     try:
         port = _allocate_port(db=db)
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Failed to allocate UDP port: {e}")
 
+    # Create server with port set immediately
     server = Server(
         owner_id=user.id,
         world_name=payload.world_name,
@@ -133,12 +233,13 @@ def create_server(
         state=ServerState.created,
         vm_provider=VMProvider.local_bedrock,
         vm_ipv4=None,
-        vm_port=port,
+        vm_port=port,  # Port is set here
         mc_config=config,
     )
     db.add(server)
-    db.flush()
+    db.flush()  # Generate server.id
 
+    # Now set join code after server.id is available
     server.join_code = generate_join_code(user.id, server.id)
 
     versions_dir, servers_dir, _logs_dir = _server_dirs()
@@ -147,7 +248,12 @@ def create_server(
         _ensure_version_on_disk(versions_dir=versions_dir, requested_version=requested_version)
         version_name, version_dir = resolve_version_dir(versions_dir=versions_dir, requested=requested_version)
         server_dir = materialize_server_dir(version_dir=version_dir, servers_dir=servers_dir, server_id=str(server.id))
-        write_server_properties(server_dir / "server.properties", _server_props_from_config(server=server, port=port))
+        
+        # Write properties with the allocated port
+        write_server_properties(
+            server_dir / "server.properties", 
+            _server_props_from_config(server=server, port=server.vm_port)
+        )
 
         cfg = dict(server.mc_config or {})
         cfg["runtime_mode"] = "process"
@@ -155,37 +261,106 @@ def create_server(
         cfg["server_dir"] = str(server_dir)
         server.mc_config = cfg
     except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=503, detail=f"Failed to materialize Bedrock server folder: {e}")
 
     try:
-        proc = _RUNTIME.ensure_process(
-            server_id=str(server.id),
-            server_dir=Path(server.mc_config["server_dir"]),
-            port=server.vm_port,
-            requested_version=str(server.mc_config.get("template_version") or ""),
-        )
-        proc.start(executable_name=settings.bedrock_executable_name or None)
-        info = proc.wait_for_ready()
-        if server.mc_config.get("template_version") and info.actual_version:
-            requested = str(server.mc_config["template_version"])
-            if requested not in {"LATEST", "PREVIEW"} and not str(info.actual_version).startswith(requested):
-                proc.stop()
-                raise RuntimeError(f"Runtime version mismatch (requested={requested}, actual={info.actual_version})")
-        server.vm_ipv4 = settings.minecraft_public_host
-        server.vm_id = str(info.pid)
-        server.state = ServerState.running
+        # Ensure port is set before passing to runtime
+        if not server.vm_port:
+            raise RuntimeError("Port not allocated before process startup")
+        
+        _start_bedrock_process(server=server, settings=settings)
     except Exception as e:
         server.state = ServerState.suspended
+        db.rollback()
         raise HTTPException(status_code=503, detail=f"Failed to start Bedrock process: {e}")
+    
     db.commit()
     db.refresh(server)
-    return ServerOut.model_validate(server, from_attributes=True)
+    return _server_to_out(server, owner=user)
+
+
+def _discover_filesystem_servers(*, servers_dir: Path, user: User, db: Session) -> list[Server]:
+    """
+    Discover server folders on the filesystem that aren't in the database.
+    Creates database entries for newly discovered servers.
+    """
+    discovered = []
+    if not servers_dir.exists():
+        return discovered
+
+    # Get existing server IDs in the database
+    existing_ids = {str(s) for s in db.execute(select(Server.id)).scalars().all()}
+
+    # Scan filesystem for server folders
+    for server_dir in servers_dir.iterdir():
+        if not server_dir.is_dir():
+            continue
+
+        server_id_str = server_dir.name
+        try:
+            # Validate it's a valid UUID
+            server_uuid = uuid.UUID(server_id_str)
+        except (ValueError, AttributeError):
+            continue
+
+        # Skip if already in database
+        if server_id_str in existing_ids:
+            continue
+
+        # Extract world name and port from server.properties
+        props_file = server_dir / "server.properties"
+        world_name = "Unnamed Server"
+        port = 19132  # Default port
+        
+        if props_file.exists():
+            try:
+                content = props_file.read_text(encoding="utf-8")
+                for line in content.split("\n"):
+                    if line.startswith("level-name="):
+                        world_name = line.split("=", 1)[1].strip()
+                    elif line.startswith("server-port="):
+                        try:
+                            port = int(line.split("=", 1)[1].strip())
+                        except ValueError:
+                            pass
+            except Exception:
+                pass
+
+        # Create database entry for discovered server
+        new_server = Server(
+            id=server_uuid,
+            owner_id=user.id,
+            world_name=world_name,
+            join_code=generate_join_code(user.id, server_uuid),
+            state=ServerState.suspended,  # Mark as suspended since it's pre-existing
+            vm_provider=VMProvider.local_bedrock,
+            vm_ipv4=get_settings().minecraft_public_host,
+            vm_port=port,
+            mc_config={"server_dir": str(server_dir)},
+        )
+        db.add(new_server)
+        discovered.append(new_server)
+
+    if discovered:
+        db.commit()
+
+    return discovered
 
 
 @router.get("", response_model=list[ServerOut])
 def list_servers(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[ServerOut]:
+    # Get servers from database
     servers = db.execute(select(Server).where(Server.owner_id == user.id)).scalars().all()
-    return [ServerOut.model_validate(s, from_attributes=True) for s in servers]
+    
+    # Discover and add any servers from the filesystem that aren't in the database
+    versions_dir, servers_dir, _logs_dir = _server_dirs()
+    discovered = _discover_filesystem_servers(servers_dir=servers_dir, user=user, db=db)
+    
+    # Combine database servers and newly discovered ones
+    all_servers = list(servers) + discovered
+    
+    return [_server_to_out(s, owner=user) for s in all_servers]
 
 
 @router.get("/{server_id}", response_model=ServerDetail)
@@ -197,7 +372,7 @@ def get_server(server_id: str, user: User = Depends(get_current_user), db: Sessi
     server = db.get(Server, server_uuid)
     if not server or server.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Server not found")
-    base = ServerOut.model_validate(server, from_attributes=True)
+    base = _server_to_out(server, owner=user)
     return ServerDetail(
         **base.model_dump(),
         minecraft_host=(server.vm_ipv4 or get_settings().minecraft_public_host),
@@ -218,12 +393,14 @@ def start_server(server_id: str, user: User = Depends(get_current_user), db: Ses
     settings = get_settings()
     server.vm_provider = VMProvider.local_bedrock
 
+    # Ensure port is allocated
     if not server.vm_port:
         try:
             server.vm_port = _allocate_port(db=db)
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"Failed to allocate UDP port: {e}")
 
+    # Ensure server directory exists
     if not (server.mc_config or {}).get("server_dir"):
         versions_dir, servers_dir, _logs_dir = _server_dirs()
         try:
@@ -241,22 +418,22 @@ def start_server(server_id: str, user: User = Depends(get_current_user), db: Ses
             server.mc_config = cfg
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"Failed to materialize Bedrock server folder: {e}")
+    else:
+        # For pre-existing servers, update server.properties with the current port
+        try:
+            server_dir = Path(server.mc_config["server_dir"])
+            write_server_properties(
+                server_dir / "server.properties", _server_props_from_config(server=server, port=server.vm_port)
+            )
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Failed to update server.properties: {e}")
 
     try:
-        proc = _RUNTIME.ensure_process(
-            server_id=str(server.id),
-            server_dir=Path(server.mc_config["server_dir"]),
-            port=server.vm_port,
-            requested_version=str(server.mc_config.get("template_version") or ""),
-        )
-        proc.start(executable_name=settings.bedrock_executable_name or None)
-        info = proc.wait_for_ready()
-        server.vm_id = str(info.pid)
-        server.vm_ipv4 = settings.minecraft_public_host
-        server.state = ServerState.running
+        _start_bedrock_process(server=server, settings=settings)
     except Exception as e:
         server.state = ServerState.suspended
         raise HTTPException(status_code=503, detail=f"Failed to start Bedrock process: {e}")
+    
     db.commit()
     return ServerActionResponse(id=server.id, state=server.state)
 
@@ -301,6 +478,7 @@ def toggle_server(
         server.state = ServerState.suspended
     else:
         try:
+            # Allocate port if missing
             if not server.vm_port:
                 server.vm_port = _allocate_port(db=db)
 
@@ -323,21 +501,11 @@ def toggle_server(
                 _server_props_from_config(server=server, port=server.vm_port),
             )
 
-            proc = _RUNTIME.ensure_process(
-                server_id=str(server.id),
-                server_dir=Path(server.mc_config["server_dir"]),
-                port=server.vm_port,
-                requested_version=str(server.mc_config.get("template_version") or ""),
-            )
-            proc.start(executable_name=settings.bedrock_executable_name or None)
-            info = proc.wait_for_ready()
-            server.vm_id = str(info.pid)
-            server.vm_ipv4 = settings.minecraft_public_host
-            server.vm_provider = VMProvider.local_bedrock
-            server.state = ServerState.running
+            _start_bedrock_process(server=server, settings=settings)
         except Exception as e:
             server.state = ServerState.suspended
             raise HTTPException(status_code=503, detail=f"Failed to start Bedrock process: {e}")
+    
     db.commit()
     return ServerActionResponse(id=server.id, state=server.state)
 
@@ -400,7 +568,8 @@ def get_server_stats(server_id: str, user: User = Depends(get_current_user), db:
 
     settings = get_settings()
     host = server.vm_ipv4 or settings.minecraft_public_host
-    port = server.vm_port or settings.minecraft_port
+    # Use allocated port, fallback to configured port
+    port = server.vm_port or settings.bedrock_port_range_start
 
     try:
         pong = bedrock_unconnected_ping(host="127.0.0.1", port=port, timeout_seconds=1.0)

@@ -17,7 +17,10 @@ class Settings(BaseSettings):
     jwt_access_token_expire_seconds: int = 60 * 60 * 24
     jwt_refresh_token_expire_seconds: int = 60 * 60 * 24 * 30
 
+    google_client_id: str | None = None
+
     minecraft_public_host: str = "192.168.29.102"
+    minecraft_public_domain: str = "localhost"  # User's domain (e.g., "yourname.example.com" or "localhost")
     minecraft_port: int = 19132
 
     # Local Bedrock runtime (direct process spawning).

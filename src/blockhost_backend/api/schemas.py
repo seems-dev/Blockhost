@@ -38,6 +38,10 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class GoogleLoginRequest(BaseModel):
+    id_token: str
+
+
 class RefreshRequest(BaseModel):
     refresh_token: str
 
@@ -67,6 +71,7 @@ class ServerOut(BaseModel):
     id: uuid.UUID
     world_name: str
     join_code: str
+    subdomain: str  # e.g., "srv-abc123xyz"
     state: ServerState
     vm_provider: VMProvider
     vm_ipv4: str | None
@@ -76,6 +81,7 @@ class ServerOut(BaseModel):
     created_at: datetime
     last_activity: datetime
     mc_config: dict
+    shareable_address: str  # e.g., "srv-abc123xyz.blockhost.com:19132"
 
 
 class ServerDetail(ServerOut):
@@ -86,6 +92,13 @@ class ServerDetail(ServerOut):
 class ServerActionResponse(BaseModel):
     id: uuid.UUID
     state: ServerState
+
+
+class BedrockLogEventOut(BaseModel):
+    raw: str
+    level: str | None = None
+    event_type: str | None = None
+    player_name: str | None = None
 
 
 class BedrockServerStats(BaseModel):
@@ -102,6 +115,18 @@ class BedrockServerStats(BaseModel):
     players_max: int | None = None
     server_id: int | None = None
     gamemode: str | None = None
+    # Live stats from stdout parsing + process sampling
+    online_players: list[str] = []
+    tps: float | None = None
+    tick_ms: float | None = None
+    cpu_usage: float | None = None
+    ram_usage_mb: float | None = None
+    uptime_seconds: float | None = None
+    log_lines_total: int = 0
+    last_log_line: str | None = None
+    last_event: str | None = None
+    recent_events: list[BedrockLogEventOut] = []
+    process_running: bool = False
 
 
 class ServerConfigOut(BaseModel):
@@ -111,3 +136,45 @@ class ServerConfigOut(BaseModel):
 
 class ServerConfigUpdateRequest(BaseModel):
     config: BedrockConfig
+
+
+class PlayerActionRequest(BaseModel):
+    player: str = Field(min_length=1, max_length=64)
+
+
+class TeleportRequest(BaseModel):
+    player: str = Field(min_length=1, max_length=64)
+    x: float
+    y: float
+    z: float
+
+
+class OpRequest(BaseModel):
+    player: str = Field(min_length=1, max_length=64)
+    grant: bool = True
+
+
+class GamemodeRequest(BaseModel):
+    player: str = Field(min_length=1, max_length=64)
+    mode: str = Field(pattern=r"^(survival|creative|adventure|spectator)$")
+
+
+class TimeRequest(BaseModel):
+    value: str = Field(min_length=1, max_length=32)
+
+
+class WeatherRequest(BaseModel):
+    weather: str = Field(pattern=r"^(clear|rain|thunder)$")
+
+
+class SayRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=256)
+
+
+class ServerCommandResponse(BaseModel):
+    ok: bool
+    command: str
+
+
+class BlocklistOut(BaseModel):
+    players: list[str]

@@ -11,7 +11,9 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
+from blockhost_backend.minecraft.bedrock_log_parser import BedrockLiveStats, BedrockLogParser
 from blockhost_backend.minecraft.bedrock_ping import bedrock_unconnected_ping, parse_bedrock_pong_payload
+from blockhost_backend.runtime.process_metrics import ProcessMetricsSampler
 
 #bedrock_process.py
 _COMMON_BEDROCK_BINARIES = ("bedrock_server", "bedrock_server.exe")
@@ -91,7 +93,11 @@ class BedrockProcess:
 
         self._proc: subprocess.Popen[str] | None = None
         self._log_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+        self._stdin_lock = threading.Lock()
         self._logs: deque[str] = deque(maxlen=4000)
+        self._log_parser = BedrockLogParser()
+        self._metrics_sampler: ProcessMetricsSampler | None = None
         self._reader_thread: threading.Thread | None = None
         self._actual_version: str | None = None
         self._assigned_port: int | None = None
@@ -117,8 +123,20 @@ class BedrockProcess:
             return list(self._logs)[-tail:]
 
     def _append_log(self, line: str) -> None:
+        cleaned = line.rstrip("\n")
         with self._log_lock:
-            self._logs.append(line.rstrip("\n"))
+            self._logs.append(cleaned)
+        with self._stats_lock:
+            self._log_parser.parse_line(cleaned)
+
+    def get_live_stats(self) -> BedrockLiveStats:
+        with self._stats_lock:
+            stats = self._log_parser.stats
+            if self._metrics_sampler is not None:
+                metrics = self._metrics_sampler.sample()
+                stats.cpu_usage_percent = metrics.cpu_usage_percent
+                stats.ram_usage_mb = metrics.ram_usage_mb
+            return stats
 
     def _find_executable(self, *, preferred_name: str | None = None) -> Path:
         candidates: list[str] = []
@@ -213,6 +231,8 @@ class BedrockProcess:
             preexec_fn=os.setsid if os.name != "nt" else None,  # Create process group (for cleaner kills)
         )
         self._proc = proc
+        self._log_parser.reset()
+        self._metrics_sampler = ProcessMetricsSampler(proc.pid)
 
         def _reader() -> None:
             """Read process output in a non-daemon thread."""
@@ -241,6 +261,22 @@ class BedrockProcess:
             requested_version=self.requested_version,
             actual_version=self._actual_version,
         )
+
+    def send_command(self, command: str) -> None:
+        """Send a console command to the running Bedrock server via stdin."""
+        if not self.is_running():
+            raise RuntimeError("Bedrock server is not running")
+
+        cmd = command.strip()
+        if not cmd or "\n" in cmd or "\r" in cmd:
+            raise ValueError("Invalid command")
+
+        with self._stdin_lock:
+            if self._proc is None or self._proc.stdin is None:
+                raise RuntimeError("Bedrock server stdin is unavailable")
+            self._append_log(f"[blockhost] command> {cmd}")
+            self._proc.stdin.write(f"{cmd}\n")
+            self._proc.stdin.flush()
 
     def stop(self, *, timeout_seconds: float = 30.0) -> None:
         if not self._proc:
@@ -367,6 +403,13 @@ class BedrockRuntimeRegistry:
             proc = self._procs.pop(server_id, None)
         if proc:
             proc.stop()
+
+
+_RUNTIME = BedrockRuntimeRegistry()
+
+
+def get_runtime_registry() -> BedrockRuntimeRegistry:
+    return _RUNTIME
 
 
 _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[.-].*)?$")

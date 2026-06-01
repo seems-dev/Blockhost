@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-
+#bedrock_properties.py
 
 @dataclass(frozen=True)
 class BedrockServerProperties:
@@ -15,6 +15,7 @@ class BedrockServerProperties:
     level_name: str | None = None
     level_seed: str | None = None
     server_port: int = 19132
+    
 
 
 def write_server_properties(path: Path, props: BedrockServerProperties) -> None:
@@ -43,9 +44,17 @@ def write_server_properties(path: Path, props: BedrockServerProperties) -> None:
     put("level-seed", props.level_seed)
 
     # Bedrock uses UDP. Set both IPv4 and IPv6 port keys.
-    put("server-port", int(props.server_port))
-    put("server-portv6", int(props.server_port))
 
+    ipv4_port = int(props.server_port)
+    ipv6_port = ipv4_port + 1
+
+# Ensure they're different
+    if ipv6_port == ipv4_port:
+        ipv6_port = ipv4_port + 1
+
+    put("server-port", ipv4_port)
+    put("server-portv6", ipv6_port)
+    print("server-portv6",ipv6_port)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from blockhost_backend.minecraft.bedrock_ping import bedrock_unconnected_ping, parse_bedrock_pong_payload
 
-
+#bedrock_process.py
 _COMMON_BEDROCK_BINARIES = ("bedrock_server", "bedrock_server.exe")
 _BASE_PORT = 19132
 _PORT_RANGE = range(_BASE_PORT, _BASE_PORT + 100)  # Support up to 100 servers
@@ -26,7 +26,8 @@ def _is_port_in_use(port: int) -> bool:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if os.name != "nt":  # Unix/Linux/macOS
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        sock.bind(("127.0.0.1", port))
+        # Try binding to all interfaces (0.0.0.0) like Bedrock does
+        sock.bind(("0.0.0.0", port))
         sock.close()
         return False  # Port is free
     except OSError:
@@ -66,7 +67,7 @@ def _update_server_properties(server_dir: Path, port: int) -> None:
         content = props_file.read_text()
         # Replace both server-port and server-portv6
         content = re.sub(r"server-port=\d+", f"server-port={port}", content)
-        content = re.sub(r"server-portv6=\d+", f"server-portv6={port}", content)
+        content = re.sub(r"server-portv6=\d+", f"server-portv6={port+1}", content)
         props_file.write_text(content)
     except Exception as e:
         print(f"[blockhost] warning: failed to update server.properties: {e}")
@@ -94,6 +95,7 @@ class BedrockProcess:
         self._reader_thread: threading.Thread | None = None
         self._actual_version: str | None = None
         self._assigned_port: int | None = None
+        self._ready_event = threading.Event()  # Signal when process is ready
 
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
@@ -135,6 +137,7 @@ class BedrockProcess:
         )
 
     def start(self, *, executable_name: str | None = None) -> BedrockRuntimeInfo:
+        """FIXED: Properly start the Bedrock process with daemon-safe logging."""
         if self.is_running():
             raise RuntimeError("Bedrock server already running")
 
@@ -148,10 +151,38 @@ class BedrockProcess:
         except Exception:
             pass
 
-        # Clean up stale processes
-        self._append_log("[blockhost] cleaning up stale bedrock_server processes")
-        _kill_stale_bedrock_processes()
-        time.sleep(0.5)  # Give OS time to release the port
+        # Clean up any stale process for THIS SPECIFIC SERVER (don't kill other servers)
+        # Use fuser to find processes using the port and kill only those
+        self._append_log("[blockhost] checking for stale processes on this server's port")
+        try:
+            result = subprocess.run(
+                ["fuser", "-k", f"{self.port}/udp"],
+                capture_output=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                self._append_log("[blockhost] killed stale process using this port")
+                time.sleep(1.0)
+        except Exception as e:
+            self._append_log(f"[blockhost] fuser not available or failed: {e}, trying alternative method")
+            # Fallback: try lsof
+            try:
+                result = subprocess.run(
+                    ["lsof", "-ti", f":{self.port}"],
+                    capture_output=True,
+                    timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    pids = result.stdout.decode().strip().split()
+                    for pid in pids:
+                        try:
+                            os.kill(int(pid), 9)
+                            self._append_log(f"[blockhost] killed stale process {pid} using port {self.port}")
+                        except Exception:
+                            pass
+                    time.sleep(1.0)
+            except Exception:
+                pass
 
         # Find an available port
         self._append_log(f"[blockhost] checking port availability (preferred: {self.port})")
@@ -168,6 +199,9 @@ class BedrockProcess:
         _update_server_properties(self.server_dir, assigned_port)
 
         self._append_log(f"[blockhost] starting bedrock_server: {exe.name} (port={assigned_port})")
+        
+        # FIXED: Don't use daemon thread. Use non-daemon thread so it stays alive
+        #        and properly consumes stdout even if main thread continues.
         proc = subprocess.Popen(
             [str(exe)],
             cwd=str(self.server_dir),
@@ -175,17 +209,28 @@ class BedrockProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1,
+            bufsize=1,  # Line buffering
+            preexec_fn=os.setsid if os.name != "nt" else None,  # Create process group (for cleaner kills)
         )
         self._proc = proc
 
         def _reader() -> None:
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                self._append_log(line)
-            self._append_log("[blockhost] process output closed")
+            """Read process output in a non-daemon thread."""
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    self._append_log(line)
+            except Exception as e:
+                self._append_log(f"[blockhost] log reader error: {e}")
+            finally:
+                self._append_log("[blockhost] process output closed")
 
-        t = threading.Thread(target=_reader, name=f"bedrock-log-{self.server_id}", daemon=True)
+        # FIXED: daemon=False so the thread keeps the process alive
+        t = threading.Thread(
+            target=_reader, 
+            name=f"bedrock-log-{self.server_id}", 
+            daemon=False  # CRITICAL FIX: Non-daemon thread
+        )
         t.start()
         self._reader_thread = t
 
@@ -222,6 +267,9 @@ class BedrockProcess:
         self._append_log("[blockhost] bedrock_server did not exit; terminating")
         try:
             proc.terminate()
+            time.sleep(2)
+            if proc.poll() is None:
+                proc.kill()
         except Exception:
             pass
 
@@ -229,34 +277,51 @@ class BedrockProcess:
         """
         Wait until the server responds to RakNet unconnected ping.
         Also captures the runtime-reported version.
+        
+        FIXED: Better error messages and process state checking.
         """
         if self._assigned_port is None:
             raise RuntimeError("Server not started yet (assigned_port is None)")
 
         start = time.time()
         last_error: str | None = None
+        ping_attempt = 0
+        
         while time.time() - start < timeout_seconds:
+            # FIXED: Check if process has exited with better diagnostics
             if self._proc and self._proc.poll() is not None:
-                tail = "\n".join(self.read_logs(tail=80))
-                raise RuntimeError(f"Bedrock process exited during startup.\n\nLast logs:\n{tail}")
+                returncode = self._proc.returncode
+                tail = "\n".join(self.read_logs(tail=100))
+                raise RuntimeError(
+                    f"Bedrock process exited during startup (exit code: {returncode}).\n\n"
+                    f"Last logs:\n{tail}"
+                )
+            
             try:
-                pong = bedrock_unconnected_ping(host="127.0.0.1", port=self._assigned_port, timeout_seconds=0.5)
+                ping_attempt += 1
+                pong = bedrock_unconnected_ping(
+                    host="127.0.0.1", 
+                    port=self._assigned_port, 
+                    timeout_seconds=0.5
+                )
                 parsed = parse_bedrock_pong_payload(pong.payload)
                 version = parsed.get("version")
                 if isinstance(version, str) and version.strip():
                     self._actual_version = version.strip()
                     self._append_log(f"[blockhost] detected runtime version: {self._actual_version}")
+                
+                self._append_log(f"[blockhost] server ready (ping success on attempt {ping_attempt})")
                 break
             except Exception as e:
                 last_error = str(e)
                 time.sleep(0.25)
 
         if self._actual_version is None and last_error:
-            self._append_log(f"[blockhost] bedrock ping not ready yet: {last_error}")
+            self._append_log(f"[blockhost] bedrock ping not responding after {ping_attempt} attempts: {last_error}")
 
         pid = self.pid()
         if pid is None:
-            raise RuntimeError("Bedrock process not running")
+            raise RuntimeError("Bedrock process not running after wait_for_ready")
 
         return BedrockRuntimeInfo(
             pid=pid,
@@ -308,13 +373,18 @@ _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[.-].*)?$")
 
 
 def resolve_version_dir(*, versions_dir: Path, requested: str | None) -> tuple[str, Path]:
+    """FIXED: Better error messages."""
     versions_dir.mkdir(parents=True, exist_ok=True)
 
     if requested and requested.strip() and requested.strip().upper() not in {"LATEST", "PREVIEW"}:
         ver = requested.strip()
         path = versions_dir / ver
         if not path.exists() or not path.is_dir():
-            raise FileNotFoundError(f"Requested Bedrock version template not found: {path}")
+            available = [d.name for d in versions_dir.iterdir() if d.is_dir()]
+            raise FileNotFoundError(
+                f"Requested Bedrock version template not found: {path}\n"
+                f"Available versions: {available if available else 'NONE'}"
+            )
         return ver, path
 
     # Pick "latest" by semver sort (fallback to lexical).
@@ -326,8 +396,13 @@ def resolve_version_dir(*, versions_dir: Path, requested: str | None) -> tuple[s
         m = _SEMVER_RE.match(name)
         key = (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
         candidates.append((key, name))
+    
     if not candidates:
-        raise FileNotFoundError(f"No Bedrock versions found in {versions_dir} (expected versions/<version>/)")
+        raise FileNotFoundError(
+            f"No Bedrock versions found in {versions_dir}\n"
+            f"Expected structure: {versions_dir}/<version>/bedrock_server\n"
+            f"Available directories: {list(versions_dir.iterdir())}"
+        )
 
     candidates.sort(key=lambda item: (item[0] is None, item[0] or (0, 0, 0), item[1]))
     chosen = candidates[-1][1]
@@ -335,9 +410,23 @@ def resolve_version_dir(*, versions_dir: Path, requested: str | None) -> tuple[s
 
 
 def materialize_server_dir(*, version_dir: Path, servers_dir: Path, server_id: str) -> Path:
+    """FIXED: Better error handling and cleanup."""
     servers_dir.mkdir(parents=True, exist_ok=True)
     server_dir = servers_dir / server_id
+    
     if server_dir.exists():
+        # If it already exists, that's OK - return it
         return server_dir
-    shutil.copytree(version_dir, server_dir)
+    
+    if not version_dir.exists():
+        raise FileNotFoundError(f"Version directory does not exist: {version_dir}")
+    
+    try:
+        shutil.copytree(version_dir, server_dir)
+    except Exception as e:
+        # Clean up partial copy if something went wrong
+        if server_dir.exists():
+            shutil.rmtree(server_dir, ignore_errors=True)
+        raise RuntimeError(f"Failed to copy version template to {server_dir}: {e}")
+    
     return server_dir

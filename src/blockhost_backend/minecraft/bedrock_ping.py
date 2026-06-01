@@ -5,7 +5,7 @@ import socket
 import struct
 import time
 from dataclasses import dataclass
-
+#bedrock_ping.py
 
 _RAKNET_MAGIC = bytes.fromhex("00ffff00fefefefefdfdfdfd12345678")
 

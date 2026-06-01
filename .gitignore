@@ -103,3 +103,5 @@ servers/
 *.jar
 *.war
 *.zip
+versions/*
+!versions/manifest.json

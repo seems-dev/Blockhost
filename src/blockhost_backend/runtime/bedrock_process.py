@@ -9,11 +9,11 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Any, Callable
 
-from blockhost_backend.minecraft.bedrock_log_parser import BedrockLiveStats, BedrockLogParser
 from blockhost_backend.minecraft.bedrock_ping import bedrock_unconnected_ping, parse_bedrock_pong_payload
-from blockhost_backend.runtime.process_metrics import ProcessMetricsSampler
 
 #bedrock_process.py
 _COMMON_BEDROCK_BINARIES = ("bedrock_server", "bedrock_server.exe")
@@ -93,15 +93,28 @@ class BedrockProcess:
 
         self._proc: subprocess.Popen[str] | None = None
         self._log_lock = threading.Lock()
-        self._stats_lock = threading.Lock()
-        self._stdin_lock = threading.Lock()
-        self._logs: deque[str] = deque(maxlen=4000)
-        self._log_parser = BedrockLogParser()
-        self._metrics_sampler: ProcessMetricsSampler | None = None
+        self._logs: deque[dict[str, Any]] = deque(maxlen=4000)
+        self._log_listeners: list[Callable[[dict[str, Any]], None]] = []
+        self.online_players: set[str] = set()
         self._reader_thread: threading.Thread | None = None
         self._actual_version: str | None = None
         self._assigned_port: int | None = None
         self._ready_event = threading.Event()  # Signal when process is ready
+        self._start_time: float | None = None
+
+    def send_command(self, cmd: str) -> None:
+        if not self._proc or self._proc.poll() is not None:
+            raise RuntimeError("Bedrock server is not running")
+        if self._proc.stdin:
+            self._proc.stdin.write(cmd.strip() + "\n")
+            self._proc.stdin.flush()
+            self._append_log(f"[blockhost] sent command: {cmd.strip()}")
+
+    def uptime_seconds(self) -> int | None:
+        if self._start_time is None or not self.is_running():
+            return None
+        return int(time.time() - self._start_time)
+
 
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
@@ -116,27 +129,50 @@ class BedrockProcess:
         """Return the actual port assigned to this server (may differ from requested port)."""
         return self._assigned_port
 
-    def read_logs(self, *, tail: int = 200) -> list[str]:
+    def read_logs(self, *, tail: int = 200) -> list[dict[str, Any]]:
         with self._log_lock:
             if tail <= 0:
                 return list(self._logs)
             return list(self._logs)[-tail:]
 
-    def _append_log(self, line: str) -> None:
-        cleaned = line.rstrip("\n")
+    def add_log_listener(self, listener: Callable[[dict[str, Any]], None]) -> None:
         with self._log_lock:
-            self._logs.append(cleaned)
-        with self._stats_lock:
-            self._log_parser.parse_line(cleaned)
+            if listener not in self._log_listeners:
+                self._log_listeners.append(listener)
 
-    def get_live_stats(self) -> BedrockLiveStats:
-        with self._stats_lock:
-            stats = self._log_parser.stats
-            if self._metrics_sampler is not None:
-                metrics = self._metrics_sampler.sample()
-                stats.cpu_usage_percent = metrics.cpu_usage_percent
-                stats.ram_usage_mb = metrics.ram_usage_mb
-            return stats
+    def remove_log_listener(self, listener: Callable[[dict[str, Any]], None]) -> None:
+        with self._log_lock:
+            if listener in self._log_listeners:
+                self._log_listeners.remove(listener)
+
+    def _append_log(self, line: str) -> None:
+        line = line.rstrip("\n")
+        entry = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "line": line,
+        }
+        
+        # Basic log parsing for stats
+        if "Player connected: " in line:
+            try:
+                name = line.split("Player connected: ")[1].split(",")[0].strip()
+                self.online_players.add(name)
+            except Exception:
+                pass
+        elif "Player disconnected: " in line:
+            try:
+                name = line.split("Player disconnected: ")[1].split(",")[0].strip()
+                self.online_players.discard(name)
+            except Exception:
+                pass
+
+        with self._log_lock:
+            self._logs.append(entry)
+            for listener in self._log_listeners:
+                try:
+                    listener(entry)
+                except Exception as e:
+                    print(f"[blockhost] error in log listener: {e}")
 
     def _find_executable(self, *, preferred_name: str | None = None) -> Path:
         candidates: list[str] = []
@@ -217,28 +253,36 @@ class BedrockProcess:
         _update_server_properties(self.server_dir, assigned_port)
 
         self._append_log(f"[blockhost] starting bedrock_server: {exe.name} (port={assigned_port})")
-        
-        # FIXED: Don't use daemon thread. Use non-daemon thread so it stays alive
-        #        and properly consumes stdout even if main thread continues.
+
+        cmd = [str(exe)]
+        if os.name != "nt" and shutil.which("stdbuf"):
+            cmd = ["stdbuf", "-oL", str(exe)]
+            self._append_log("[blockhost] using stdbuf for line-buffered stdout")
+
         proc = subprocess.Popen(
-            [str(exe)],
+            cmd,
             cwd=str(self.server_dir),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,  # Line buffering
             preexec_fn=os.setsid if os.name != "nt" else None,  # Create process group (for cleaner kills)
         )
         self._proc = proc
-        self._log_parser.reset()
-        self._metrics_sampler = ProcessMetricsSampler(proc.pid)
+        self._start_time = time.time()
+
 
         def _reader() -> None:
             """Read process output in a non-daemon thread."""
             try:
                 assert proc.stdout is not None
-                for line in proc.stdout:
+                while True:
+                    line = proc.stdout.readline()
+                    if line == "":
+                        break
                     self._append_log(line)
             except Exception as e:
                 self._append_log(f"[blockhost] log reader error: {e}")
@@ -261,22 +305,6 @@ class BedrockProcess:
             requested_version=self.requested_version,
             actual_version=self._actual_version,
         )
-
-    def send_command(self, command: str) -> None:
-        """Send a console command to the running Bedrock server via stdin."""
-        if not self.is_running():
-            raise RuntimeError("Bedrock server is not running")
-
-        cmd = command.strip()
-        if not cmd or "\n" in cmd or "\r" in cmd:
-            raise ValueError("Invalid command")
-
-        with self._stdin_lock:
-            if self._proc is None or self._proc.stdin is None:
-                raise RuntimeError("Bedrock server stdin is unavailable")
-            self._append_log(f"[blockhost] command> {cmd}")
-            self._proc.stdin.write(f"{cmd}\n")
-            self._proc.stdin.flush()
 
     def stop(self, *, timeout_seconds: float = 30.0) -> None:
         if not self._proc:
@@ -327,7 +355,8 @@ class BedrockProcess:
             # FIXED: Check if process has exited with better diagnostics
             if self._proc and self._proc.poll() is not None:
                 returncode = self._proc.returncode
-                tail = "\n".join(self.read_logs(tail=100))
+                log_entries = self.read_logs(tail=100)
+                tail = "\n".join(entry.get("line", "") for entry in log_entries)
                 raise RuntimeError(
                     f"Bedrock process exited during startup (exit code: {returncode}).\n\n"
                     f"Last logs:\n{tail}"
@@ -404,12 +433,14 @@ class BedrockRuntimeRegistry:
         if proc:
             proc.stop()
 
+    def send_command(self, *, server_id: str, cmd: str) -> None:
+        with self._lock:
+            proc = self._procs.get(server_id)
+        if proc:
+            proc.send_command(cmd)
+        else:
+            raise RuntimeError("Server process not found in runtime registry")
 
-_RUNTIME = BedrockRuntimeRegistry()
-
-
-def get_runtime_registry() -> BedrockRuntimeRegistry:
-    return _RUNTIME
 
 
 _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[.-].*)?$")

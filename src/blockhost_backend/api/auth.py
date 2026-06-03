@@ -6,10 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-import requests
-
-from blockhost_backend.api.schemas import AuthResponse, GoogleLoginRequest, LoginRequest, RefreshRequest, SignupRequest, UserOut
-from blockhost_backend.config.config_manager import Settings, get_settings
+from blockhost_backend.api.schemas import AuthResponse, LoginRequest, RefreshRequest, SignupRequest, UserOut
+from blockhost_backend.config.config_manager import get_settings
 from blockhost_backend.core.security import (
     TokenError,
     create_access_token,
@@ -78,63 +76,6 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)) -> AuthRespons
     access_token = create_access_token(subject=str(user.id), expires_seconds=settings.jwt_access_token_expire_seconds)
     refresh_token = create_refresh_token(subject=str(user.id), expires_seconds=settings.jwt_refresh_token_expire_seconds)
 
-    return AuthResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        user=UserOut(
-            id=user.id,
-            email=user.email,
-            nickname=user.nickname,
-            referrer_code=user.referrer_code,
-            blockcoin_balance=user.blockcoin_balance,
-            subscription_tier=user.subscription_tier,
-        ),
-    )
-
-
-def _verify_google_id_token(id_token: str, settings: Settings) -> dict:
-    resp = requests.get(
-        "https://oauth2.googleapis.com/tokeninfo",
-        params={"id_token": id_token},
-        timeout=10,
-    )
-    if resp.status_code != 200:
-        raise HTTPException(status_code=401, detail="Invalid Google ID token")
-    payload = resp.json()
-    if payload.get("email_verified") not in ("true", True):
-        raise HTTPException(status_code=401, detail="Google email is not verified")
-    if settings.google_client_id:
-        audience = payload.get("aud")
-        if audience != settings.google_client_id:
-            raise HTTPException(status_code=401, detail="Google ID token audience mismatch")
-    return payload
-
-
-@router.post("/google", response_model=AuthResponse)
-def google_login(payload: GoogleLoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
-    settings = get_settings()
-    info = _verify_google_id_token(payload.id_token, settings)
-    email = str(info.get("email", "")).lower()
-    if not email:
-        raise HTTPException(status_code=400, detail="Google token did not contain email")
-
-    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
-    if not user:
-        user = User(
-            email=email,
-            phone=None,
-            nickname=info.get("name") or email.split("@")[0],
-            auth_hash=hash_password(uuid.uuid4().hex),
-            referrer_code=_unique_referrer_code(db),
-            blockcoin_balance=0,
-        )
-        db.add(user)
-        db.flush()
-        db.commit()
-        db.refresh(user)
-
-    access_token = create_access_token(subject=str(user.id), expires_seconds=settings.jwt_access_token_expire_seconds)
-    refresh_token = create_refresh_token(subject=str(user.id), expires_seconds=settings.jwt_refresh_token_expire_seconds)
     return AuthResponse(
         access_token=access_token,
         refresh_token=refresh_token,

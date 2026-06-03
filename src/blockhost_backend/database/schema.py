@@ -24,6 +24,24 @@ class SubscriptionTier(str, enum.Enum):
     premium = "premium"
 
 
+
+
+def get_subscription_str(obj) -> str:
+    """
+    Return the subscription tier name as a plain string.
+    Accepts either a `SubscriptionTier` enum or an object (e.g., `User`)
+    with a `subscription_tier` attribute.
+    """
+    if isinstance(obj, SubscriptionTier):
+        return obj.value
+    tier = getattr(obj, "subscription_tier", None)
+    if isinstance(tier, SubscriptionTier):
+        return tier.value
+    if isinstance(tier, str):
+        return tier
+    return str(tier)
+
+
 class ServerState(str, enum.Enum):
     created = "created"
     provisioning = "provisioning"
@@ -65,7 +83,6 @@ class Server(Base):
     owner_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("users.id"), index=True, nullable=False)
     world_name: Mapped[str] = mapped_column(String(128), nullable=False)
     join_code: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
-    subdomain: Mapped[str | None] = mapped_column(String(64), unique=True, index=True, nullable=True)  # e.g., "srv-abc123xyz"
     state: Mapped[ServerState] = mapped_column(Enum(ServerState), nullable=False, default=ServerState.created)
 
     vm_provider: Mapped[VMProvider] = mapped_column(Enum(VMProvider), nullable=False, default=VMProvider.local_bedrock)

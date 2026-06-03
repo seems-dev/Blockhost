@@ -5,7 +5,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from blockhost_backend.api import auth as auth_routes
-from blockhost_backend.api import server_controls as server_control_routes
 from blockhost_backend.api import servers as server_routes
 from blockhost_backend.api import versions as versions_routes
 from blockhost_backend.database.db import engine
@@ -13,7 +12,7 @@ from blockhost_backend.database.schema import Base
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Erex Backend", version="0.1.0")
+    app = FastAPI(title="BlockHost Backend", version="0.1.0")
 
     # Setup-stage: allow web clients (Flutter Web / browser) to call the API.
     app.add_middleware(
@@ -30,7 +29,6 @@ def create_app() -> FastAPI:
 
     app.include_router(auth_routes.router)
     app.include_router(server_routes.router)
-    app.include_router(server_control_routes.router)
     app.include_router(versions_routes.router)
 
     return app

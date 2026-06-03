@@ -30,3 +30,19 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="User not found")
     return user
 
+def get_ws_user(
+    token: str | None = None,
+    db: Session = Depends(get_db),
+) -> User:
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        payload = decode_token(token, expected_type="access")
+        user_id = uuid.UUID(payload["sub"])
+    except (TokenError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid access token")
+    user = db.get(User, user_id)
+    if user is None or user.deleted_at is not None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+

@@ -10,7 +10,14 @@ from passlib.context import CryptContext
 from blockhost_backend.config.config_manager import get_settings
 
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+_pwd_context = None
+
+
+def _get_pwd_context() -> CryptContext:
+    global _pwd_context
+    if _pwd_context is None:
+        _pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+    return _pwd_context
 
 
 def _normalize_password_for_bcrypt(password: str) -> str:
@@ -23,11 +30,11 @@ def _normalize_password_for_bcrypt(password: str) -> str:
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(_normalize_password_for_bcrypt(password))
+    return _get_pwd_context().hash(_normalize_password_for_bcrypt(password))
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return pwd_context.verify(_normalize_password_for_bcrypt(password), password_hash)
+    return _get_pwd_context().verify(_normalize_password_for_bcrypt(password), password_hash)
 
 
 def _utcnow() -> datetime:

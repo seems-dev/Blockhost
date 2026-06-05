@@ -5,7 +5,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, EmailStr, Field
 
-from blockhost_backend.database.schema import ServerState, SubscriptionTier, VMProvider
+from blockhost_backend.database.schema import BackupKind, BackupStatus, RestoreStatus, ServerState, SubscriptionTier, VMProvider
 
 
 class BedrockConfig(BaseModel):
@@ -140,3 +140,107 @@ class ServerConfigOut(BaseModel):
 
 class ServerConfigUpdateRequest(BaseModel):
     config: BedrockConfig
+
+
+class CreateBackupRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=128)
+    description: str | None = Field(default=None, max_length=2000)
+    idempotency_key: str | None = Field(default=None, max_length=128)
+    force_offline: bool = False
+
+
+class BackupJobOut(BaseModel):
+    job_id: uuid.UUID
+    backup_id: uuid.UUID
+    server_id: uuid.UUID
+    status: BackupStatus
+    phase: str
+    progress_percent: int
+    progress_bytes: int
+    total_bytes: int
+    error_code: str | None = None
+    error_message: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    already_running: bool = False
+
+
+class BackupOut(BaseModel):
+    backup_id: uuid.UUID
+    server_id: uuid.UUID
+    name: str | None = None
+    description: str | None = None
+    kind: BackupKind
+    status: BackupStatus
+    world_name: str
+    archive_format: str
+    size_bytes: int
+    uncompressed_size_bytes: int
+    checksum_sha256: str | None = None
+    consistency_method: str | None = None
+    server_was_running: bool
+    pinned: bool
+    created_at: datetime
+    completed_at: datetime | None = None
+    failure_code: str | None = None
+    failure_message: str | None = None
+
+
+class BackupListOut(BaseModel):
+    items: list[BackupOut]
+
+
+class DeleteBackupRequest(BaseModel):
+    delete_even_if_pinned: bool = False
+
+
+class CreateRestoreRequest(BaseModel):
+    backup_id: uuid.UUID
+    restart_after_restore: bool = True
+    rollback_enabled: bool = True
+    confirm: str = Field(min_length=1, max_length=32)
+
+
+class RestoreJobOut(BaseModel):
+    restore_job_id: uuid.UUID
+    backup_id: uuid.UUID
+    server_id: uuid.UUID
+    status: RestoreStatus
+    phase: str
+    progress_percent: int
+    progress_bytes: int
+    total_bytes: int
+    restart_after_restore: bool
+    rollback_enabled: bool
+    error_code: str | None = None
+    error_message: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class BackupScheduleRequest(BaseModel):
+    enabled: bool = True
+    interval_minutes: int = Field(ge=5, le=60 * 24 * 30)
+    retention_count: int = Field(default=7, ge=1, le=100)
+    retention_days: int | None = Field(default=None, ge=1, le=3650)
+    skip_if_server_offline: bool = False
+    defer_if_job_active: bool = True
+
+
+class BackupScheduleOut(BaseModel):
+    schedule_id: uuid.UUID
+    server_id: uuid.UUID
+    enabled: bool
+    interval_minutes: int | None
+    retention_count: int
+    retention_days: int | None
+    skip_if_server_offline: bool
+    defer_if_job_active: bool
+    last_run_at: datetime | None
+    last_success_at: datetime | None
+    next_run_at: datetime | None
+    consecutive_failures: int
+    created_at: datetime
+    updated_at: datetime

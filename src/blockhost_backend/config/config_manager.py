@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     bedrock_versions_manifest: str = "versions/manifest.json"
     bedrock_port_range_start: int = 19132
     bedrock_port_range_end: int = 19232
+    backup_storage_dir: str = "backups"
+    backup_temp_dir: str = "backups/tmp"
+    backup_retention_count: int = 7
+    backup_save_hold_seconds: float = 2.0
+    backup_worker_threads: int = 2
+    backup_scheduler_enabled: bool = True
+    backup_scheduler_poll_seconds: int = 60
     # Optional explicit executable name inside a version/server folder.
     # If empty, BlockHost will try common Bedrock server binary names.
     bedrock_executable_name: str = ""

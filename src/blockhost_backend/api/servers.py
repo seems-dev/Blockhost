@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import logging
 import re
-import socket
-import subprocess
+import threading
+import time
 import uuid
-from contextlib import closing
 from pathlib import Path
 
 import asyncio
 import json
-from fastapi import APIRouter, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -24,36 +23,29 @@ from blockhost_backend.api.schemas import (
     ServerConfigUpdateRequest,
     ServerDetail,
     ServerOut,
+    ServerStateSnapshot,
 )
 from blockhost_backend.config.config_manager import get_settings
-from blockhost_backend.database.db import get_db
+from blockhost_backend.database.db import SessionLocal, get_db
 from blockhost_backend.database.schema import Server, ServerState, SubscriptionTier, User, VMProvider
 from blockhost_backend.minecraft.bedrock_ping import bedrock_unconnected_ping, parse_bedrock_pong_payload
 from blockhost_backend.minecraft.bedrock_properties import BedrockServerProperties, write_server_properties
 from blockhost_backend.minecraft.bedrock_download import ensure_version_installed, recommended_version
 from blockhost_backend.minecraft.port_alloc import PortRange, pick_free_udp_port
-from blockhost_backend.runtime.bedrock_process import (
-    BedrockRuntimeRegistry,
-    materialize_server_dir,
-    resolve_version_dir,
-)
-from blockhost_backend.runtime.cgroup_limits import apply_limits, remove_limits
+from blockhost_backend.orchestrator.lifecycle_manager import get_server_lifecycle_orchestrator
+from blockhost_backend.orchestrator.resources import TIER_RESOURCE_LIMITS
+from blockhost_backend.runtime.bedrock_process import materialize_server_dir, resolve_version_dir
 from blockhost_backend.utils import generate_join_code
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/servers", tags=["servers"])
 
-_RUNTIME = BedrockRuntimeRegistry()
-
-# ---------------------------------------------------------------------------
-# Tier resource limits — source of truth for RAM/CPU per subscription tier.
-# Keep here (not in a separate file) so servers.py is fully self-contained.
-# ---------------------------------------------------------------------------
-TIER_RESOURCE_LIMITS: dict[SubscriptionTier, dict] = {
-    SubscriptionTier.free:    {"ram_mb": 512,  "cpu_quota_pct": 50},
-    SubscriptionTier.premium: {"ram_mb": 1024, "cpu_quota_pct": 100},
-}
+_ORCHESTRATOR = get_server_lifecycle_orchestrator()
+_STATS_SNAPSHOT_TTL_SECONDS = 2.0
+_STATS_SNAPSHOT_CACHE: dict[str, tuple[float, BedrockServerStats]] = {}
+_STATS_REFRESHING: set[str] = set()
+_STATS_CACHE_LOCK = threading.Lock()
 
 # Maximum servers allowed per tier — enforced server-side only, never from client.
 TIER_SERVER_LIMITS: dict[SubscriptionTier, int] = {
@@ -148,6 +140,133 @@ def _server_to_out(server: Server, owner: User | None = None) -> ServerOut:
     )
 
 
+def _server_to_detail(server: Server, owner: User | None = None) -> ServerDetail:
+    base = _server_to_out(server, owner=owner)
+    return ServerDetail(
+        **base.model_dump(),
+        minecraft_host=(server.vm_ipv4 or get_settings().minecraft_public_host),
+        minecraft_port=server.vm_port,
+    )
+
+
+def _compute_server_stats(server: Server, user: User) -> BedrockServerStats:
+    settings = get_settings()
+    host = server.vm_ipv4 or settings.minecraft_public_host
+    port = server.vm_port or settings.bedrock_port_range_start
+
+    tier = _get_user_tier(user)
+    limits = TIER_RESOURCE_LIMITS.get(tier, TIER_RESOURCE_LIMITS[SubscriptionTier.free])
+    allocated_ram_mb = limits["ram_mb"]
+    allocated_cpu_cores = limits["cpu_quota_pct"] / 100.0
+
+    runtime_status = _ORCHESTRATOR.get_status(str(server.id))
+    process_running = runtime_status.running
+    uptime = runtime_status.uptime_seconds
+
+    resource_stats = _ORCHESTRATOR.get_stats(str(server.id))
+    cpu_usage = resource_stats.cpu_usage
+    ram_usage_mb = resource_stats.ram_usage_mb
+    cpu_usage_percent = None
+    ram_usage_percent = None
+    if cpu_usage is not None and allocated_cpu_cores and allocated_cpu_cores > 0:
+        cpu_usage_percent = (cpu_usage / 100.0) / allocated_cpu_cores * 100.0
+    if ram_usage_mb is not None and allocated_ram_mb and allocated_ram_mb > 0:
+        ram_usage_percent = (ram_usage_mb / allocated_ram_mb) * 100.0
+
+    base_stats = {
+        "host": host,
+        "port": port,
+        "allocated_ram_mb": allocated_ram_mb,
+        "allocated_cpu_cores": allocated_cpu_cores,
+        "process_running": process_running,
+        "uptime_seconds": uptime,
+        "cpu_usage": cpu_usage,
+        "ram_usage_mb": ram_usage_mb,
+        "cpu_usage_percent": cpu_usage_percent,
+        "ram_usage_percent": ram_usage_percent,
+    }
+
+    try:
+        pong = bedrock_unconnected_ping(host="127.0.0.1", port=port, timeout_seconds=1.0)
+        parsed = parse_bedrock_pong_payload(pong.payload)
+        return BedrockServerStats(
+            **base_stats,
+            reachable=True,
+            latency_ms=pong.latency_ms,
+            edition=parsed.get("edition"),
+            motd=parsed.get("motd"),
+            motd2=parsed.get("motd2"),
+            protocol=parsed.get("protocol"),
+            version=parsed.get("version"),
+            players_online=parsed.get("players_online"),
+            players_max=parsed.get("players_max"),
+            server_id=parsed.get("server_id"),
+            gamemode=parsed.get("gamemode"),
+            online_players_list=runtime_status.online_players or [],
+        )
+    except Exception:
+        return BedrockServerStats(
+            **base_stats,
+            reachable=False,
+            online_players_list=runtime_status.online_players or [],
+        )
+
+
+def _store_server_stats_snapshot(server_id: str, stats: BedrockServerStats) -> None:
+    with _STATS_CACHE_LOCK:
+        _STATS_SNAPSHOT_CACHE[server_id] = (time.monotonic(), stats)
+        _STATS_REFRESHING.discard(server_id)
+
+
+def _drop_server_stats_snapshot(server_id: str) -> None:
+    with _STATS_CACHE_LOCK:
+        _STATS_SNAPSHOT_CACHE.pop(server_id, None)
+        _STATS_REFRESHING.discard(server_id)
+
+
+def _refresh_server_stats_snapshot(server_id: str) -> None:
+    db = SessionLocal()
+    try:
+        try:
+            server_uuid = uuid.UUID(server_id)
+        except ValueError:
+            return
+        server = db.get(Server, server_uuid)
+        if not server:
+            return
+        user = db.get(User, server.owner_id)
+        if not user:
+            return
+        _store_server_stats_snapshot(server_id, _compute_server_stats(server, user))
+    finally:
+        with _STATS_CACHE_LOCK:
+            _STATS_REFRESHING.discard(server_id)
+        db.close()
+
+
+def _get_server_stats_snapshot(
+    server: Server,
+    user: User,
+    background_tasks: BackgroundTasks | None = None,
+) -> BedrockServerStats:
+    server_id = str(server.id)
+    now = time.monotonic()
+    with _STATS_CACHE_LOCK:
+        cached = _STATS_SNAPSHOT_CACHE.get(server_id)
+        if cached:
+            cached_at, stats = cached
+            if now - cached_at <= _STATS_SNAPSHOT_TTL_SECONDS:
+                return stats
+            if background_tasks and server_id not in _STATS_REFRESHING:
+                _STATS_REFRESHING.add(server_id)
+                background_tasks.add_task(_refresh_server_stats_snapshot, server_id)
+                return stats
+
+    stats = _compute_server_stats(server, user)
+    _store_server_stats_snapshot(server_id, stats)
+    return stats
+
+
 def _server_dirs() -> tuple[Path, Path, Path]:
     settings = get_settings()
     return (
@@ -191,16 +310,6 @@ def _normalize_requested_version(requested_version: str | None) -> str | None:
     return rv
 
 
-def _is_port_available(port: int) -> bool:
-    try:
-        with closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("0.0.0.0", port))
-            return True
-    except OSError:
-        return False
-
-
 def _allocate_port(*, db: Session) -> int:
     settings = get_settings()
     used = set(
@@ -212,15 +321,7 @@ def _allocate_port(*, db: Session) -> int:
         start=settings.bedrock_port_range_start,
         end=settings.bedrock_port_range_end,
     )
-    for port in range(port_range.start, port_range.end + 1):
-        if port in used:
-            continue
-        if _is_port_available(port):
-            return port
-    raise RuntimeError(
-        f"No free UDP ports in range {port_range.start}-{port_range.end}. "
-        f"Database has {len(used)} allocated: {sorted(used)}"
-    )
+    return pick_free_udp_port(port_range=port_range, used_ports=used)
 
 
 def _server_props_from_config(*, server: Server, port: int) -> BedrockServerProperties:
@@ -240,80 +341,19 @@ def _server_props_from_config(*, server: Server, port: int) -> BedrockServerProp
 
 
 def _start_bedrock_process(*, server: Server, settings, db: Session | None = None) -> None:
-    """
-    Start a Bedrock process and apply cgroup resource limits based on the
-    owner's subscription tier.  Tier is always resolved from the database
-    (via the loaded relationship or a fresh DB lookup) — never from the request.
-    """
-    if not server.vm_port:
-        raise RuntimeError(f"Server {server.id} has no port allocated")
-    if not (server.mc_config or {}).get("server_dir"):
-        raise RuntimeError(f"Server {server.id} has no server_dir configured")
-
-    # Validate server_dir is inside the allowed root before using it
+    """Delegate process lifecycle to the orchestrator/runtime abstraction."""
     _, servers_dir, _ = _server_dirs()
-    safe_server_dir = _validate_server_dir(
-        Path(server.mc_config["server_dir"]), servers_dir
+    _ORCHESTRATOR.start_server(
+        server=server,
+        settings=settings,
+        servers_dir=servers_dir,
+        get_user_tier=_get_user_tier,
+        db=db,
     )
-
-    proc = _RUNTIME.ensure_process(
-        server_id=str(server.id),
-        server_dir=safe_server_dir,
-        port=server.vm_port,
-        requested_version=str(server.mc_config.get("template_version") or ""),
-    )
-    proc.start(executable_name=settings.bedrock_executable_name or None)
-    info = proc.wait_for_ready()
-
-    if server.mc_config.get("template_version") and info.actual_version:
-        requested = str(server.mc_config["template_version"])
-        if requested not in {"LATEST", "PREVIEW"} and not str(info.actual_version).startswith(requested):
-            proc.stop()
-            raise RuntimeError(
-                f"Runtime version mismatch (requested={requested}, actual={info.actual_version})"
-            )
-
-    # Resolve tier from DB — never trust a client-supplied value
-    tier: SubscriptionTier = SubscriptionTier.free
-    try:
-        owner = getattr(server, "owner", None)
-        if owner and getattr(owner, "subscription_tier", None):
-            tier = _get_user_tier(owner)
-        elif db and server.owner_id:
-            db_owner = db.get(User, server.owner_id)
-            if db_owner:
-                tier = _get_user_tier(db_owner)
-    except Exception as exc:
-        logger.warning("Could not resolve tier for server %s: %s — defaulting to free", server.id, exc)
-
-    if info.pid:
-        limits = TIER_RESOURCE_LIMITS.get(tier, TIER_RESOURCE_LIMITS[SubscriptionTier.free])
-        apply_limits(
-            pid=info.pid,
-            server_id=str(server.id),
-            ram_mb=limits["ram_mb"],
-            cpu_quota_pct=limits["cpu_quota_pct"],
-        )
-        logger.info(
-            "Server %s started (pid=%s, tier=%s, ram=%sMB, cpu=%s%%)",
-            server.id, info.pid, tier.value, limits["ram_mb"], limits["cpu_quota_pct"],
-        )
-
-    server.vm_id = str(info.pid)
-    server.vm_ipv4 = settings.minecraft_public_host
-    server.state = ServerState.running
-
 
 def _stop_server_process(server: Server) -> None:
-    """Stop the BDS process and clean up cgroup resources."""
-    try:
-        _RUNTIME.stop(server_id=str(server.id))
-    except Exception as exc:
-        logger.warning("RUNTIME.stop failed for server %s: %s", server.id, exc)
-    finally:
-        # Always clean up cgroup even if stop raised
-        remove_limits(server_id=str(server.id))
-    server.state = ServerState.suspended
+    """Delegate process lifecycle to the orchestrator/runtime abstraction."""
+    _ORCHESTRATOR.stop_server(server)
 
 
 # ---------------------------------------------------------------------------
@@ -513,12 +553,13 @@ def list_servers(
     return [_server_to_out(s, owner=user) for s in servers]
 
 
-@router.get("/{server_id}", response_model=ServerDetail)
+@router.get("/{server_id}", response_model=ServerStateSnapshot)
 def get_server(
     server_id: str,
+    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> ServerDetail:
+) -> ServerStateSnapshot:
     try:
         server_uuid = uuid.UUID(server_id)
     except ValueError:
@@ -526,11 +567,10 @@ def get_server(
     server = db.get(Server, server_uuid)
     if not server or server.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Server not found")
-    base = _server_to_out(server, owner=user)
-    return ServerDetail(
-        **base.model_dump(),
-        minecraft_host=(server.vm_ipv4 or get_settings().minecraft_public_host),
-        minecraft_port=server.vm_port,
+    return ServerStateSnapshot(
+        server=_server_to_detail(server, owner=user),
+        config=server.mc_config or {},
+        stats=_get_server_stats_snapshot(server, user, background_tasks),
     )
 
 
@@ -550,9 +590,7 @@ def start_server(
 
     is_actually_running = False
     if server.state == ServerState.running:
-        proc = _RUNTIME.get(str(server.id))
-        if proc and proc.is_running():
-            is_actually_running = True
+        is_actually_running = _ORCHESTRATOR.is_running(str(server.id))
 
     if is_actually_running:
         # Idempotent — already running, nothing to do
@@ -613,9 +651,11 @@ def start_server(
         _start_bedrock_process(server=server, settings=settings, db=db)
     except Exception as e:
         server.state = ServerState.suspended
+        _drop_server_stats_snapshot(str(server.id))
         raise HTTPException(status_code=503, detail=f"Failed to start Bedrock process: {e}")
 
     db.commit()
+    _drop_server_stats_snapshot(str(server.id))
     return ServerActionResponse(id=server.id, state=server.state)
 
 
@@ -635,6 +675,7 @@ def stop_server(
 
     _stop_server_process(server)
     db.commit()
+    _drop_server_stats_snapshot(str(server.id))
     return ServerActionResponse(id=server.id, state=server.state)
 
 
@@ -654,9 +695,7 @@ def toggle_server(
 
     is_actually_running = False
     if server.state == ServerState.running:
-        proc = _RUNTIME.get(str(server.id))
-        if proc and proc.is_running():
-            is_actually_running = True
+        is_actually_running = _ORCHESTRATOR.is_running(str(server.id))
 
     settings = get_settings()
     if is_actually_running:
@@ -695,11 +734,13 @@ def toggle_server(
             _start_bedrock_process(server=server, settings=settings, db=db)
         except Exception as e:
             server.state = ServerState.suspended
+            _drop_server_stats_snapshot(str(server.id))
             raise HTTPException(
                 status_code=503, detail=f"Failed to start Bedrock process: {e}"
             )
 
     db.commit()
+    _drop_server_stats_snapshot(str(server.id))
     return ServerActionResponse(id=server.id, state=server.state)
 
 
@@ -774,6 +815,7 @@ def update_server_config(
 @router.get("/{server_id}/stats", response_model=BedrockServerStats)
 def get_server_stats(
     server_id: str,
+    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> BedrockServerStats:
@@ -784,78 +826,7 @@ def get_server_stats(
     server = db.get(Server, server_uuid)
     if not server or server.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Server not found")
-
-    settings = get_settings()
-    host = server.vm_ipv4 or settings.minecraft_public_host
-    port = server.vm_port or settings.bedrock_port_range_start
-
-    tier = _get_user_tier(user)
-    limits = TIER_RESOURCE_LIMITS.get(tier, TIER_RESOURCE_LIMITS[SubscriptionTier.free])
-    allocated_ram_mb = limits["ram_mb"]
-    allocated_cpu_cores = limits["cpu_quota_pct"] / 100.0
-
-    proc = _RUNTIME.get(str(server.id))
-    process_running = proc is not None and proc.is_running()
-    pid = proc.pid() if process_running and proc else None
-    uptime = proc.uptime_seconds() if process_running and proc else None
-
-    cpu_usage = None
-    ram_usage_mb = None
-    cpu_usage_percent = None
-    ram_usage_percent = None
-    if pid:
-        try:
-            result = subprocess.run(
-                ["ps", "-p", str(pid), "-o", "%cpu,rss", "--no-headers"],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                parts = result.stdout.strip().split()
-                if len(parts) >= 2:
-                    cpu_usage = float(parts[0])
-                    ram_usage_mb = float(parts[1]) / 1024.0
-                    # Normalize CPU and RAM against allocated caps
-                    if allocated_cpu_cores and allocated_cpu_cores > 0:
-                        cpu_usage_percent = (cpu_usage / 100.0) / allocated_cpu_cores * 100.0
-                    if allocated_ram_mb and allocated_ram_mb > 0:
-                        ram_usage_percent = (ram_usage_mb / allocated_ram_mb) * 100.0
-        except Exception:
-            pass
-
-    base_stats = {
-        "host": host,
-        "port": port,
-        "allocated_ram_mb": allocated_ram_mb,
-        "allocated_cpu_cores": allocated_cpu_cores,
-        "process_running": process_running,
-        "uptime_seconds": uptime,
-        "cpu_usage": cpu_usage,
-        "ram_usage_mb": ram_usage_mb,
-        "cpu_usage_percent": cpu_usage_percent,
-        "ram_usage_percent": ram_usage_percent,
-    }
-
-    try:
-        pong = bedrock_unconnected_ping(host="127.0.0.1", port=port, timeout_seconds=1.0)
-        parsed = parse_bedrock_pong_payload(pong.payload)
-        return BedrockServerStats(
-            **base_stats,
-            reachable=True,
-            latency_ms=pong.latency_ms,
-            edition=parsed.get("edition"),
-            motd=parsed.get("motd"),
-            motd2=parsed.get("motd2"),
-            protocol=parsed.get("protocol"),
-            version=parsed.get("version"),
-            players_online=parsed.get("players_online"),
-            players_max=parsed.get("players_max"),
-            server_id=parsed.get("server_id"),
-            gamemode=parsed.get("gamemode"),
-            online_players_list=list(proc.online_players) if proc else [],
-        )
-    except Exception:
-        return BedrockServerStats(**base_stats, reachable=False, online_players_list=list(proc.online_players) if proc else [])
+    return _get_server_stats_snapshot(server, user, background_tasks)
 
 
 
@@ -877,11 +848,8 @@ def get_server_logs(
     # Clamp tail to prevent memory DoS from huge values
     tail = max(1, min(tail, _MAX_LOG_TAIL))
 
-    proc = _RUNTIME.get(str(server.id))
-    if not proc:
-        return []
     # Strip dict structure to string for backwards compatibility, or clients that just want strings
-    return [entry.get("line", "") for entry in proc.read_logs(tail=tail)]
+    return [entry.get("line", "") for entry in _ORCHESTRATOR.read_logs(str(server.id), tail=tail)]
 
 @router.websocket("/{server_id}/console/ws")
 async def console_websocket(
@@ -907,14 +875,13 @@ async def console_websocket(
             await websocket.close(code=4003)
             return
 
-        proc = _RUNTIME.get(server_id)
-        if not proc or not proc.is_running():
+        if not _ORCHESTRATOR.is_running(server_id):
             await websocket.send_json({"type": "error", "error": "Server is not running"})
             await websocket.close(code=4000)
             return
 
         # Send last 500 lines as history
-        history = proc.read_logs(tail=500)
+        history = _ORCHESTRATOR.read_logs(server_id, tail=500)
         await websocket.send_json({"type": "history", "logs": history})
 
         # Queue to bridge sync listener to async websocket
@@ -924,7 +891,7 @@ async def console_websocket(
         def on_log(entry: dict):
             loop.call_soon_threadsafe(queue.put_nowait, entry)
 
-        proc.add_log_listener(on_log)
+        _ORCHESTRATOR.add_log_listener(server_id, on_log)
 
         async def send_logs():
             try:
@@ -941,7 +908,7 @@ async def console_websocket(
                     try:
                         msg = json.loads(data)
                         if msg.get("type") == "command" and "command" in msg:
-                            proc.send_command(msg["command"])
+                            _ORCHESTRATOR.send_command(server_id, msg["command"])
                     except json.JSONDecodeError:
                         pass
             except WebSocketDisconnect:
@@ -961,8 +928,8 @@ async def console_websocket(
         await websocket.send_json({"type": "error", "error": "Authentication failed"})
         await websocket.close(code=4001)
     finally:
-        if 'proc' in locals() and proc and 'on_log' in locals():
-            proc.remove_log_listener(on_log)
+        if 'on_log' in locals():
+            _ORCHESTRATOR.remove_log_listener(server_id, on_log)
 
 
 
@@ -977,10 +944,10 @@ def _require_server(server_id: str, user: User, db: Session) -> Server:
     return server
 
 def _send_cmd(server_id: str, cmd: str) -> dict:
-    proc = _RUNTIME.get(server_id)
-    if not proc or not proc.is_running():
-        raise HTTPException(status_code=400, detail="Server is not running")
-    proc.send_command(cmd)
+    try:
+        _ORCHESTRATOR.send_command(server_id, cmd)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return {"status": "ok"}
 
 

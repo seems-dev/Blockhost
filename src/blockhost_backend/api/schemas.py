@@ -114,6 +114,12 @@ class BedrockServerStats(BaseModel):
     uptime_seconds: int | None = None
 
 
+class ServerStateSnapshot(BaseModel):
+    server: ServerDetail
+    config: BedrockConfig
+    stats: BedrockServerStats | None = None
+
+
 class CommandRequest(BaseModel):
     player: str | None = None
     x: float | None = None

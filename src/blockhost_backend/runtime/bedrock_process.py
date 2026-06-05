@@ -14,38 +14,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from blockhost_backend.minecraft.bedrock_ping import bedrock_unconnected_ping, parse_bedrock_pong_payload
+from blockhost_backend.minecraft.port_alloc import is_udp_port_free
 
 #bedrock_process.py
 _COMMON_BEDROCK_BINARIES = ("bedrock_server", "bedrock_server.exe")
-_BASE_PORT = 19132
-_PORT_RANGE = range(_BASE_PORT, _BASE_PORT + 100)  # Support up to 100 servers
-
-
-def _is_port_in_use(port: int) -> bool:
-    """Check if a port is in use at the socket level (UDP - what Bedrock uses)."""
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if os.name != "nt":  # Unix/Linux/macOS
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        # Try binding to all interfaces (0.0.0.0) like Bedrock does
-        sock.bind(("0.0.0.0", port))
-        sock.close()
-        return False  # Port is free
-    except OSError:
-        return True  # Port is in use
-
-
-def _find_available_port(preferred_port: int | None = None) -> int:
-    """Find an available port, starting with preferred_port if given."""
-    if preferred_port and not _is_port_in_use(preferred_port):
-        return preferred_port
-    
-    for port in _PORT_RANGE:
-        if not _is_port_in_use(port):
-            return port
-    
-    raise RuntimeError(f"No available ports in range {_PORT_RANGE.start}-{_PORT_RANGE.stop}")
 
 
 def _kill_stale_bedrock_processes() -> None:
@@ -57,22 +29,6 @@ def _kill_stale_bedrock_processes() -> None:
             os.system("pkill -9 bedrock_server 2>/dev/null")
     except Exception:
         pass
-
-
-def _update_server_properties(server_dir: Path, port: int) -> None:
-    """Update server.properties with the assigned port."""
-    props_file = server_dir / "server.properties"
-    if not props_file.exists():
-        return
-    
-    try:
-        content = props_file.read_text()
-        # Replace both server-port and server-portv6
-        content = re.sub(r"server-port=\d+", f"server-port={port}", content)
-        content = re.sub(r"server-portv6=\d+", f"server-portv6={port+1}", content)
-        props_file.write_text(content)
-    except Exception as e:
-        print(f"[blockhost] warning: failed to update server.properties: {e}")
 
 
 @dataclass(frozen=True)
@@ -238,21 +194,15 @@ class BedrockProcess:
             except Exception:
                 pass
 
-        # Find an available port
-        self._append_log(f"[blockhost] checking port availability (preferred: {self.port})")
-        assigned_port = _find_available_port(preferred_port=self.port)
-        self._assigned_port = assigned_port
-        
-        if assigned_port != self.port:
-            self._append_log(f"[blockhost] port {self.port} in use, assigned {assigned_port} instead")
-        else:
-            self._append_log(f"[blockhost] port {self.port} is available")
-        
-        # Update server.properties with the assigned port
-        self._append_log(f"[blockhost] updating server.properties with port {assigned_port}")
-        _update_server_properties(self.server_dir, assigned_port)
+        # Verify the requested port is actually free
+        self._append_log(f"[blockhost] verifying port {self.port} is available")
+        if not is_udp_port_free(port=self.port):
+            raise RuntimeError(f"Port {self.port} is still in use after cleanup")
+            
+        self._assigned_port = self.port
+        self._append_log(f"[blockhost] port {self.port} is available")
 
-        self._append_log(f"[blockhost] starting bedrock_server: {exe.name} (port={assigned_port})")
+        self._append_log(f"[blockhost] starting bedrock_server: {exe.name} (port={self.port})")
 
         cmd = [str(exe)]
         if os.name != "nt" and shutil.which("stdbuf"):
@@ -300,7 +250,7 @@ class BedrockProcess:
 
         return BedrockRuntimeInfo(
             pid=proc.pid,
-            port=assigned_port,
+            port=self._assigned_port,
             server_dir=str(self.server_dir),
             requested_version=self.requested_version,
             actual_version=self._actual_version,

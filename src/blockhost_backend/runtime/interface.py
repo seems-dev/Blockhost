@@ -1,0 +1,72 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Protocol
+
+
+LogEntry = dict[str, Any]
+LogListener = Callable[[LogEntry], None]
+
+
+@dataclass(frozen=True)
+class RuntimeStartRequest:
+    server_id: str
+    server_dir: Path
+    port: int
+    requested_version: str | None
+    executable_name: str | None
+    ram_mb: int
+    cpu_quota_pct: int
+
+
+@dataclass(frozen=True)
+class RuntimeStartResult:
+    runtime_id: str
+    port: int
+    actual_version: str | None
+
+
+@dataclass(frozen=True)
+class RuntimeStatus:
+    running: bool
+    runtime_id: str | None = None
+    pid: int | None = None
+    uptime_seconds: int | None = None
+    actual_version: str | None = None
+    online_players: list[str] | None = None
+
+
+@dataclass(frozen=True)
+class RuntimeResourceStats:
+    cpu_usage: float | None = None
+    ram_usage_mb: float | None = None
+
+
+class Runtime(Protocol):
+    def start_server(self, request: RuntimeStartRequest) -> RuntimeStartResult:
+        ...
+
+    def stop_server(self, server_id: str) -> None:
+        ...
+
+    def restart_server(self, request: RuntimeStartRequest) -> RuntimeStartResult:
+        ...
+
+    def get_status(self, server_id: str) -> RuntimeStatus:
+        ...
+
+    def get_stats(self, server_id: str) -> RuntimeResourceStats:
+        ...
+
+    def read_logs(self, server_id: str, *, tail: int = 200) -> list[LogEntry]:
+        ...
+
+    def send_command(self, server_id: str, command: str) -> None:
+        ...
+
+    def add_log_listener(self, server_id: str, listener: LogListener) -> None:
+        ...
+
+    def remove_log_listener(self, server_id: str, listener: LogListener) -> None:
+        ...

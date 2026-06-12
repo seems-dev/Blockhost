@@ -404,9 +404,9 @@ def run_backup_job(job_id: uuid.UUID) -> None:
 
             _update_backup_job(db, job, BackupStatus.compressing, "compressing", 45, 80)
             final_archive = backup_object_path(server.id, backup.id)
-            temp_archive = final_archive.with_suffix(final_archive.suffix + ".tmp")
+            temp_archive = Path(str(final_archive) + ".tmp")
             if temp_archive.exists():
-                temp_archive.unlink()
+                temp_archive.unlink(missing_ok=True)
 
             with tarfile.open(temp_archive, "w:gz") as tar:
                 tar.add(staging / "bedrock", arcname="bedrock", recursive=True)
@@ -415,6 +415,8 @@ def run_backup_job(job_id: uuid.UUID) -> None:
             checksum = _sha256_file(temp_archive)
             size = temp_archive.stat().st_size
             _atomic_replace(temp_archive, final_archive)
+            if temp_archive.exists():
+                temp_archive.unlink(missing_ok=True)
             final_archive.with_suffix(final_archive.suffix + ".sha256").write_text(checksum, encoding="utf-8")
 
             completed_at = utcnow()
@@ -479,6 +481,12 @@ def run_backup_job(job_id: uuid.UUID) -> None:
             temp_archive.unlink(missing_ok=True)
         if staging:
             _safe_rmtree(staging)
+            staging_parent = staging.parent
+            if staging_parent.exists() and not any(staging_parent.iterdir()):
+                staging_parent.rmdir()
+            staging_grandparent = staging_parent.parent
+            if staging_grandparent.exists() and not any(staging_grandparent.iterdir()):
+                staging_grandparent.rmdir()
         db.close()
 
 

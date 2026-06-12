@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     worker_agent_url: str = "http://localhost:9000"
     worker_agent_token: str = "change-me-in-dev"
 
+    google_client_id: str = "264249625264-0it828liska1emqu72ebb26s6u6krnmu.apps.googleusercontent.com"  # Add this line before the last two settings
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

@@ -102,10 +102,9 @@ class BackupConsistencyMethod(str, enum.Enum):
     server_stop = "server_stop"
     filesystem_snapshot = "filesystem_snapshot"
 
-
 class User(Base):
     __tablename__ = "users"
-
+ 
     id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
     phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -116,12 +115,16 @@ class User(Base):
     blockcoin_balance: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     stripe_customer_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     subscription_tier: Mapped[SubscriptionTier] = mapped_column(Enum(SubscriptionTier), nullable=False, default=SubscriptionTier.free)
+ 
+    # --- OAuth fields ---
+    google_sub: Mapped[str | None] = mapped_column(String(128), unique=True, index=True, nullable=True)
+    auth_provider: Mapped[str] = mapped_column(String(32), nullable=False, default="local")
+ 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
+ 
     servers: Mapped[list["Server"]] = relationship(back_populates="owner", cascade="all, delete-orphan")
-
 
 class Server(Base):
     __tablename__ = "servers"

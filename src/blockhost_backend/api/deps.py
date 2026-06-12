@@ -16,12 +16,14 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 def get_current_user(
     creds: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    token: str | None = None,
     db: Session = Depends(get_db),
 ) -> User:
-    if creds is None:
+    raw_token = creds.credentials if creds else token
+    if not raw_token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
-        payload = decode_token(creds.credentials, expected_type="access")
+        payload = decode_token(raw_token, expected_type="access")
         user_id = uuid.UUID(payload["sub"])
     except (TokenError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid access token")

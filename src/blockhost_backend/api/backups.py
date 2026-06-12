@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse
+from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from blockhost_backend.api.deps import get_current_user
+from blockhost_backend.api.deps import bearer_scheme, get_current_user
+from blockhost_backend.core.security import TokenError, decode_token
 from blockhost_backend.api.schemas import (
     BackupJobOut,
     BackupListOut,
@@ -331,13 +334,38 @@ def get_backup(
     return _backup_to_out(backup)
 
 
+def _resolve_user_for_download(
+    creds: HTTPAuthorizationCredentials | None,
+    token: str | None,
+    db: Session,
+) -> User:
+    if creds is not None:
+        return get_current_user(creds=creds, db=db)
+
+    if token is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    try:
+        payload = decode_token(token, expected_type="access")
+        user_id = uuid.UUID(payload["sub"])
+    except (TokenError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid access token")
+
+    user = db.get(User, user_id)
+    if user is None or user.deleted_at is not None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
 @router.get("/{server_id}/backups/{backup_id}/download")
 def download_backup(
     server_id: str,
     backup_id: str,
-    user: User = Depends(get_current_user),
+    token: str | None = Query(default=None),
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: Session = Depends(get_db),
 ) -> FileResponse:
+    user = _resolve_user_for_download(creds, token, db)
     server = _require_server(server_id, user, db)
     backup = _require_backup(server, backup_id, user, db)
     if backup.status != BackupStatus.completed:
@@ -365,9 +393,22 @@ def delete_backup(
         raise HTTPException(status_code=409, detail="Backup is pinned")
 
     path = backup_object_path(server.id, backup.id)
+    temp_paths = {
+        path.with_suffix(path.suffix + ".tmp"),
+        Path(str(path) + ".tmp"),
+    }
     checksum_path = path.with_suffix(path.suffix + ".sha256")
-    path.unlink(missing_ok=True)
-    checksum_path.unlink(missing_ok=True)
+
+    for artifact in (path, checksum_path, *temp_paths):
+        artifact.unlink(missing_ok=True)
+
+    parent_dir = path.parent
+    if parent_dir.exists() and not any(parent_dir.iterdir()):
+        parent_dir.rmdir()
+    server_dir = parent_dir.parent
+    if server_dir.exists() and not any(server_dir.iterdir()):
+        server_dir.rmdir()
+
     backup.status = BackupStatus.deleted
     backup.deleted_at = utcnow()
     db.commit()

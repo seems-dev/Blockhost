@@ -5,10 +5,21 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 
-LogEntry = dict[str, Any]
+# -------------------------
+# LOGGING
+# -------------------------
+@dataclass(frozen=True)
+class LogEntry:
+    ts: str | None
+    line: str
+
+
 LogListener = Callable[[LogEntry], None]
 
 
+# -------------------------
+# START REQUEST
+# -------------------------
 @dataclass(frozen=True)
 class RuntimeStartRequest:
     server_id: str
@@ -20,30 +31,40 @@ class RuntimeStartRequest:
     cpu_quota_pct: int
 
 
+# -------------------------
+# START RESULT
+# -------------------------
 @dataclass(frozen=True)
 class RuntimeStartResult:
-    runtime_id: str
+    runtime_id: str        # systemd unit name
     port: int
     actual_version: str | None
 
 
+# -------------------------
+# STATUS (SYSTEMD BASED)
+# -------------------------
 @dataclass(frozen=True)
 class RuntimeStatus:
     running: bool
     runtime_id: str | None = None
-    pid: int | None = None
-    uptime_seconds: int | None = None
-    actual_version: str | None = None
-    online_players: list[str] | None = None
+    active_state: str | None = None
 
 
+# -------------------------
+# RESOURCES
+# -------------------------
 @dataclass(frozen=True)
 class RuntimeResourceStats:
     cpu_usage: float | None = None
     ram_usage_mb: float | None = None
 
 
+# -------------------------
+# RUNTIME INTERFACE
+# -------------------------
 class Runtime(Protocol):
+
     def start_server(self, request: RuntimeStartRequest) -> RuntimeStartResult:
         ...
 

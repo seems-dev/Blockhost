@@ -244,3 +244,15 @@ class BackupScheduleOut(BaseModel):
     consecutive_failures: int
     created_at: datetime
     updated_at: datetime
+
+
+class FileInfo(BaseModel):
+    name: str
+    path: str
+    is_dir: bool
+    size: int | None
+    last_modified: float
+
+
+class FileWriteRequest(BaseModel):
+    content: str

@@ -23,6 +23,7 @@ from blockhost_backend.api.schemas import (
     BedrockServerStats,
     CommandRequest,
     CreateServerRequest,
+    PlayerInfo,
     ServerActionResponse,
     ServerConfigOut,
     ServerConfigUpdateRequest,
@@ -256,6 +257,12 @@ def _compute_server_stats(server: Server, user: User) -> BedrockServerStats:
     try:
         pong = bedrock_unconnected_ping(host="127.0.0.1", port=port, timeout_seconds=1.0)
         parsed = parse_bedrock_pong_payload(pong.payload)
+        # Convert online players dict to PlayerInfo list
+        players_with_xuid = runtime_status.runtime_id and _ORCHESTRATOR.get_online_players_with_xuid(server_id)
+        player_info_list = [
+            PlayerInfo(name=name, xuid=xuid)
+            for name, xuid in (players_with_xuid or {}).items()
+        ]
         return BedrockServerStats(
             **base_stats,
             reachable=True,
@@ -269,13 +276,13 @@ def _compute_server_stats(server: Server, user: User) -> BedrockServerStats:
             players_max=parsed.get("players_max"),
             server_id=parsed.get("server_id"),
             gamemode=parsed.get("gamemode"),
-            online_players_list=runtime_status.online_players or [],
+            online_players_list=player_info_list,
         )
     except Exception:
         return BedrockServerStats(
             **base_stats,
             reachable=False,
-            online_players_list=runtime_status.online_players or [],
+            online_players_list=[],
         )
 
 

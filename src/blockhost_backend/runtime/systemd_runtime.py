@@ -26,8 +26,13 @@ _UNIT_RE = re.compile(r"[^A-Za-z0-9_.@-]+")
 
 import threading
 
-_PLAYER_CONNECTED_RE = re.compile(r"Player (?:connected|Spawned):\s*(\S+)", re.IGNORECASE)
-_PLAYER_DISCONNECTED_RE = re.compile(r"Player disconnected:\s*(\S+)", re.IGNORECASE)
+# Matches: "Player connected: PlayerName, xuid: 1234567890123456" or "Player Spawned: PlayerName, xuid: 1234567890123456"
+_PLAYER_CONNECTED_RE = re.compile(
+    r"Player (?:connected|Spawned):\s*([^,]+)(?:,\s*xuid:\s*(\d+))?",
+    re.IGNORECASE
+)
+# Matches: "Player disconnected: PlayerName"
+_PLAYER_DISCONNECTED_RE = re.compile(r"Player disconnected:\s*([^,]+)", re.IGNORECASE)
 
 class SystemdRuntime:
     """
@@ -38,7 +43,8 @@ class SystemdRuntime:
         self._listeners: dict[str, list[LogListener]] = {}
         self._log_procs: dict[str, subprocess.Popen] = {}
         self._threads: dict[str, threading.Thread] = {}
-        self._online_players: dict[str, set[str]] = {}  # server_id -> set of names
+        # server_id -> {player_name: xuid_or_none}
+        self._online_players: dict[str, dict[str, str | None]] = {}
         self._lock = threading.Lock()
 
     # ---------------- START ----------------
@@ -56,7 +62,7 @@ class SystemdRuntime:
 
         # Clear player list for fresh start
         with self._lock:
-            self._online_players[request.server_id] = set()
+            self._online_players[request.server_id] = {}
 
         fifo_path = request.server_dir / "stdin.fifo"
         if not fifo_path.exists():
@@ -135,14 +141,19 @@ class SystemdRuntime:
         running = result.stdout.strip() == "active"
 
         with self._lock:
-            players = list(self._online_players.get(server_id, set()))
+            # Convert {player_name: xuid} dict to list of player names
+            players_dict = self._online_players.get(server_id, {})
+            players = list(players_dict.keys()) if players_dict else []
 
         return RuntimeStatus(
             running=running,
             runtime_id=unit if running else None,
             online_players=players if running else None,
         )
-
+    # Get players with their XUIDs (dict format: {name: xuid_or_none})
+    def get_online_players_with_xuid(self, server_id: str) -> dict[str, str | None]:
+        with self._lock:
+            return dict(self._online_players.get(server_id, {}))
     # ---------------- STATS (BASIC) ----------------
     def get_stats(self, server_id: str) -> RuntimeResourceStats:
         unit = self._unit_name(server_id)
@@ -296,9 +307,12 @@ class SystemdRuntime:
                     m_disc = _PLAYER_DISCONNECTED_RE.search(stripped)
                     with self._lock:
                         if m_conn:
-                            self._online_players.setdefault(server_id, set()).add(m_conn.group(1))
+                            player_name = m_conn.group(1).strip()
+                            xuid = m_conn.group(2) if m_conn.lastindex >= 2 else None
+                            self._online_players.setdefault(server_id, {})[player_name] = xuid
                         elif m_disc:
-                            self._online_players.setdefault(server_id, set()).discard(m_disc.group(1))
+                            player_name = m_disc.group(1).strip()
+                            self._online_players.setdefault(server_id, {}).pop(player_name, None)
                         listeners = list(self._listeners.get(server_id, []))
 
                     for cb in listeners:

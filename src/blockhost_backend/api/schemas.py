@@ -103,7 +103,7 @@ class BedrockServerStats(BaseModel):
     players_max: int | None = None
     server_id: int | None = None
     gamemode: str | None = None
-    online_players_list: list[str] = Field(default_factory=list)
+    online_players_list: list[PlayerInfo] = Field(default_factory=list)
     cpu_usage: float | None = None
     ram_usage_mb: float | None = None
     allocated_ram_mb: int | None = None
@@ -128,6 +128,12 @@ class CommandRequest(BaseModel):
     grant: bool | None = None
     mode: str | None = None
     value: str | None = None
+
+
+class PlayerInfo(BaseModel):
+    """Player info with name and XUID"""
+    name: str
+    xuid: str | None = None  # May be None if XUID not yet extracted from logs
     weather: str | None = None
     message: str | None = None
 

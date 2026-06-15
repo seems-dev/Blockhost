@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from blockhost_backend.database.types import GUID, JSONType
@@ -156,6 +156,28 @@ class Server(Base):
     backup_retention_days: Mapped[int] = mapped_column(Integer, nullable=False, default=365)
 
     owner: Mapped[User] = relationship(back_populates="servers")
+    bans: Mapped[list["Ban"]] = relationship(back_populates="server", cascade="all, delete-orphan")
+
+
+class Ban(Base):
+    __tablename__ = "bans"
+    __table_args__ = (
+        UniqueConstraint("server_id", "xuid", "active", name="uq_bans_server_xuid_active"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
+    server_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("servers.id"), index=True, nullable=False)
+    xuid: Mapped[str] = mapped_column(String(64), nullable=False)
+    player_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    banned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    unbanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), ForeignKey("users.id"), nullable=True)
+    unbanned_by_user_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), ForeignKey("users.id"), nullable=True)
+
+    server: Mapped["Server"] = relationship(back_populates="bans")
 
 
 class Backup(Base):

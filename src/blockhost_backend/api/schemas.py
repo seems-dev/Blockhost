@@ -133,6 +133,42 @@ class CommandRequest(BaseModel):
 
 
 
+class BanCreateRequest(BaseModel):
+    xuid: str = Field(min_length=1, max_length=64)
+    player_name: str | None = Field(default=None, max_length=64)
+    reason: str | None = Field(default=None, max_length=256)
+    duration_seconds: int | None = Field(default=None, ge=1)
+    expires_at: datetime | None = None
+
+
+class BanOut(BaseModel):
+    ban_id: uuid.UUID
+    server_id: uuid.UUID
+    xuid: str
+    player_name: str | None = None
+    reason: str | None = None
+    active: bool
+    banned_at: datetime
+    expires_at: datetime | None = None
+    unbanned_at: datetime | None = None
+    created_by_user_id: uuid.UUID | None = None
+    unbanned_by_user_id: uuid.UUID | None = None
+
+
+class BanListOut(BaseModel):
+    items: list[BanOut]
+
+
+class BanCheckResponse(BaseModel):
+    banned: bool
+    ban_id: uuid.UUID | None = None
+    xuid: str | None = None
+    player_name: str | None = None
+    reason: str | None = None
+    expires_at: datetime | None = None
+    active: bool | None = None
+
+
 class ServerConfigOut(BaseModel):
     id: uuid.UUID
     mc_config: BedrockConfig

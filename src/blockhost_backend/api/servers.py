@@ -5,16 +5,21 @@ import re
 import threading
 import time
 import uuid
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import asyncio
 import json
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status, WebSocket, WebSocketDisconnect
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from blockhost_backend.api.deps import get_current_user, get_ws_user
 from blockhost_backend.api.schemas import (
+    BanCheckResponse,
+    BanCreateRequest,
+    BanListOut,
+    BanOut,
     BedrockServerStats,
     CommandRequest,
     CreateServerRequest,
@@ -27,7 +32,7 @@ from blockhost_backend.api.schemas import (
 )
 from blockhost_backend.config.config_manager import get_settings
 from blockhost_backend.database.db import SessionLocal, get_db
-from blockhost_backend.database.schema import Server, ServerState, SubscriptionTier, User, VMProvider
+from blockhost_backend.database.schema import Ban, Server, ServerState, SubscriptionTier, User, VMProvider
 from blockhost_backend.minecraft.bedrock_ping import bedrock_unconnected_ping, parse_bedrock_pong_payload
 from blockhost_backend.minecraft.bedrock_properties import BedrockServerProperties, write_server_properties
 from blockhost_backend.minecraft.bedrock_download import ensure_version_installed, recommended_version
@@ -138,6 +143,68 @@ def _server_to_out(server: Server, owner: User | None = None) -> ServerOut:
         last_activity=server.last_activity,
         mc_config=server.mc_config,
     )
+
+
+def _server_to_detail(server: Server, owner: User | None = None) -> ServerDetail:
+    base = _server_to_out(server, owner=owner)
+    return ServerDetail(
+        **base.model_dump(),
+        minecraft_host=(server.vm_ipv4 or get_settings().minecraft_public_host),
+        minecraft_port=server.vm_port,
+    )
+
+
+def _ban_to_out(ban: Ban) -> BanOut:
+    return BanOut(
+        ban_id=ban.id,
+        server_id=ban.server_id,
+        xuid=ban.xuid,
+        player_name=ban.player_name,
+        reason=ban.reason,
+        active=ban.active,
+        banned_at=ban.banned_at,
+        expires_at=ban.expires_at,
+        unbanned_at=ban.unbanned_at,
+        created_by_user_id=ban.created_by_user_id,
+        unbanned_by_user_id=ban.unbanned_by_user_id,
+    )
+
+
+def _expire_ban_if_needed(ban: Ban, now: datetime) -> bool:
+    if ban.active and ban.expires_at is not None and ban.expires_at <= now:
+        ban.active = False
+        ban.unbanned_at = ban.expires_at or now
+        return True
+    return False
+
+
+def _resolve_active_ban(server_id: uuid.UUID, xuid: str, db: Session) -> Ban | None:
+    now = datetime.now(timezone.utc)
+    ban = db.scalars(
+        select(Ban)
+        .where(Ban.server_id == server_id, Ban.xuid == xuid, Ban.active == True)
+        .order_by(Ban.banned_at.desc())
+    ).one_or_none()
+    if ban and _expire_ban_if_needed(ban, now):
+        db.add(ban)
+        db.commit()
+        db.refresh(ban)
+        return None
+    return ban
+
+
+def _expire_expired_bans(server_id: uuid.UUID, db: Session) -> None:
+    now = datetime.now(timezone.utc)
+    expired_bans = db.scalars(
+        select(Ban)
+        .where(Ban.server_id == server_id, Ban.active == True, Ban.expires_at != None, Ban.expires_at <= now)
+    ).all()
+    for ban in expired_bans:
+        ban.active = False
+        ban.unbanned_at = ban.expires_at or now
+        db.add(ban)
+    if expired_bans:
+        db.commit()
 
 
 def _server_to_detail(server: Server, owner: User | None = None) -> ServerDetail:
@@ -1016,6 +1083,100 @@ def command_weather(server_id: str, req: CommandRequest, user: User = Depends(ge
 def command_say(server_id: str, req: CommandRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     _require_server(server_id, user, db)
     return _send_cmd(server_id, f"say {req.message}")
+
+
+@router.get("/{server_id}/bans", response_model=BanListOut)
+def list_bans(server_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    server = _require_server(server_id, user, db)
+    _expire_expired_bans(server.id, db)
+    bans = db.scalars(
+        select(Ban)
+        .where(Ban.server_id == server.id, Ban.active == True)
+        .order_by(Ban.banned_at.desc())
+    ).all()
+    return BanListOut(items=[_ban_to_out(ban) for ban in bans])
+
+
+@router.get("/{server_id}/bans/history", response_model=BanListOut)
+def list_ban_history(server_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    server = _require_server(server_id, user, db)
+    _expire_expired_bans(server.id, db)
+    bans = db.scalars(
+        select(Ban)
+        .where(Ban.server_id == server.id)
+        .order_by(Ban.banned_at.desc())
+    ).all()
+    return BanListOut(items=[_ban_to_out(ban) for ban in bans])
+
+
+@router.get("/{server_id}/bans/check", response_model=BanCheckResponse)
+def check_ban(server_id: str, xuid: str = Query(..., min_length=1), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    server = _require_server(server_id, user, db)
+    ban = _resolve_active_ban(server.id, xuid, db)
+    if not ban:
+        return BanCheckResponse(banned=False)
+    return BanCheckResponse(
+        banned=True,
+        ban_id=ban.id,
+        xuid=ban.xuid,
+        player_name=ban.player_name,
+        reason=ban.reason,
+        expires_at=ban.expires_at,
+        active=ban.active,
+    )
+
+
+@router.post("/{server_id}/bans", response_model=BanOut)
+def create_ban(server_id: str, payload: BanCreateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    server = _require_server(server_id, user, db)
+    expires_at = payload.expires_at
+    if expires_at is None and payload.duration_seconds is not None:
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=payload.duration_seconds)
+    if expires_at is not None and expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Expiration must be in the future")
+
+    existing = db.scalars(
+        select(Ban)
+        .where(Ban.server_id == server.id, Ban.xuid == payload.xuid, Ban.active == True)
+        .limit(1)
+    ).one_or_none()
+    if existing:
+        raise HTTPException(status_code=409, detail="Player is already banned")
+
+    ban = Ban(
+        server_id=server.id,
+        xuid=payload.xuid,
+        player_name=payload.player_name,
+        reason=payload.reason,
+        active=True,
+        expires_at=expires_at,
+        created_by_user_id=user.id,
+    )
+    db.add(ban)
+    db.commit()
+    db.refresh(ban)
+    return _ban_to_out(ban)
+
+
+@router.delete("/{server_id}/bans/{ban_id}", response_model=BanOut)
+def delete_ban(server_id: str, ban_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    server = _require_server(server_id, user, db)
+    try:
+        ban_uuid = uuid.UUID(ban_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Ban not found")
+    ban = db.get(Ban, ban_uuid)
+    if not ban or ban.server_id != server.id:
+        raise HTTPException(status_code=404, detail="Ban not found")
+    if ban.active:
+        ban.active = False
+        ban.unbanned_at = datetime.now(timezone.utc)
+        ban.unbanned_by_user_id = user.id
+        db.add(ban)
+        db.commit()
+        db.refresh(ban)
+    return _ban_to_out(ban)
+
 
 @router.get("/{server_id}/blocklist")
 def get_blocklist(server_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):

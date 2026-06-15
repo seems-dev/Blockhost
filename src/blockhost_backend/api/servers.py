@@ -880,16 +880,18 @@ async def console_websocket(
             await websocket.close(code=4000)
             return
 
+        import dataclasses
+        
         # Send last 500 lines as history
         history = _ORCHESTRATOR.read_logs(server_id, tail=500)
-        await websocket.send_json({"type": "history", "logs": history})
+        await websocket.send_json({"type": "history", "logs": [dataclasses.asdict(e) for e in history]})
 
         # Queue to bridge sync listener to async websocket
         queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
 
-        def on_log(entry: dict):
-            loop.call_soon_threadsafe(queue.put_nowait, entry)
+        def on_log(entry):
+            loop.call_soon_threadsafe(queue.put_nowait, dataclasses.asdict(entry))
 
         _ORCHESTRATOR.add_log_listener(server_id, on_log)
 

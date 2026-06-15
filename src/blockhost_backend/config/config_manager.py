@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     # Optional explicit executable name inside a version/server folder.
     # If empty, BlockHost will try common Bedrock server binary names.
     bedrock_executable_name: str = ""
-    bedrock_runtime_driver: str = "local_process"
+    bedrock_runtime_driver: str = "systemd"
 
     worker_agent_url: str = "http://localhost:9000"
     worker_agent_token: str = "change-me-in-dev"

@@ -49,6 +49,8 @@ class RuntimeStatus:
     running: bool
     runtime_id: str | None = None
     active_state: str | None = None
+    uptime_seconds: int | None = None
+    online_players: list[str] | None = None
 
 
 # -------------------------

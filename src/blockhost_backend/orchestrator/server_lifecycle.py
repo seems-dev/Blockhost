@@ -20,6 +20,7 @@ from blockhost_backend.runtime.interface import (
     RuntimeStartRequest,
     RuntimeStatus,
 )
+from blockhost_backend.services.ban_service import ban_service
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,9 @@ class ServerLifecycleOrchestrator:
 
     def is_running(self, server_id: str) -> bool:
         return self.get_status(server_id).running
+
+    def get_online_players_with_xuid(self, server_id: str) -> dict[str, str | None]:
+        return self._runtime.get_online_players_with_xuid(server_id)
 
     # ---------------- START ----------------
     def start_server(
@@ -97,6 +101,9 @@ class ServerLifecycleOrchestrator:
         server.vm_ipv4 = settings.minecraft_public_host
         server.vm_port = result.port
         server.state = ServerState.running
+
+        # Attach moderation listener
+        ban_service.attach_listener(str(server.id), self)
 
         logger.info(
             "Server %s started (runtime=%s, tier=%s, ram=%sMB, cpu=%s%%)",

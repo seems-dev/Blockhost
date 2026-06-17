@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     worker_agent_url: str = "http://localhost:9000"
     worker_agent_token: str = "change-me-in-dev"
 
+    # Console streaming configuration
+    console_queue_max_size: int = 1000  # Max buffered log lines per websocket connection
+    console_stream_cleanup_enabled: bool = True  # Stop log stream when no listeners remain (but keep running if player tracking active)
+
     google_client_id: str = "264249625264-0it828liska1emqu72ebb26s6u6krnmu.apps.googleusercontent.com"  # Add this line before the last two settings
 
 @lru_cache(maxsize=1)

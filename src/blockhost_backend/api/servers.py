@@ -258,7 +258,7 @@ def _compute_server_stats(server: Server, user: User) -> BedrockServerStats:
         pong = bedrock_unconnected_ping(host="127.0.0.1", port=port, timeout_seconds=1.0)
         parsed = parse_bedrock_pong_payload(pong.payload)
         # Convert online players dict to PlayerInfo list
-        players_with_xuid = runtime_status.runtime_id and _ORCHESTRATOR.get_online_players_with_xuid(server_id)
+        players_with_xuid = runtime_status.runtime_id and _ORCHESTRATOR.get_online_players_with_xuid(str(server.id))
         player_info_list = [
             PlayerInfo(name=name, xuid=xuid)
             for name, xuid in (players_with_xuid or {}).items()
@@ -955,17 +955,28 @@ async def console_websocket(
             return
 
         import dataclasses
+        from blockhost_backend.config.config_manager import get_settings
+        
+        settings = get_settings()
         
         # Send last 500 lines as history
         history = _ORCHESTRATOR.read_logs(server_id, tail=500)
         await websocket.send_json({"type": "history", "logs": [dataclasses.asdict(e) for e in history]})
 
-        # Queue to bridge sync listener to async websocket
-        queue = asyncio.Queue()
+        # Queue to bridge sync listener to async websocket (bounded to prevent unbounded memory growth)
+        queue = asyncio.Queue(maxsize=settings.console_queue_max_size)
         loop = asyncio.get_running_loop()
 
         def on_log(entry):
-            loop.call_soon_threadsafe(queue.put_nowait, dataclasses.asdict(entry))
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, dataclasses.asdict(entry))
+            except asyncio.QueueFull:
+                # Drop oldest entry when queue is full and add new one
+                try:
+                    queue.get_nowait()  # Discard oldest
+                    loop.call_soon_threadsafe(queue.put_nowait, dataclasses.asdict(entry))
+                except asyncio.QueueEmpty:
+                    pass  # Race condition, queue was emptied
 
         _ORCHESTRATOR.add_log_listener(server_id, on_log)
 
@@ -1162,6 +1173,10 @@ def create_ban(server_id: str, payload: BanCreateRequest, user: User = Depends(g
     db.add(ban)
     db.commit()
     db.refresh(ban)
+
+    from blockhost_backend.services.ban_service import ban_service
+    ban_service.kick_player_if_online(str(server.id), payload.xuid, payload.player_name, payload.reason, _ORCHESTRATOR)
+
     return _ban_to_out(ban)
 
 

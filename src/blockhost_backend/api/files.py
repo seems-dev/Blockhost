@@ -150,9 +150,6 @@ def read_file(
     if not target_file.exists() or not target_file.is_file():
         raise HTTPException(status_code=404, detail="File not found")
 
-    if target_file.suffix.lower() not in TEXT_EXTENSIONS:
-        raise HTTPException(status_code=415, detail="Unsupported media type for text editing")
-
     size = target_file.stat().st_size
     if size > MAX_EDIT_SIZE:
         raise HTTPException(status_code=413, detail=f"File too large to edit (max {MAX_EDIT_SIZE//1024//1024}MB)")
@@ -174,9 +171,6 @@ def write_file(
 ):
     server, server_root = _get_server_and_root(server_id, user, db)
     target_file = _validate_safe_path(server_root, path)
-
-    if target_file.suffix.lower() not in TEXT_EXTENSIONS:
-        raise HTTPException(status_code=415, detail="Unsupported media type for text editing")
 
     content_bytes = payload.content.encode("utf-8")
     if len(content_bytes) > MAX_EDIT_SIZE:
@@ -244,3 +238,34 @@ async def upload_file(
             buffer.write(chunk)
 
     return {"status": "ok", "filename": filename, "size": total_size}
+
+
+@router.delete("/delete")
+def delete_file_or_folder(
+    server_id: str,
+    path: str = Query(..., description="Relative path to delete"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    import shutil
+    server, server_root = _get_server_and_root(server_id, user, db)
+    target = _validate_safe_path(server_root, path)
+
+    # Prevent deleting the allowed roots themselves
+    for allowed in ALLOWED_ROOTS:
+        allowed_path = (server_root / allowed).resolve()
+        if target == allowed_path:
+            raise HTTPException(status_code=403, detail="Cannot delete root folders")
+
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Path not found")
+
+    try:
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete: {str(e)}")
+

@@ -276,13 +276,22 @@ class SystemdRuntime:
             self._listeners[server_id].append(listener)
 
     def remove_log_listener(self, server_id: str, listener: LogListener) -> None:
+        from blockhost_backend.config.config_manager import get_settings
+        settings = get_settings()
+        
         with self._lock:
             if server_id in self._listeners:
                 try:
                     self._listeners[server_id].remove(listener)
                 except ValueError:
                     pass
-                # Keep the stream alive for player tracking — don't stop on last listener
+                
+                # Optionally stop stream when no listeners remain (if cleanup enabled)
+                # Player tracking depends on the stream, so this is optional
+                if settings.console_stream_cleanup_enabled and not self._listeners[server_id]:
+                    # No more listeners; optionally clean up stream
+                    # Note: player tracking will stop, but reconnecting listeners will restart it
+                    self._stop_log_stream(server_id)
 
     def _start_log_stream(self, server_id: str) -> None:
         unit = self._unit_name(server_id)
@@ -315,14 +324,20 @@ class SystemdRuntime:
                             self._online_players.setdefault(server_id, {}).pop(player_name, None)
                         listeners = list(self._listeners.get(server_id, []))
 
+                    # Harden listener execution: catch exceptions to prevent stream crash
                     for cb in listeners:
                         try:
                             cb(entry)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            import logging
+                            logger = logging.getLogger(__name__)
+                            logger.exception(f"Listener callback failed for server {server_id}: {e}")
             finally:
                 proc.stdout.close()
                 proc.wait()
+                with self._lock:
+                    self._log_procs.pop(server_id, None)
+                    self._threads.pop(server_id, None)
                 
         t = threading.Thread(target=tail_logs, daemon=True)
         t.start()

@@ -82,6 +82,9 @@ class Runtime(Protocol):
     def get_stats(self, server_id: str) -> RuntimeResourceStats:
         ...
 
+    def get_online_players_with_xuid(self, server_id: str) -> dict[str, str | None]:
+        ...
+
     def read_logs(self, server_id: str, *, tail: int = 200) -> list[LogEntry]:
         ...
 

@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "recommended_version": "1.20.12.01",
+  "recommended_version": "1.20.12",
   "versions": {
-    "1.20.12.01": {
+    "1.20.12": {
       "linux_x86_64": {
         "url": "https://minecraft.net/bedrockdedicatedserver/bin-linux/bedrock-server-1.20.12.01.zip",
         "sha256": ""

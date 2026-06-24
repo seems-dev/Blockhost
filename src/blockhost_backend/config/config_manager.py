@@ -28,13 +28,26 @@ class Settings(BaseSettings):
     bedrock_versions_manifest: str = "versions/manifest.json"
     bedrock_port_range_start: int = 19132
     bedrock_port_range_end: int = 19232
+    backup_storage_dir: str = "backups"
+    backup_temp_dir: str = "backups/tmp"
+    backup_retention_count: int = 7
+    backup_save_hold_seconds: float = 2.0
+    backup_worker_threads: int = 2
+    backup_scheduler_enabled: bool = True
+    backup_scheduler_poll_seconds: int = 60
     # Optional explicit executable name inside a version/server folder.
     # If empty, BlockHost will try common Bedrock server binary names.
     bedrock_executable_name: str = ""
+    bedrock_runtime_driver: str = "systemd"
 
     worker_agent_url: str = "http://localhost:9000"
     worker_agent_token: str = "change-me-in-dev"
 
+    # Console streaming configuration
+    console_queue_max_size: int = 1000  # Max buffered log lines per websocket connection
+    console_stream_cleanup_enabled: bool = True  # Stop log stream when no listeners remain (but keep running if player tracking active)
+
+    google_client_id: str = "264249625264-0it828liska1emqu72ebb26s6u6krnmu.apps.googleusercontent.com"  # Add this line before the last two settings
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

@@ -1,0 +1,124 @@
+# BlockHost Flutter Client - pubspec.yaml
+# 
+# This is a partial pubspec.yaml showing the required dependencies
+# for the relay_service and server_manager to work.
+#
+# Merge these dependencies with your existing pubspec.yaml
+
+name: blockhost_client
+description: Minecraft Bedrock server relay client for BlockHost
+
+# The following line prevents the package from being accidentally published to
+# pub.dev using `flutter pub publish`. This is preferred for private packages.
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: '>=3.10.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Core dependencies (required)
+  http: ^1.1.0                    # HTTP client for relay communication
+  
+  # UI dependencies
+  cupertino_icons: ^1.0.2         # iOS style icons
+  
+  # State management (optional - choose one or implement your own)
+  # provider: ^6.0.0
+  # riverpod: ^2.4.0
+  
+  # Storage (optional - for persisting user info)
+  shared_preferences: ^2.2.0      # Simple key-value storage
+  
+  # Utilities (optional)
+  uuid: ^4.0.0                    # Generate device UUIDs
+  intl: ^0.19.0                   # Internationalization
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  # Linting
+  flutter_lints: ^3.0.0
+  
+  # Testing (optional)
+  mocktail: ^1.0.0                # Mocking for tests
+  
+flutter:
+  uses-material-design: true
+  
+  # Assets (optional - add game assets, icons, etc.)
+  # assets:
+  #   - assets/
+  #   - assets/icons/
+  #   - assets/images/
+  
+  # Fonts (optional)
+  # fonts:
+  #   - family: Roboto
+  #     fonts:
+  #       - asset: assets/fonts/Roboto-Regular.ttf
+  #       - asset: assets/fonts/Roboto-Bold.ttf
+  #         weight: 700
+
+
+# ============================================================================
+# Setup Instructions:
+# ============================================================================
+#
+# 1. Add these dependencies to your existing pubspec.yaml:
+#
+#    dependencies:
+#      http: ^1.1.0
+#
+# 2. Run: flutter pub get
+#
+# 3. Import in your code:
+#
+#    import 'package:blockhost_client/services/relay_service.dart';
+#    import 'package:blockhost_client/services/server_manager.dart';
+#
+# 4. Use in your Flutter app:
+#
+#    final manager = ServerManager(
+#      userId: 'device-123',
+#      authToken: 'secret-token',
+#    );
+#
+# ============================================================================
+# Platform-Specific Setup:
+# ============================================================================
+#
+# Android (ios/Podfile, already configured for newer Flutter):
+# - No additional setup needed for http package
+#
+# iOS (ios/Podfile):
+# - No additional setup needed for http package
+#
+# Web:
+# - http package works on web (uses XMLHttpRequest/fetch)
+#
+# Linux/Windows/macOS:
+# - http package supported via platform channels
+#
+# ============================================================================
+# Common Issues:
+# ============================================================================
+#
+# 1. "http package not found"
+#    Solution: flutter pub get
+#
+# 2. "Cannot find package blockhost_client"
+#    Make sure relay_service.dart is in lib/services/
+#    Import: import 'package:blockhost_client/services/relay_service.dart';
+#
+# 3. "HTTP connection refused"
+#    Check relay_service.py is running on http://localhost:8000
+#    Or update the relayUrl in RelayService constructor
+#
+# ============================================================================

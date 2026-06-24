@@ -105,3 +105,6 @@ servers/
 *.zip
 versions/*
 !versions/manifest.json
+flutter_client/android/
+flutter_client/ios/
+flutter_client/macos/

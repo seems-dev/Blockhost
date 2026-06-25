@@ -73,12 +73,53 @@ def materialize_server_dir(*, version_dir: Path, servers_dir: Path, server_id: s
     if not version_dir.exists():
         raise FileNotFoundError(f"Version directory does not exist: {version_dir}")
     
+    # When materializing a new server, avoid duplicating large Bedrock binaries.
+    # Create the server directory, copy most files/directories, but create
+    # relative symlinks for the Bedrock executable and shared libraries so the
+    # canonical copy in versions/ is used.
+    BINARY_WHITELIST = ("bedrock_server", "bedrock_server.exe", "bedrock_server_symbols.debug")
+    SO_RE = re.compile(r"^lib.*\.so(?:\..*)?$")
+
     try:
-        shutil.copytree(version_dir, server_dir)
+        server_dir.mkdir(parents=True, exist_ok=False)
+
+        for child in version_dir.iterdir():
+            target = server_dir / child.name
+            try:
+                if child.is_dir():
+                    # Copy directories entirely (world templates, resource packs, etc.)
+                    shutil.copytree(child, target)
+                elif child.is_file():
+                    name = child.name
+                    # If this is a Bedrock binary or shared library, create a relative symlink
+                    if name in BINARY_WHITELIST or SO_RE.match(name):
+                        # Ensure the canonical version binary/lib is executable where appropriate
+                        try:
+                            st = child.stat()
+                            # Add owner/group/other execute bits if any execute bit is missing
+                            if not (st.st_mode & 0o111):
+                                child.chmod(st.st_mode | 0o111)
+                        except Exception:
+                            # Non-fatal: continue and attempt to symlink
+                            pass
+                        rel = os.path.relpath(child, start=server_dir)
+                        os.symlink(rel, target)
+                    else:
+                        # Regular file: copy attributes
+                        shutil.copy2(child, target)
+                else:
+                    # Skip other file types (symlinks, sockets) for now
+                    pass
+            except Exception:
+                # Clean up partial server dir on per-child failure
+                if server_dir.exists():
+                    shutil.rmtree(server_dir, ignore_errors=True)
+                raise
+
     except Exception as e:
-        # Clean up partial copy if something went wrong
+        # Ensure no partial server dir remains
         if server_dir.exists():
             shutil.rmtree(server_dir, ignore_errors=True)
-        raise RuntimeError(f"Failed to copy version template to {server_dir}: {e}")
-    
+        raise RuntimeError(f"Failed to materialize version template to {server_dir}: {e}")
+
     return server_dir

@@ -36,6 +36,12 @@ from blockhost_backend.database.schema import (
     User,
     utcnow,
 )
+from blockhost_backend.services.system_health import (
+    DiskProtectionError,
+    WorldSizeLimitError,
+    assert_disk_usage_safe,
+    assert_world_size_within_plan,
+)
 from blockhost_backend.orchestrator.backup import (
     ACTIVE_BACKUP_STATUSES,
     ACTIVE_RESTORE_STATUSES,
@@ -56,6 +62,32 @@ def _parse_uuid(value: str) -> uuid.UUID:
         return uuid.UUID(value)
     except ValueError:
         raise HTTPException(status_code=404, detail="Not found")
+
+
+
+
+def _guard_disk_for_operation(operation: str) -> None:
+    try:
+        assert_disk_usage_safe(operation)
+    except DiskProtectionError as exc:
+        raise HTTPException(status_code=503, detail={"error": exc.message})
+
+
+def _world_path(server: Server) -> Path:
+    mc_config = server.mc_config or {}
+    server_dir = Path(str(mc_config.get("server_dir") or ""))
+    world_name = str(mc_config.get("level_name") or server.world_name)
+    world_path = server_dir / "worlds" / world_name
+    if world_path.exists():
+        return world_path
+    return server_dir / "worlds"
+
+
+def _guard_world_size_for_backup(server: Server, user: User) -> None:
+    try:
+        assert_world_size_within_plan(_world_path(server), )
+    except WorldSizeLimitError as exc:
+        raise HTTPException(status_code=413, detail={"error": exc.message})
 
 
 def _require_server(server_id: str, user: User, db: Session) -> Server:
@@ -271,6 +303,9 @@ def create_backup(
         if idempotent:
             return _backup_job_to_out(idempotent, already_running=idempotent.status in ACTIVE_BACKUP_STATUSES)
 
+    _guard_disk_for_operation("create_backup")
+    _guard_world_size_for_backup(server, user)
+
     world_name = str((server.mc_config or {}).get("level_name") or server.world_name)
     backup = Backup(
         server_id=server.id,
@@ -433,6 +468,8 @@ def create_restore(
         raise HTTPException(status_code=409, detail="Backup already active for this server")
     if _active_restore(db, server.id):
         raise HTTPException(status_code=409, detail="Restore already active for this server")
+
+    _guard_disk_for_operation("create_restore")
 
     job = RestoreJob(
         backup_id=backup.id,

@@ -5,9 +5,9 @@ from datetime import datetime
 
 from pydantic import BaseModel, EmailStr, Field
 
-from blockhost_backend.database.schema import BackupKind, BackupStatus, RestoreStatus, ServerState, SubscriptionTier, VMProvider
+from blockhost_backend.database.schema import BackupKind, BackupStatus, RestoreStatus, ServerState,  VMProvider
 
-
+#file_name = schemas.py
 class BedrockConfig(BaseModel):
     # Mirrors common `server.properties` keys supported by popular Bedrock server containers.
     # `bedrock_image` allows pinning a per-server container image/tag (version).
@@ -48,7 +48,7 @@ class UserOut(BaseModel):
     nickname: str
     referrer_code: str
     blockcoin_balance: int
-    subscription_tier: SubscriptionTier
+    
 
 
 class AuthResponse(BaseModel):
@@ -59,7 +59,7 @@ class AuthResponse(BaseModel):
 
 class CreateServerRequest(BaseModel):
     world_name: str = Field(min_length=1, max_length=128)
-    tier: SubscriptionTier = SubscriptionTier.free
+    
     config: BedrockConfig | None = None
 
 

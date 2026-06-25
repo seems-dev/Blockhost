@@ -33,8 +33,19 @@ class Settings(BaseSettings):
     backup_retention_count: int = 7
     backup_save_hold_seconds: float = 2.0
     backup_worker_threads: int = 2
-    backup_scheduler_enabled: bool = True
+    backup_scheduler_enabled: bool = False
     backup_scheduler_poll_seconds: int = 60
+    subscription_expiration_enabled: bool = True
+    subscription_expiration_poll_seconds: int = 60
+    subscription_grace_period_days: int = 3
+    billing_provider: str = "test"
+    billing_signature_secret: str = "change-me-billing-secret"
+    disk_warning_threshold_percent: float = 80.0
+    disk_critical_threshold_percent: float = 90.0
+    disk_health_monitor_enabled: bool = True
+    disk_health_check_interval_seconds: int = 10 * 60
+    free_world_limit_gb: float = 2.0
+    premium_world_limit_gb: float = 10.0
     # Optional explicit executable name inside a version/server folder.
     # If empty, BlockHost will try common Bedrock server binary names.
     bedrock_executable_name: str = ""

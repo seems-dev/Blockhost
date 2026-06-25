@@ -118,10 +118,11 @@ class SystemdRuntime:
             capture_output=True
         )
 
-        # Clear player list on stop and stop log stream
+        # Clear player list on stop, stop log stream, and clear listeners
         with self._lock:
             self._online_players.pop(server_id, None)
             self._stop_log_stream(server_id)
+            self._listeners.pop(server_id, None)
 
     # ---------------- RESTART ----------------
     def restart_server(self, request: RuntimeStartRequest) -> RuntimeStartResult:
@@ -141,6 +142,9 @@ class SystemdRuntime:
         running = result.stdout.strip() == "active"
 
         with self._lock:
+            if not running:
+                self._stop_log_stream(server_id)
+                self._listeners.pop(server_id, None)
             # Convert {player_name: xuid} dict to list of player names
             players_dict = self._online_players.get(server_id, {})
             players = list(players_dict.keys()) if players_dict else []

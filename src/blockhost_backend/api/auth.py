@@ -88,7 +88,7 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)) -> AuthRespons
             nickname=user.nickname,
             referrer_code=user.referrer_code,
             blockcoin_balance=user.blockcoin_balance,
-            subscription_tier=user.subscription_tier,
+           
         ),
     )
 
@@ -113,7 +113,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
             nickname=user.nickname,
             referrer_code=user.referrer_code,
             blockcoin_balance=user.blockcoin_balance,
-            subscription_tier=user.subscription_tier,
+            
         ),
     )
 
@@ -251,6 +251,6 @@ def google_login(
             nickname=user.nickname,
             referrer_code=user.referrer_code,
             blockcoin_balance=user.blockcoin_balance,
-            subscription_tier=user.subscription_tier,
+            
         ),
     )

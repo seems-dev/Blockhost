@@ -5,11 +5,11 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, Index, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from blockhost_backend.database.types import GUID, JSONType
-
+#file_name = schema.pyS
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -19,27 +19,18 @@ class Base(DeclarativeBase):
     pass
 
 
-class SubscriptionTier(str, enum.Enum):
-    free = "free"
-    premium = "premium"
+class BillingSubscriptionStatus(str, enum.Enum):
+    active = "active"
+    grace_period = "grace_period"
+    suspended = "suspended"
+    cancelled = "cancelled"
 
 
-
-
-def get_subscription_str(obj) -> str:
-    """
-    Return the subscription tier name as a plain string.
-    Accepts either a `SubscriptionTier` enum or an object (e.g., `User`)
-    with a `subscription_tier` attribute.
-    """
-    if isinstance(obj, SubscriptionTier):
-        return obj.value
-    tier = getattr(obj, "subscription_tier", None)
-    if isinstance(tier, SubscriptionTier):
-        return tier.value
-    if isinstance(tier, str):
-        return tier
-    return str(tier)
+class BillingTransactionStatus(str, enum.Enum):
+    pending = "pending"
+    paid = "paid"
+    failed = "failed"
+    refunded = "refunded"
 
 
 class ServerState(str, enum.Enum):
@@ -114,7 +105,7 @@ class User(Base):
     referred_by_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), ForeignKey("users.id"), nullable=True)
     blockcoin_balance: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     stripe_customer_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    subscription_tier: Mapped[SubscriptionTier] = mapped_column(Enum(SubscriptionTier), nullable=False, default=SubscriptionTier.free)
+   
  
     # --- OAuth fields ---
     google_sub: Mapped[str | None] = mapped_column(String(128), unique=True, index=True, nullable=True)
@@ -157,6 +148,80 @@ class Server(Base):
 
     owner: Mapped[User] = relationship(back_populates="servers")
     bans: Mapped[list["Ban"]] = relationship(back_populates="server", cascade="all, delete-orphan")
+
+
+class BillingPlan(Base):
+    __tablename__ = "plans"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    ram_mb: Mapped[int] = mapped_column(Integer, nullable=False)
+    cpu_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    storage_mb: Mapped[int] = mapped_column(Integer, nullable=False)
+    player_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    duration_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    subscriptions: Mapped[list["BillingSubscription"]] = relationship(back_populates="plan")
+
+
+class BillingSubscription(Base):
+    __tablename__ = "subscriptions"
+    __table_args__ = (
+        Index(
+            "uq_alive_subscription_per_server",
+            "server_id",
+            unique=True,
+            postgresql_where=text("status IN ('active', 'grace_period')")
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("users.id"), index=True, nullable=False)
+    server_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("servers.id"), index=True, nullable=False)
+    plan_id: Mapped[str] = mapped_column(String(64), ForeignKey("plans.id"), index=True, nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    status: Mapped[BillingSubscriptionStatus] = mapped_column(
+        Enum(BillingSubscriptionStatus), index=True, nullable=False, default=BillingSubscriptionStatus.active
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+    plan: Mapped[BillingPlan] = relationship(back_populates="subscriptions")
+
+
+class BillingTransaction(Base):
+    __tablename__ = "transactions"
+
+    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("users.id"), index=True, nullable=False)
+    server_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("servers.id"), index=True, nullable=False)
+    subscription_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), ForeignKey("subscriptions.id"), nullable=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_order_id: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
+    provider_payment_id: Mapped[str | None] = mapped_column(String(128), unique=True, nullable=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="INR")
+    status: Mapped[BillingTransactionStatus] = mapped_column(
+        Enum(BillingTransactionStatus), index=True, nullable=False, default=BillingTransactionStatus.pending
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    target_plan_id: Mapped[str] = mapped_column(String(64), ForeignKey("plans.id"), nullable=False)
+
+
+class BillingAuditLog(Base):
+    __tablename__ = "billing_audit_logs"
+
+    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("users.id"), index=True, nullable=False)
+    server_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("servers.id"), index=True, nullable=False)
+    transaction_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), ForeignKey("transactions.id"), nullable=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    details: Mapped[dict] = mapped_column(JSONType, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
 class Ban(Base):

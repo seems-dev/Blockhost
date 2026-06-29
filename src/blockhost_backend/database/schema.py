@@ -168,14 +168,6 @@ class BillingPlan(Base):
 
 class BillingSubscription(Base):
     __tablename__ = "subscriptions"
-    __table_args__ = (
-        Index(
-            "uq_alive_subscription_per_server",
-            "server_id",
-            unique=True,
-            postgresql_where=text("status IN ('active', 'grace_period')")
-        ),
-    )
 
     id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("users.id"), index=True, nullable=False)
@@ -210,6 +202,12 @@ class BillingTransaction(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     target_plan_id: Mapped[str] = mapped_column(String(64), ForeignKey("plans.id"), nullable=False)
+
+    subscription: Mapped["BillingSubscription | None"] = relationship(
+        "BillingSubscription",
+        foreign_keys=[subscription_id],
+        lazy="select",
+    )
 
 
 class BillingAuditLog(Base):

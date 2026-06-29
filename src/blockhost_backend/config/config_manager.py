@@ -3,8 +3,6 @@ from __future__ import annotations
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file="src/.env", env_file_encoding="utf-8", extra="ignore")
 
@@ -58,7 +56,10 @@ class Settings(BaseSettings):
     console_queue_max_size: int = 1000  # Max buffered log lines per websocket connection
     console_stream_cleanup_enabled: bool = True  # Stop log stream when no listeners remain (but keep running if player tracking active)
 
-    google_client_id: str = "264249625264-0it828liska1emqu72ebb26s6u6krnmu.apps.googleusercontent.com"  # Add this line before the last two settings
+    google_client_id: str = ""
+    razorpay_key_id: str = ""
+    razorpay_key_secret: str = ""          # matches RAZORPAY_KEY_SECRET in .env
+    razorpay_webhook_secret: str = ""     # matches RAZORPAY_WEBHOOK_SECRET in .env
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

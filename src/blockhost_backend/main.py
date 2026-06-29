@@ -74,21 +74,22 @@ def _create_tables() -> None:
     if engine.dialect.name == "postgresql":
         with engine.begin() as conn:
             conn.execute(
-            text(
-                "ALTER TABLE servers "
-                "ADD COLUMN IF NOT EXISTS mc_config JSONB NOT NULL DEFAULT '{}'::jsonb"
+                text(
+                    "ALTER TABLE servers "
+                    "ADD COLUMN IF NOT EXISTS mc_config JSONB NOT NULL DEFAULT '{}'::jsonb"
+                )
             )
-        )
-        conn.execute(text(
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sub VARCHAR(128)"
-        ))
-        conn.execute(text(
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(32) NOT NULL DEFAULT 'local'"
-        ))
-        conn.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_users_google_sub ON users (google_sub) WHERE google_sub IS NOT NULL"
-        ))
-        conn.execute(text(
-            "CREATE INDEX IF NOT EXISTS ix_users_google_sub ON users (google_sub)"
-        ))
+            conn.execute(text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sub VARCHAR(128)"
+            ))
+            conn.execute(text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(32) NOT NULL DEFAULT 'local'"
+            ))
+            conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_users_google_sub ON users (google_sub) WHERE google_sub IS NOT NULL"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_users_google_sub ON users (google_sub)"
+            ))
     start_disk_health_monitor_once()
+

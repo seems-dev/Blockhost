@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hmac
 import logging
 import threading
 import time
@@ -9,6 +8,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
 
+import razorpay
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -51,23 +51,28 @@ class ProviderOrder:
     currency: str
 
 
-def _amount(value: Decimal) -> str:
-    return f"{value.quantize(Decimal('0.01'))}"
-
-
-def sign_payment_payload(*, provider_order_id: str, provider_payment_id: str, amount: Decimal, currency: str) -> str:
-    settings = get_settings()
-    body = f"{provider_order_id}|{provider_payment_id}|{_amount(amount)}|{currency.upper()}".encode("utf-8")
-    return hmac.new(settings.billing_signature_secret.encode("utf-8"), body, "sha256").hexdigest()
-
-
 def create_provider_order(*, amount: Decimal, currency: str) -> ProviderOrder:
-    return ProviderOrder(
-        provider=get_settings().billing_provider,
-        provider_order_id=f"order_{uuid.uuid4().hex}",
-        amount=amount,
-        currency=currency.upper(),
-    )
+    """Create a Razorpay order and return its ID + metadata."""
+    settings = get_settings()
+    client = razorpay.Client(auth=(settings.razorpay_key_id, settings.razorpay_key_secret))
+
+    # Razorpay expects amount in paise (₹399 → 39900)
+    amount_paise = int(amount * 100)
+
+    try:
+        order_data = client.order.create(data={
+            "amount": amount_paise,
+            "currency": currency.upper(),
+            "payment_capture": 1,  # Auto-capture on payment
+        })
+        return ProviderOrder(
+            provider="razorpay",
+            provider_order_id=order_data["id"],  # e.g. order_P8i3jXYZ...
+            amount=amount,
+            currency=currency.upper(),
+        )
+    except razorpay.errors.RazorpayError as e:
+        raise BillingError("razorpay_order_failed", str(e))
 
 
 def verify_provider_signature(
@@ -78,13 +83,22 @@ def verify_provider_signature(
     currency: str,
     signature: str,
 ) -> bool:
-    expected = sign_payment_payload(
-        provider_order_id=provider_order_id,
-        provider_payment_id=provider_payment_id,
-        amount=amount,
-        currency=currency,
-    )
-    return hmac.compare_digest(expected, signature)
+    """
+    Verify the Razorpay payment signature returned by the Checkout SDK.
+    Uses the Razorpay SDK's built-in HMAC-SHA256 verification.
+    """
+    settings = get_settings()
+    client = razorpay.Client(auth=(settings.razorpay_key_id, settings.razorpay_key_secret))
+
+    try:
+        client.utility.verify_payment_signature({
+            "razorpay_order_id": provider_order_id,
+            "razorpay_payment_id": provider_payment_id,
+            "razorpay_signature": signature,
+        })
+        return True
+    except razorpay.errors.SignatureVerificationError:
+        return False
 
 
 def invalidate_billing_caches(*, user_id: uuid.UUID, server_id: uuid.UUID) -> None:
@@ -141,72 +155,43 @@ def create_upgrade_transaction(
     return tx, order
 
 
-def verify_upgrade_payment(
+def _activate_subscription(
     *,
     db: Session,
-    user_id: uuid.UUID,
-    provider_order_id: str,
+    tx: BillingTransaction,
     provider_payment_id: str,
-    signature: str,
-    amount: Decimal | None = None,
-    currency: str | None = None,
 ) -> tuple[BillingTransaction, BillingSubscription]:
-    tx = db.execute(
-        select(BillingTransaction)
-        .where(BillingTransaction.provider_order_id == provider_order_id)
-        .with_for_update()
-    ).scalars().one_or_none()
-    if tx is None:
-        raise BillingError("order_not_found", "Payment order not found")
-    if tx.user_id != user_id:
-        raise BillingError("unauthorized", "User does not own this transaction")
-
+    """
+    Internal: assumes payment authenticity is already verified by the caller.
+    Creates the subscription record and marks the transaction as paid.
+    Safe to call from both the /verify endpoint and the Razorpay webhook handler.
+    """
+    # Already paid — idempotent early return
     if tx.status == BillingTransactionStatus.paid:
         subscription = db.get(BillingSubscription, tx.subscription_id) if tx.subscription_id else None
         if subscription is None:
-            raise BillingError("transaction_inconsistent", "Paid transaction is missing subscription")
+            raise BillingError("transaction_inconsistent", "Paid transaction is missing its subscription record")
         return tx, subscription
+
     if tx.status != BillingTransactionStatus.pending:
-        raise BillingError("transaction_not_pending", "Transaction is not pending")
-
-    # Check for duplicate payment ID to prevent replay/double-spend attacks
-    dup = db.execute(
-        select(BillingTransaction).where(
-            BillingTransaction.provider_payment_id == provider_payment_id,
-            BillingTransaction.status == BillingTransactionStatus.paid
-        )
-    ).scalars().first()
-    if dup is not None:
-        raise BillingError("payment_id_reused", "This payment ID has already been verified and processed")
-
-    expected_amount = Decimal(tx.amount)
-    expected_currency = tx.currency.upper()
-    if amount is not None and Decimal(amount).quantize(Decimal("0.01")) != expected_amount.quantize(Decimal("0.01")):
-        raise BillingError("amount_mismatch", "Payment amount does not match")
-    if currency is not None and currency.upper() != expected_currency:
-        raise BillingError("currency_mismatch", "Payment currency does not match")
-    if not verify_provider_signature(
-        provider_order_id=provider_order_id,
-        provider_payment_id=provider_payment_id,
-        amount=expected_amount,
-        currency=expected_currency,
-        signature=signature,
-    ):
-        raise BillingError("invalid_signature", "Payment signature verification failed")
+        raise BillingError("transaction_not_pending", "Transaction is not in a pending state")
 
     try:
         server = db.get(Server, tx.server_id)
         plan = db.get(BillingPlan, tx.target_plan_id)
         if server is None or plan is None or not plan.active:
-            raise BillingError("upgrade_target_missing", "Upgrade target no longer exists")
+            raise BillingError("upgrade_target_missing", "Upgrade target server or plan no longer exists")
 
         now = utcnow()
+
+        # Cancel any existing active/grace-period subscriptions for this server
         existing = db.execute(
             select(BillingSubscription).where(
                 BillingSubscription.server_id == tx.server_id,
-                BillingSubscription.status.in_(
-                    [BillingSubscriptionStatus.active, BillingSubscriptionStatus.grace_period]
-                ),
+                BillingSubscription.status.in_([
+                    BillingSubscriptionStatus.active,
+                    BillingSubscriptionStatus.grace_period,
+                ]),
             )
         ).scalars().all()
         for sub in existing:
@@ -233,25 +218,24 @@ def verify_upgrade_payment(
 
         _apply_plan_limits_to_server(server, plan)
         db.add(server)
-        db.add(
-            BillingAuditLog(
-                user_id=tx.user_id,
-                server_id=tx.server_id,
-                transaction_id=tx.id,
-                action="subscription_upgraded",
-                details={
-                    "plan_id": plan.id,
-                    "provider": tx.provider,
-                    "provider_order_id": tx.provider_order_id,
-                    "provider_payment_id": provider_payment_id,
-                },
-            )
-        )
+        db.add(BillingAuditLog(
+            user_id=tx.user_id,
+            server_id=tx.server_id,
+            transaction_id=tx.id,
+            action="subscription_upgraded",
+            details={
+                "plan_id": plan.id,
+                "provider": tx.provider,
+                "provider_order_id": tx.provider_order_id,
+                "provider_payment_id": provider_payment_id,
+            },
+        ))
         db.commit()
-    except IntegrityError as exc:
+    except IntegrityError:
         db.rollback()
-        if "provider_payment_id" in str(exc).lower():
-            raise BillingError("payment_id_reused", "This payment ID has already been verified and processed")
+        raise BillingError("payment_id_reused", "This payment ID has already been processed")
+    except BillingError:
+        db.rollback()
         raise
     except Exception:
         db.rollback()
@@ -261,6 +245,81 @@ def verify_upgrade_payment(
     db.refresh(tx)
     db.refresh(subscription)
     return tx, subscription
+
+
+def verify_upgrade_payment(
+    *,
+    db: Session,
+    user_id: uuid.UUID,
+    provider_order_id: str,
+    provider_payment_id: str,
+    signature: str,
+    amount: Decimal | None = None,
+    currency: str | None = None,
+) -> tuple[BillingTransaction, BillingSubscription]:
+    """
+    Client-side payment verification flow (called from POST /api/billing/verify).
+
+    1. Loads the pending transaction.
+    2. Verifies the Razorpay HMAC signature from the Checkout SDK callback.
+    3. Creates the subscription and marks the transaction paid.
+    """
+    tx = db.execute(
+        select(BillingTransaction)
+        .where(BillingTransaction.provider_order_id == provider_order_id)
+        .with_for_update()
+    ).scalars().one_or_none()
+
+    if tx is None:
+        raise BillingError("order_not_found", "Payment order not found")
+    if tx.user_id != user_id:
+        raise BillingError("unauthorized", "You do not own this transaction")
+
+    # If already paid (e.g. webhook beat us here), return idempotently
+    if tx.status == BillingTransactionStatus.paid:
+        return _activate_subscription(db=db, tx=tx, provider_payment_id=provider_payment_id)
+
+    # Verify the Razorpay payment signature
+    if not verify_provider_signature(
+        provider_order_id=provider_order_id,
+        provider_payment_id=provider_payment_id,
+        amount=tx.amount,
+        currency=tx.currency,
+        signature=signature,
+    ):
+        raise BillingError("invalid_signature", "Payment signature is invalid")
+
+    return _activate_subscription(db=db, tx=tx, provider_payment_id=provider_payment_id)
+
+
+def fulfill_webhook_payment(
+    *,
+    db: Session,
+    provider_order_id: str,
+    provider_payment_id: str,
+) -> tuple[BillingTransaction, BillingSubscription] | None:
+    """
+    Webhook-triggered fulfillment (called from POST /api/billing/webhook/razorpay).
+
+    The caller (webhook handler) has already verified the Razorpay webhook HMAC signature,
+    so we trust the payment data and skip the per-payment signature check here.
+
+    Returns None if the transaction is not found or already processed (safe to ignore).
+    """
+    tx = db.execute(
+        select(BillingTransaction)
+        .where(
+            BillingTransaction.provider_order_id == provider_order_id,
+            BillingTransaction.status == BillingTransactionStatus.pending,
+        )
+        .with_for_update()
+    ).scalars().one_or_none()
+
+    if tx is None:
+        # Transaction not found or already fulfilled — not an error for the webhook
+        return None
+
+    return _activate_subscription(db=db, tx=tx, provider_payment_id=provider_payment_id)
 
 
 def ensure_server_not_billing_suspended(*, db: Session, server: Server) -> None:
@@ -324,7 +383,7 @@ def process_subscription_expirations(db: Session) -> dict[str, int]:
             except Exception:
                 logger.exception("Failed to stop suspended server %s", server.id)
             server.state = ServerState.suspended
-            # Reset mc_config limits to tier defaults or clear resource_limits
+            # Clear resource limits — server is no longer on a paid plan
             cfg = dict(server.mc_config or {})
             cfg.pop("resource_limits", None)
             cfg.pop("billing_plan_id", None)

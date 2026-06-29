@@ -33,22 +33,32 @@ def test_verify_upgrade_payment_unauthorized():
 @patch('blockhost_backend.services.billing.verify_provider_signature')
 @patch('blockhost_backend.services.billing.utcnow')
 def test_verify_upgrade_payment_duplicate_payment_id(mock_utcnow, mock_verify_sig):
+    from blockhost_backend.database.schema import BillingTransactionStatus
     db = Mock(spec=Session)
     user_id = uuid.uuid4()
     mock_tx = Mock()
     mock_tx.user_id = user_id
-    mock_tx.status = Mock()
-    mock_tx.status.value = "pending"
+    mock_tx.status = BillingTransactionStatus.pending
     mock_tx.amount = 100
     mock_tx.currency = "INR"
     
-    # First execute is for tx, second is for dup check, third is existing subs
+    # First execute is for tx, second is for existing subs
     db.execute.side_effect = [
         Mock(**{"scalars.return_value.one_or_none.return_value": mock_tx}),
-        Mock(**{"scalars.return_value.first.return_value": None}),
         Mock(**{"scalars.return_value.all.return_value": []}),
     ]
-    db.get.return_value = Mock()
+    mock_plan = Mock()
+    mock_plan.active = True
+    mock_plan.duration_days = 30
+    mock_server = Mock()
+    mock_server.mc_config = {}
+    def _db_get_side_effect(model, *args, **kwargs):
+        if model.__name__ == 'BillingPlan':
+            return mock_plan
+        elif model.__name__ == 'Server':
+            return mock_server
+        return Mock()
+    db.get.side_effect = _db_get_side_effect
     mock_verify_sig.return_value = True
 
     # Mock db.commit to raise IntegrityError matching provider_payment_id

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.engine.url import make_url
 
 from blockhost_backend.config.config_manager import get_settings
-
+#file_name = db.py
 
 settings = get_settings()
 

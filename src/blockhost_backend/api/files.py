@@ -10,6 +10,12 @@ from blockhost_backend.api.deps import get_current_user
 from blockhost_backend.database.db import get_db
 from blockhost_backend.database.schema import Server, User
 from blockhost_backend.api.schemas import FileInfo, FileWriteRequest
+from blockhost_backend.services.system_health import (
+    DiskProtectionError,
+    WorldSizeLimitError,
+    assert_disk_usage_safe,
+    assert_world_size_within_plan,
+)
 
 router = APIRouter(prefix="/api/servers/{server_id}/files", tags=["files"])
 
@@ -35,6 +41,24 @@ TEXT_EXTENSIONS = {
 
 MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB
 MAX_EDIT_SIZE = 5 * 1024 * 1024      # 5MB
+
+
+def _guard_disk_for_operation(operation: str) -> None:
+    try:
+        assert_disk_usage_safe(operation)
+    except DiskProtectionError as exc:
+        raise HTTPException(status_code=503, detail={"error": exc.message})
+
+
+
+
+
+def _guard_world_size_after_upload(server_root: Path, user: User) -> None:
+    worlds_root = server_root / "worlds"
+    try:
+        assert_world_size_within_plan(worlds_root, )
+    except WorldSizeLimitError as exc:
+        raise HTTPException(status_code=413, detail={"error": exc.message})
 
 
 def _get_server_and_root(server_id: str, user: User, db: Session) -> tuple[Server, Path]:
@@ -212,6 +236,7 @@ async def upload_file(
     db: Session = Depends(get_db),
 ):
     server, server_root = _get_server_and_root(server_id, user, db)
+    _guard_disk_for_operation("upload_file")
     
     # We expect path to be the destination directory
     target_dir = _validate_safe_path(server_root, path)
@@ -236,6 +261,18 @@ async def upload_file(
                 target_file.unlink(missing_ok=True)
                 raise HTTPException(status_code=413, detail=f"File too large (max {MAX_UPLOAD_SIZE//1024//1024}MB)")
             buffer.write(chunk)
+            try:
+                assert_disk_usage_safe("upload_file")
+            except DiskProtectionError as exc:
+                target_file.unlink(missing_ok=True)
+                raise HTTPException(status_code=503, detail={"error": exc.message})
+
+    if target_file.is_relative_to(server_root / "worlds"):
+        try:
+            _guard_world_size_after_upload(server_root, user)
+        except HTTPException:
+            target_file.unlink(missing_ok=True)
+            raise
 
     return {"status": "ok", "filename": filename, "size": total_size}
 
@@ -268,4 +305,3 @@ def delete_file_or_folder(
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete: {str(e)}")
-

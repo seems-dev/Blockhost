@@ -3,8 +3,6 @@ from __future__ import annotations
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file="src/.env", env_file_encoding="utf-8", extra="ignore")
 
@@ -33,8 +31,19 @@ class Settings(BaseSettings):
     backup_retention_count: int = 7
     backup_save_hold_seconds: float = 2.0
     backup_worker_threads: int = 2
-    backup_scheduler_enabled: bool = True
+    backup_scheduler_enabled: bool = False
     backup_scheduler_poll_seconds: int = 60
+    subscription_expiration_enabled: bool = True
+    subscription_expiration_poll_seconds: int = 60
+    subscription_grace_period_days: int = 3
+    billing_provider: str = "test"
+    billing_signature_secret: str = "change-me-billing-secret"
+    disk_warning_threshold_percent: float = 80.0
+    disk_critical_threshold_percent: float = 90.0
+    disk_health_monitor_enabled: bool = True
+    disk_health_check_interval_seconds: int = 10 * 60
+    free_world_limit_gb: float = 2.0
+    premium_world_limit_gb: float = 10.0
     # Optional explicit executable name inside a version/server folder.
     # If empty, BlockHost will try common Bedrock server binary names.
     bedrock_executable_name: str = ""
@@ -47,7 +56,10 @@ class Settings(BaseSettings):
     console_queue_max_size: int = 1000  # Max buffered log lines per websocket connection
     console_stream_cleanup_enabled: bool = True  # Stop log stream when no listeners remain (but keep running if player tracking active)
 
-    google_client_id: str = "264249625264-0it828liska1emqu72ebb26s6u6krnmu.apps.googleusercontent.com"  # Add this line before the last two settings
+    google_client_id: str = ""
+    razorpay_key_id: str = ""
+    razorpay_key_secret: str = ""          # matches RAZORPAY_KEY_SECRET in .env
+    razorpay_webhook_secret: str = ""     # matches RAZORPAY_WEBHOOK_SECRET in .env
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

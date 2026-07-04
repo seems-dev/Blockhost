@@ -3,7 +3,8 @@
 - **Purpose**: Central HTTP API and orchestration service that manages user accounts, game servers (Minecraft Bedrock), backups, and worker orchestration.
 
 **Components**
-- **API server**: FastAPI application entrypoint at [src/blockhost_backend/main.py](src/blockhost_backend/main.py). Registers routers under `/api/*` and starts background services (e.g., backup scheduler).
+- **API server**: FastAPI application entrypoint at [src/blockhost_backend/main.py](src/blockhost_backend/main.py). Registers routers under `/api/*` and starts API-local background services.
+- **Backup scheduler**: Standalone process entrypoint at [src/blockhost_backend/backup_scheduler.py](src/blockhost_backend/backup_scheduler.py). Run it separately from FastAPI with the `blockhost-backup-scheduler` console command.
 - **API routers**: Modular endpoints in [src/blockhost_backend/api/](src/blockhost_backend/api/) (examples: `auth`, `versions`, `files`, `servers`, `backups`). Each router uses FastAPI dependency injection for auth and DB access.
 - **Database layer**: SQLAlchemy models and schema defined in [src/blockhost_backend/database/schema.py](src/blockhost_backend/database/schema.py). Connection and session lifecycle in [src/blockhost_backend/database/db.py](src/blockhost_backend/database/db.py).
 - **Security**: JWT based auth and password hashing implemented in [src/blockhost_backend/core/security.py](src/blockhost_backend/core/security.py). Request auth helpers in [src/blockhost_backend/api/deps.py](src/blockhost_backend/api/deps.py).
@@ -15,7 +16,7 @@
 - **Client → API**: Frontend (Flutter app or web) calls the FastAPI endpoints (`/api/*`). These routes are implemented as APIRouter modules and mounted in [main.py](src/blockhost_backend/main.py).
 - **Auth → DB**: Protected endpoints use `get_current_user` (see [api/deps.py](src/blockhost_backend/api/deps.py)) which decodes JWTs via `core/security.py` and loads the `User` from the DB session provided by `get_db()` (see [database/db.py](src/blockhost_backend/database/db.py)).
 - **API → Orchestrator/Workers**: When a server lifecycle action is requested (create/start/stop/remove), the API uses the orchestrator abstractions. For remote/local worker setups this results in calls to the `WorkerClient` (HTTP) or local `ServerLifecycleOrchestrator` (systemd/local runtime).
-- **Backups & background work**: Backup scheduling and job processing run via the backend's scheduler. The scheduler is started during FastAPI startup (`start_backup_scheduler_once()` in [main.py](src/blockhost_backend/main.py)). Backup jobs are represented in the DB (`backup_jobs`, `backups`) and may be executed by worker processes that update job state.
+- **Backups & background work**: Backup scheduling runs in the standalone scheduler process, not inside FastAPI. Backup jobs are represented in the DB (`backup_jobs`, `backups`) and workers update job state as they run.
 
 **API design highlights**
 - **REST-ish routers**: Routes are grouped by resource (e.g., `/api/auth`, `/api/versions`, `/api/backups`). See [src/blockhost_backend/api/](src/blockhost_backend/api/).
@@ -45,7 +46,7 @@
 - **Important vars**: `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET_KEY`, `WORKER_AGENT_URL`, `WORKER_AGENT_TOKEN`, `BEDROCK_*` directories and runtime driver.
 
 **Running locally (developer notes)**
-- **Startup**: Run the FastAPI app (e.g., `uvicorn blockhost_backend.main:app --reload`). The app will create DB tables on startup and start the backup scheduler.
+- **Startup**: Run the FastAPI app (e.g., `uvicorn blockhost_backend.main:app --reload`) and run the scheduler separately with `blockhost-backup-scheduler`. See [docs/systemd_services.md](../../docs/systemd_services.md) for systemd unit examples.
 - **Worker agent**: For full lifecycle features (container-based servers) run the companion worker agent and set `WORKER_AGENT_URL` / `WORKER_AGENT_TOKEN` accordingly.
 
 **Console streaming implementation**

@@ -14,8 +14,8 @@ class BedrockServerProperties:
     online_mode: bool | None = None
     level_name: str | None = None
     level_seed: str | None = None
+    enable_lan_visibility: bool = False
     server_port: int = 19132
-    
 
 
 def write_server_properties(path: Path, props: BedrockServerProperties) -> None:
@@ -44,17 +44,15 @@ def write_server_properties(path: Path, props: BedrockServerProperties) -> None:
     put("level-seed", props.level_seed)
 
     # Bedrock uses UDP. Set both IPv4 and IPv6 port keys.
-
     ipv4_port = int(props.server_port)
     ipv6_port = ipv4_port + 1
 
-# Ensure they're different
+    # Keep IPv4 and IPv6 ports distinct so two servers never share a UDP port.
     if ipv6_port == ipv4_port:
         ipv6_port = ipv4_port + 1
 
     put("server-port", ipv4_port)
     put("server-portv6", ipv6_port)
-    print("server-portv6",ipv6_port)
+    put("enable-lan-visibility", props.enable_lan_visibility)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-

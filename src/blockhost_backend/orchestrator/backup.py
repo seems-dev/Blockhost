@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import shutil
 import tarfile
@@ -22,19 +23,18 @@ from blockhost_backend.database.schema import (
     Backup,
     BackupConsistencyMethod,
     BackupJob,
-    BackupKind,
+
     BackupSchedule,
-    BackupStorageBackend,
+
     BackupStatus,
     RestoreJob,
     RestoreStatus,
     Server,
-    SubscriptionTier,
     User,
     utcnow,
 )
 from blockhost_backend.orchestrator.lifecycle_manager import get_server_lifecycle_orchestrator
-
+from blockhost_backend.services.system_health import assert_disk_usage_safe
 
 _ORCHESTRATOR = get_server_lifecycle_orchestrator()
 _LOCKS_GUARD = threading.Lock()
@@ -42,6 +42,7 @@ _SERVER_LOCKS: dict[str, threading.Lock] = {}
 _EXECUTOR = ThreadPoolExecutor(max_workers=max(1, get_settings().backup_worker_threads), thread_name_prefix="backup-worker")
 _SCHEDULER_STARTED = False
 _SCHEDULER_GUARD = threading.Lock()
+logger = logging.getLogger(__name__)
 
 ACTIVE_BACKUP_STATUSES = {
     BackupStatus.pending,
@@ -169,6 +170,13 @@ def _included_backup_paths(server_dir: Path, world_name: str) -> list[tuple[Path
     return candidates
 
 
+def _backup_world_size_path(server_dir: Path, world_name: str) -> Path:
+    world_path = server_dir / "worlds" / world_name
+    if world_path.exists():
+        return world_path
+    return server_dir / "worlds"
+
+
 def _iter_files(paths: Iterable[Path]) -> Iterable[Path]:
     for path in paths:
         if path.is_file():
@@ -189,27 +197,35 @@ def _size_bytes(paths: Iterable[Path]) -> int:
     return total
 
 
-def _copy_with_progress(src: Path, dst: Path, job: BackupJob, db: Session, copied_so_far: int) -> int:
+def _add_to_tar_with_progress(
+    tar: tarfile.TarFile,
+    src: Path,
+    arcname: str,
+    job: BackupJob,
+    db: Session,
+    processed_so_far: int,
+) -> int:
     if src.is_file():
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        copied_so_far += src.stat().st_size
-        _update_backup_job(db, job, BackupStatus.copying, "copying", 10, 45, copied_so_far)
-        return copied_so_far
+        tar.add(src, arcname=arcname)
+        processed_so_far += src.stat().st_size
+        _update_backup_job(db, job, BackupStatus.compressing, "compressing", 10, 80, processed_so_far)
+        return processed_so_far
+
+    # Add directory entry non-recursively
+    tar.add(src, arcname=arcname, recursive=False)
 
     for child in src.rglob("*"):
         if child.is_symlink():
             continue
         rel = child.relative_to(src)
-        target = dst / rel
+        target_arcname = f"{arcname}/{rel.as_posix()}"
         if child.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
+            tar.add(child, arcname=target_arcname, recursive=False)
             continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(child, target)
-        copied_so_far += child.stat().st_size
-        _update_backup_job(db, job, BackupStatus.copying, "copying", 10, 45, copied_so_far)
-    return copied_so_far
+        tar.add(child, arcname=target_arcname)
+        processed_so_far += child.stat().st_size
+        _update_backup_job(db, job, BackupStatus.compressing, "compressing", 10, 80, processed_so_far)
+    return processed_so_far
 
 
 def _update_backup_job(
@@ -266,6 +282,18 @@ def _safe_rmtree(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _cleanup_backup_staging(staging: Path | None) -> None:
+    if not staging:
+        return
+
+    _safe_rmtree(staging)
+    for parent in (staging.parent, staging.parent.parent):
+        try:
+            parent.rmdir()
+        except OSError:
+            pass
+
+
 def _atomic_replace(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     os.replace(src, dst)
@@ -275,16 +303,7 @@ def _stop_server(server: Server) -> None:
     _ORCHESTRATOR.stop_server(server)
 
 
-def _get_user_tier(user: User) -> SubscriptionTier:
-    tier = getattr(user, "subscription_tier", None)
-    if isinstance(tier, SubscriptionTier):
-        return tier
-    if isinstance(tier, str):
-        try:
-            return SubscriptionTier(tier)
-        except ValueError:
-            pass
-    return SubscriptionTier.free
+
 
 
 def _start_server(server: Server, db: Session) -> None:
@@ -294,7 +313,7 @@ def _start_server(server: Server, db: Session) -> None:
         server=server,
         settings=settings,
         servers_dir=servers_dir,
-        get_user_tier=_get_user_tier,
+       
         db=db,
     )
 
@@ -322,7 +341,6 @@ def run_backup_job(job_id: uuid.UUID) -> None:
     save_held = False
     server_was_running = False
     stopped_for_backup = False
-    staging: Path | None = None
     temp_archive: Path | None = None
 
     try:
@@ -356,15 +374,14 @@ def run_backup_job(job_id: uuid.UUID) -> None:
 
             server_dir = _require_server_dir(server)
             world_name = _world_name(server)
+            owner = db.get(User, backup.owner_id)
+            assert_disk_usage_safe("run_backup_job")
+            
             includes = _included_backup_paths(server_dir, world_name)
             total = _size_bytes(path for path, _arcname in includes)
             job.total_bytes = total
             backup.uncompressed_size_bytes = total
             db.commit()
-
-            staging = backup_tmp_root() / str(server.id) / "staging" / str(job.id)
-            _safe_rmtree(staging)
-            staging.mkdir(parents=True, exist_ok=True)
 
             server_was_running = _ORCHESTRATOR.is_running(str(server.id))
             backup.server_was_running = server_was_running
@@ -381,9 +398,20 @@ def run_backup_job(job_id: uuid.UUID) -> None:
                 stopped_for_backup = True
                 db.commit()
 
-            copied = 0
-            for source, archive_name in includes:
-                copied = _copy_with_progress(source, staging / archive_name, job, db, copied)
+            _update_backup_job(db, job, BackupStatus.compressing, "compressing", 10, 80)
+            final_archive = backup_object_path(server.id, backup.id)
+            temp_archive = Path(str(final_archive) + ".tmp")
+            if temp_archive.exists():
+                temp_archive.unlink(missing_ok=True)
+
+            has_worlds = any(archive_name.startswith("bedrock/worlds") for _, archive_name in includes)
+            if not has_worlds:
+                raise BackupRestoreError("invalid_backup_contents", "Backup contents have no worlds content")
+
+            processed = 0
+            with tarfile.open(temp_archive, "w:gz") as tar:
+                for source, archive_name in includes:
+                    processed = _add_to_tar_with_progress(tar, source, archive_name, job, db, processed)
 
             if save_held:
                 _save_resume_best_effort(str(server.id))
@@ -393,23 +421,11 @@ def run_backup_job(job_id: uuid.UUID) -> None:
                 stopped_for_backup = False
                 db.commit()
 
-            if not (staging / "bedrock" / "worlds").exists():
-                raise BackupRestoreError("invalid_backup_contents", "Backup staging directory has no worlds content")
-
             backup.consistency_method = consistency_method
             backup.included_paths = [archive_name for _source, archive_name in includes]
             backup.world_name = world_name
             backup.bedrock_version = str((server.mc_config or {}).get("template_version") or "")
             db.commit()
-
-            _update_backup_job(db, job, BackupStatus.compressing, "compressing", 45, 80)
-            final_archive = backup_object_path(server.id, backup.id)
-            temp_archive = Path(str(final_archive) + ".tmp")
-            if temp_archive.exists():
-                temp_archive.unlink(missing_ok=True)
-
-            with tarfile.open(temp_archive, "w:gz") as tar:
-                tar.add(staging / "bedrock", arcname="bedrock", recursive=True)
 
             _update_backup_job(db, job, BackupStatus.verifying, "verifying", 85, 95)
             checksum = _sha256_file(temp_archive)
@@ -454,8 +470,8 @@ def run_backup_job(job_id: uuid.UUID) -> None:
         if stopped_for_backup and server:
             try:
                 _start_server(server, db)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to restart server %s after backup failure: %s", server.id, exc)
 
         code = getattr(exc, "code", "backup_failed")
         message = getattr(exc, "message", str(exc))
@@ -479,14 +495,6 @@ def run_backup_job(job_id: uuid.UUID) -> None:
     finally:
         if temp_archive and temp_archive.exists():
             temp_archive.unlink(missing_ok=True)
-        if staging:
-            _safe_rmtree(staging)
-            staging_parent = staging.parent
-            if staging_parent.exists() and not any(staging_parent.iterdir()):
-                staging_parent.rmdir()
-            staging_grandparent = staging_parent.parent
-            if staging_grandparent.exists() and not any(staging_grandparent.iterdir()):
-                staging_grandparent.rmdir()
         db.close()
 
 
@@ -673,8 +681,8 @@ def run_restore_job(job_id: uuid.UUID) -> None:
             try:
                 _start_server(server, db)
                 db.commit()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to restart server %s after restore failure: %s", server.id, exc)
     finally:
         if restore_tmp:
             _safe_rmtree(restore_tmp)
@@ -713,102 +721,21 @@ def next_schedule_run(schedule: BackupSchedule, *, from_time=None):
 
 
 def dispatch_due_backup_schedules() -> int:
-    db = SessionLocal()
-    dispatched = 0
-    try:
-        now = utcnow()
-        schedules = db.execute(
-            select(BackupSchedule).where(
-                BackupSchedule.enabled.is_(True),
-                (BackupSchedule.next_run_at.is_(None)) | (BackupSchedule.next_run_at <= now),
-            )
-        ).scalars().all()
-
-        for schedule in schedules:
-            server = db.get(Server, schedule.server_id)
-            if not server:
-                schedule.enabled = False
-                schedule.updated_at = now
-                continue
-
-            active_backup = db.execute(
-                select(BackupJob).where(
-                    BackupJob.server_id == server.id,
-                    BackupJob.status.in_(ACTIVE_BACKUP_STATUSES),
-                )
-            ).scalars().first()
-            active_restore = db.execute(
-                select(RestoreJob).where(
-                    RestoreJob.server_id == server.id,
-                    RestoreJob.status.in_(ACTIVE_RESTORE_STATUSES),
-                )
-            ).scalars().first()
-            if active_backup or active_restore:
-                schedule.next_run_at = next_schedule_run(schedule, from_time=now)
-                schedule.updated_at = now
-                continue
-
-            if schedule.skip_if_server_offline and not _ORCHESTRATOR.is_running(str(server.id)):
-                schedule.last_run_at = now
-                schedule.next_run_at = next_schedule_run(schedule, from_time=now)
-                schedule.updated_at = now
-                continue
-
-            backup = Backup(
-                server_id=server.id,
-                owner_id=server.owner_id,
-                created_by_user_id=None,
-                schedule_id=schedule.id,
-                kind=BackupKind.scheduled,
-                status=BackupStatus.pending,
-                world_name=_world_name(server),
-                storage_backend=BackupStorageBackend.local,
-            )
-            db.add(backup)
-            db.flush()
-            backup.storage_key = backup_storage_key(server.id, backup.id)
-
-            job = BackupJob(
-                backup_id=backup.id,
-                server_id=server.id,
-                requested_by_user_id=None,
-                status=BackupStatus.pending,
-                phase="pending",
-                idempotency_key=f"schedule:{schedule.id}:{now.isoformat()}",
-            )
-            db.add(job)
-            schedule.last_run_at = now
-            schedule.next_run_at = next_schedule_run(schedule, from_time=now)
-            schedule.updated_at = now
-            db.commit()
-
-            submit_backup_job(job.id)
-            dispatched += 1
-    finally:
-        db.commit()
-        db.close()
-    return dispatched
+    # Automatic backup scheduler is disabled as per requirements.
+    return 0
 
 
 def _scheduler_loop() -> None:
-    settings = get_settings()
-    poll_seconds = max(5, settings.backup_scheduler_poll_seconds)
-    while True:
-        try:
-            dispatch_due_backup_schedules()
-        except Exception:
-            pass
-        time.sleep(poll_seconds)
+    # Automatic backup scheduler is disabled as per requirements.
+    pass
+
+
+def run_backup_scheduler_forever(*, stop_event: threading.Event | None = None) -> None:
+    # Automatic backup scheduler is disabled as per requirements.
+    logger.info("Backup scheduler is disabled")
+    return
 
 
 def start_backup_scheduler_once() -> None:
-    global _SCHEDULER_STARTED
-    settings = get_settings()
-    if not settings.backup_scheduler_enabled:
-        return
-    with _SCHEDULER_GUARD:
-        if _SCHEDULER_STARTED:
-            return
-        thread = threading.Thread(target=_scheduler_loop, name="backup-scheduler", daemon=True)
-        thread.start()
-        _SCHEDULER_STARTED = True
+    # Automatic backup scheduler is disabled as per requirements.
+    return

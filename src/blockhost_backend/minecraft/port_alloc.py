@@ -50,9 +50,21 @@ def is_udp_port_free(*, port: int) -> bool:
 def pick_free_udp_port(*, port_range: PortRange, used_ports: set[int]) -> int:
     if port_range.end < port_range.start:
         raise ValueError("Invalid port range")
+
     for port in range(port_range.start, port_range.end + 1):
-        if port in used_ports:
+        ipv6_port = port + 1
+        if ipv6_port > port_range.end:
             continue
-        if is_udp_port_free(port=port):
-            return port
+
+        if port in used_ports or ipv6_port in used_ports:
+            continue
+
+        if not is_udp_port_free(port=port):
+            continue
+
+        if not is_udp_port_free(port=ipv6_port):
+            continue
+
+        return port
+
     raise RuntimeError("No free UDP ports available in configured range")

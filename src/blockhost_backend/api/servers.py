@@ -32,32 +32,37 @@ from blockhost_backend.api.schemas import (
     ServerStateSnapshot,
 )
 from blockhost_backend.config.config_manager import get_settings
+from blockhost_backend.database import db
 from blockhost_backend.database.db import SessionLocal, get_db
-from blockhost_backend.database.schema import Ban, Server, ServerState, SubscriptionTier, User, VMProvider
+from blockhost_backend.database.schema import Ban, Server, ServerState, User, VMProvider
 from blockhost_backend.minecraft.bedrock_ping import bedrock_unconnected_ping, parse_bedrock_pong_payload
 from blockhost_backend.minecraft.bedrock_properties import BedrockServerProperties, write_server_properties
-from blockhost_backend.minecraft.bedrock_download import ensure_version_installed, recommended_version
+from blockhost_backend.minecraft.bedrock_download import recommended_version
 from blockhost_backend.minecraft.port_alloc import PortRange, pick_free_udp_port
 from blockhost_backend.orchestrator.lifecycle_manager import get_server_lifecycle_orchestrator
-from blockhost_backend.orchestrator.resources import TIER_RESOURCE_LIMITS
+from blockhost_backend.orchestrator.resources import get_effective_server_resource_limits, UNPAID_SERVER_LIMITS
 from blockhost_backend.runtime.bedrock_process import materialize_server_dir, resolve_version_dir
+from blockhost_backend.services.api_cache import get_api_cache
+from blockhost_backend.services.system_health import DiskProtectionError, assert_disk_usage_safe
 from blockhost_backend.utils import generate_join_code
-
+from blockhost_backend.services.billing import BillingError
+#file_name = servers.py
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/servers", tags=["servers"])
 
 _ORCHESTRATOR = get_server_lifecycle_orchestrator()
 _STATS_SNAPSHOT_TTL_SECONDS = 2.0
+_STATS_REDIS_TTL_SECONDS = 5
+_SERVER_LIST_TTL_SECONDS = 5
+_SERVER_DETAIL_TTL_SECONDS = 15
+_SERVER_CONFIG_TTL_SECONDS = 30
+_PLANS_TTL_SECONDS = 300
 _STATS_SNAPSHOT_CACHE: dict[str, tuple[float, BedrockServerStats]] = {}
 _STATS_REFRESHING: set[str] = set()
 _STATS_CACHE_LOCK = threading.Lock()
 
 # Maximum servers allowed per tier — enforced server-side only, never from client.
-TIER_SERVER_LIMITS: dict[SubscriptionTier, int] = {
-    SubscriptionTier.free:    1,
-    SubscriptionTier.premium: 3,
-}
 
 # Allowlist for Bedrock version strings: digits and dots only, e.g. "1.21.0"
 _VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
@@ -70,20 +75,43 @@ _MAX_LOG_TAIL = 500
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _get_user_tier(user: User) -> SubscriptionTier:
-    """
-    Resolve a user's SubscriptionTier from the ORM object.
-    Never trusts client-supplied values — always reads from the DB-loaded user.
-    """
-    tier = getattr(user, "subscription_tier", None)
-    if isinstance(tier, SubscriptionTier):
-        return tier
-    if isinstance(tier, str):
-        try:
-            return SubscriptionTier(tier)
-        except ValueError:
-            pass
-    return SubscriptionTier.free
+def _server_list_cache_key(user_id: uuid.UUID) -> str:
+    return f"servers:list:{user_id}"
+
+
+def _server_detail_cache_key(user_id: uuid.UUID, server_id: uuid.UUID | str) -> str:
+    return f"servers:detail:{user_id}:{server_id}"
+
+
+def _server_config_cache_key(user_id: uuid.UUID, server_id: uuid.UUID | str) -> str:
+    return f"servers:config:{user_id}:{server_id}"
+
+
+def _server_stats_cache_key(server_id: str) -> str:
+    return f"servers:stats:{server_id}"
+
+
+def _plans_cache_key() -> str:
+    return "servers:plans:catalog"
+
+
+def _invalidate_server_read_cache(user_id: uuid.UUID, server_id: uuid.UUID | str | None = None) -> None:
+    cache = get_api_cache()
+    cache.delete(_server_list_cache_key(user_id))
+    if server_id is None:
+        return
+    cache.delete(_server_detail_cache_key(user_id, server_id))
+    cache.delete(_server_config_cache_key(user_id, server_id))
+
+
+
+
+
+def _guard_disk_for_operation(operation: str) -> None:
+    try:
+        assert_disk_usage_safe(operation)
+    except DiskProtectionError as exc:
+        raise HTTPException(status_code=503, detail={"error": exc.message})
 
 
 def _sanitize_version(version: str | None) -> str | None:
@@ -217,13 +245,13 @@ def _server_to_detail(server: Server, owner: User | None = None) -> ServerDetail
     )
 
 
-def _compute_server_stats(server: Server, user: User) -> BedrockServerStats:
+def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
     settings = get_settings()
     host = server.vm_ipv4 or settings.minecraft_public_host
     port = server.vm_port or settings.bedrock_port_range_start
 
-    tier = _get_user_tier(user)
-    limits = TIER_RESOURCE_LIMITS.get(tier, TIER_RESOURCE_LIMITS[SubscriptionTier.free])
+    # Get limits strictly from the server's billing subscription
+    limits = get_effective_server_resource_limits(db=db, server=server)
     allocated_ram_mb = limits["ram_mb"]
     allocated_cpu_cores = limits["cpu_quota_pct"] / 100.0
 
@@ -236,11 +264,11 @@ def _compute_server_stats(server: Server, user: User) -> BedrockServerStats:
     ram_usage_mb = resource_stats.ram_usage_mb
     cpu_usage_percent = None
     ram_usage_percent = None
+    
     if cpu_usage is not None and allocated_cpu_cores and allocated_cpu_cores > 0:
         cpu_usage_percent = (cpu_usage / 100.0) / allocated_cpu_cores * 100.0
     if ram_usage_mb is not None and allocated_ram_mb and allocated_ram_mb > 0:
         ram_usage_percent = (ram_usage_mb / allocated_ram_mb) * 100.0
-
     base_stats = {
         "host": host,
         "port": port,
@@ -290,12 +318,39 @@ def _store_server_stats_snapshot(server_id: str, stats: BedrockServerStats) -> N
     with _STATS_CACHE_LOCK:
         _STATS_SNAPSHOT_CACHE[server_id] = (time.monotonic(), stats)
         _STATS_REFRESHING.discard(server_id)
+    get_api_cache().set_json(
+        _server_stats_cache_key(server_id),
+        stats.model_dump(mode="json"),
+        _STATS_REDIS_TTL_SECONDS,
+    )
 
 
 def _drop_server_stats_snapshot(server_id: str) -> None:
     with _STATS_CACHE_LOCK:
         _STATS_SNAPSHOT_CACHE.pop(server_id, None)
         _STATS_REFRESHING.discard(server_id)
+    get_api_cache().delete(_server_stats_cache_key(server_id))
+
+
+def _cached_server_stats_snapshot(server_id: str, now: float) -> BedrockServerStats | None:
+    with _STATS_CACHE_LOCK:
+        cached = _STATS_SNAPSHOT_CACHE.get(server_id)
+        if cached:
+            cached_at, stats = cached
+            if now - cached_at <= _STATS_SNAPSHOT_TTL_SECONDS:
+                return stats
+
+    cached_payload = get_api_cache().get_json(_server_stats_cache_key(server_id))
+    if cached_payload is None:
+        return None
+    try:
+        stats = BedrockServerStats.model_validate(cached_payload)
+    except Exception:
+        get_api_cache().delete(_server_stats_cache_key(server_id))
+        return None
+    with _STATS_CACHE_LOCK:
+        _STATS_SNAPSHOT_CACHE[server_id] = (now, stats)
+    return stats
 
 
 def _refresh_server_stats_snapshot(server_id: str) -> None:
@@ -308,10 +363,7 @@ def _refresh_server_stats_snapshot(server_id: str) -> None:
         server = db.get(Server, server_uuid)
         if not server:
             return
-        user = db.get(User, server.owner_id)
-        if not user:
-            return
-        _store_server_stats_snapshot(server_id, _compute_server_stats(server, user))
+        _store_server_stats_snapshot(server_id, _compute_server_stats(server, db))
     finally:
         with _STATS_CACHE_LOCK:
             _STATS_REFRESHING.discard(server_id)
@@ -320,25 +372,63 @@ def _refresh_server_stats_snapshot(server_id: str) -> None:
 
 def _get_server_stats_snapshot(
     server: Server,
-    user: User,
+    db: Session,
     background_tasks: BackgroundTasks | None = None,
 ) -> BedrockServerStats:
     server_id = str(server.id)
     now = time.monotonic()
+    cached_stats = _cached_server_stats_snapshot(server_id, now)
+    if cached_stats is not None:
+        return cached_stats
+
+    stale_stats = None
     with _STATS_CACHE_LOCK:
         cached = _STATS_SNAPSHOT_CACHE.get(server_id)
         if cached:
-            cached_at, stats = cached
-            if now - cached_at <= _STATS_SNAPSHOT_TTL_SECONDS:
-                return stats
-            if background_tasks and server_id not in _STATS_REFRESHING:
-                _STATS_REFRESHING.add(server_id)
-                background_tasks.add_task(_refresh_server_stats_snapshot, server_id)
-                return stats
+            stale_stats = cached[1]
+        if background_tasks and stale_stats is not None and server_id not in _STATS_REFRESHING:
+            _STATS_REFRESHING.add(server_id)
+            background_tasks.add_task(_refresh_server_stats_snapshot, server_id)
+            return stale_stats
 
-    stats = _compute_server_stats(server, user)
-    _store_server_stats_snapshot(server_id, stats)
-    return stats
+    if background_tasks is None:
+        stats = _compute_server_stats(server, db)
+        _store_server_stats_snapshot(server_id, stats)
+        return stats
+
+    # Cold start (cache is empty):
+    # Return placeholder stats immediately and trigger background refresh task.
+    limits = get_effective_server_resource_limits(db=db, server=server)
+    is_running = server.state == ServerState.running
+
+    placeholder_stats = BedrockServerStats(
+        host=server.vm_ipv4 or get_settings().minecraft_public_host,
+        port=server.vm_port or get_settings().bedrock_port_range_start,
+        allocated_ram_mb=limits["ram_mb"],
+        allocated_cpu_cores=limits["cpu_quota_pct"] / 100.0,
+        process_running=is_running,
+        uptime_seconds=0,
+        cpu_usage=0.0,
+        ram_usage_mb=0.0,
+        cpu_usage_percent=0.0,
+        ram_usage_percent=0.0,
+        reachable=False,
+        online_players_list=[],
+    )
+
+    get_api_cache().set_json(
+        _server_stats_cache_key(server_id),
+        placeholder_stats.model_dump(mode="json"),
+        _STATS_REDIS_TTL_SECONDS,
+    )
+
+    with _STATS_CACHE_LOCK:
+        _STATS_SNAPSHOT_CACHE[server_id] = (now, placeholder_stats)
+        if server_id not in _STATS_REFRESHING:
+            _STATS_REFRESHING.add(server_id)
+            background_tasks.add_task(_refresh_server_stats_snapshot, server_id)
+
+    return placeholder_stats
 
 
 def _server_dirs() -> tuple[Path, Path, Path]:
@@ -358,12 +448,19 @@ def _ensure_version_on_disk(*, versions_dir: Path, requested_version: str | None
     if rv.lower() in {"recommended", "default"}:
         rv = recommended_version(manifest_path=Path(settings.bedrock_versions_manifest))
     if rv.upper() in {"LATEST", "PREVIEW"}:
+        installed_versions = [p.name for p in versions_dir.iterdir() if p.is_dir()] if versions_dir.exists() else []
+        if not installed_versions:
+            raise HTTPException(
+                status_code=400,
+                detail="No Bedrock versions are downloaded. Please download the recommended version first."
+            )
         return
-    ensure_version_installed(
-        versions_dir=versions_dir,
-        manifest_path=Path(settings.bedrock_versions_manifest),
-        version=rv,
-    )
+    dest = versions_dir / rv
+    if not dest.exists() or not dest.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Version {rv} is not downloaded. Please download it via the versions page first."
+        )
 
 
 def _normalize_requested_version(requested_version: str | None) -> str | None:
@@ -384,17 +481,59 @@ def _normalize_requested_version(requested_version: str | None) -> str | None:
     return rv
 
 
+def _collect_reserved_ports(*, db: Session, port_range: PortRange) -> set[int]:
+    reserved: set[int] = set()
+    for port in db.execute(select(Server.vm_port)).scalars().all():
+        if port is None:
+            continue
+        reserved.add(port)
+        if port + 1 <= port_range.end:
+            reserved.add(port + 1)
+    return reserved
+
+
+def _validate_server_port_pairs(*, db: Session, port_range: PortRange) -> None:
+    port_map: dict[int, list[str]] = {}
+    errors: list[str] = []
+
+    for row in db.execute(select(Server.id, Server.vm_port)).all():
+        server_id, port = row
+        if port is None:
+            continue
+
+        if port < port_range.start or port > port_range.end:
+            errors.append(
+                f"Server {server_id} has vm_port={port} outside configured range {port_range.start}-{port_range.end}"
+            )
+
+        ipv6_port = port + 1
+        if ipv6_port > port_range.end:
+            errors.append(
+                f"Server {server_id} has vm_port={port} with invalid server-portv6={ipv6_port} beyond range end {port_range.end}"
+            )
+
+        for p in (port, ipv6_port):
+            if p <= port_range.end:
+                port_map.setdefault(p, []).append(str(server_id))
+
+    for p, servers in port_map.items():
+        if len(servers) > 1:
+            errors.append(
+                f"Port {p} is reserved by multiple servers: {', '.join(servers)}"
+            )
+
+    if errors:
+        raise RuntimeError("Invalid Bedrock port assignments: " + "; ".join(errors))
+
+
 def _allocate_port(*, db: Session) -> int:
     settings = get_settings()
-    used = set(
-        p
-        for p in db.execute(select(Server.vm_port)).scalars().all()
-        if p is not None
-    )
     port_range = PortRange(
         start=settings.bedrock_port_range_start,
         end=settings.bedrock_port_range_end,
     )
+    _validate_server_port_pairs(db=db, port_range=port_range)
+    used = _collect_reserved_ports(db=db, port_range=port_range)
     return pick_free_udp_port(port_range=port_range, used_ports=used)
 
 
@@ -410,20 +549,14 @@ def _server_props_from_config(*, server: Server, port: int) -> BedrockServerProp
         online_mode=cfg.get("online_mode"),
         level_name=cfg.get("level_name") or server.world_name,
         level_seed=cfg.get("level_seed"),
+        enable_lan_visibility=False,
         server_port=port,
     )
 
 
 def _start_bedrock_process(*, server: Server, settings, db: Session | None = None) -> None:
-    """Delegate process lifecycle to the orchestrator/runtime abstraction."""
     _, servers_dir, _ = _server_dirs()
-    _ORCHESTRATOR.start_server(
-        server=server,
-        settings=settings,
-        servers_dir=servers_dir,
-        get_user_tier=_get_user_tier,
-        db=db,
-    )
+    _ORCHESTRATOR.start_server(server=server, settings=settings, servers_dir=servers_dir, db=db)
 
 def _stop_server_process(server: Server) -> None:
     """Delegate process lifecycle to the orchestrator/runtime abstraction."""
@@ -441,18 +574,10 @@ def create_server(
     db: Session = Depends(get_db),
 ) -> ServerOut:
     settings = get_settings()
+    _guard_disk_for_operation("create_server")
 
-    # Always derive tier from the authenticated user record — never from payload.
-    user_tier = _get_user_tier(user)
-    server_limit = TIER_SERVER_LIMITS.get(user_tier, TIER_SERVER_LIMITS[SubscriptionTier.free])
-    count = db.execute(
-        select(func.count()).select_from(Server).where(Server.owner_id == user.id)
-    ).scalar_one()
-    if count >= server_limit:
-        raise HTTPException(
-            status_code=403,
-            detail=f"{user_tier.value.capitalize()} tier limited to {server_limit} server(s)",
-        )
+    
+    
 
     config = payload.config.model_dump(exclude_none=True) if payload.config else {}
     config.pop("bedrock_image", None)  # Docker-only field, never accepted
@@ -519,6 +644,10 @@ def create_server(
         if not server.vm_port:
             raise RuntimeError("Port not allocated before process startup")
         _start_bedrock_process(server=server, settings=settings, db=db)
+    except BillingError as e:
+        server.state = ServerState.suspended
+        db.rollback()
+        raise HTTPException(status_code=402, detail={"error": e.code, "message": e.message})
     except Exception as e:
         server.state = ServerState.suspended
         db.rollback()
@@ -526,6 +655,7 @@ def create_server(
 
     db.commit()
     db.refresh(server)
+    _invalidate_server_read_cache(user.id, server.id)
     return _server_to_out(server, owner=user)
 
 
@@ -616,6 +746,12 @@ def _discover_filesystem_servers(*, servers_dir: Path, db: Session) -> list[Serv
 def list_servers(
     user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> list[ServerOut]:
+    cache = get_api_cache()
+    cache_key = _server_list_cache_key(user.id)
+    cached = cache.get_json(cache_key)
+    if cached is not None:
+        return cached
+
     # Run discovery first (logs orphans, does not assign them to this user)
     _, servers_dir, _ = _server_dirs()
     _discover_filesystem_servers(servers_dir=servers_dir, db=db)
@@ -624,7 +760,12 @@ def list_servers(
     servers = db.execute(
         select(Server).where(Server.owner_id == user.id)
     ).scalars().all()
-    return [_server_to_out(s, owner=user) for s in servers]
+    payload = [_server_to_out(s, owner=user).model_dump(mode="json") for s in servers]
+    cache.set_json(cache_key, payload, _SERVER_LIST_TTL_SECONDS)
+    return payload
+
+
+
 
 
 @router.get("/{server_id}", response_model=ServerStateSnapshot)
@@ -641,10 +782,19 @@ def get_server(
     server = db.get(Server, server_uuid)
     if not server or server.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Server not found")
+    cache = get_api_cache()
+    cache_key = _server_detail_cache_key(user.id, server.id)
+    cached_detail = cache.get_json(cache_key)
+    if cached_detail is None:
+        cached_detail = {
+            "server": _server_to_detail(server, owner=user).model_dump(mode="json"),
+            "config": server.mc_config or {},
+        }
+        cache.set_json(cache_key, cached_detail, _SERVER_DETAIL_TTL_SECONDS)
     return ServerStateSnapshot(
-        server=_server_to_detail(server, owner=user),
-        config=server.mc_config or {},
-        stats=_get_server_stats_snapshot(server, user, background_tasks),
+        server=cached_detail["server"],
+        config=cached_detail["config"],
+        stats=_get_server_stats_snapshot(server, db, background_tasks),
     )
 
 
@@ -723,6 +873,10 @@ def start_server(
 
     try:
         _start_bedrock_process(server=server, settings=settings, db=db)
+    except BillingError as e:
+        server.state = ServerState.suspended
+        _drop_server_stats_snapshot(str(server.id))
+        raise HTTPException(status_code=402, detail={"error": e.code, "message": e.message})
     except Exception as e:
         server.state = ServerState.suspended
         _drop_server_stats_snapshot(str(server.id))
@@ -730,6 +884,7 @@ def start_server(
 
     db.commit()
     _drop_server_stats_snapshot(str(server.id))
+    _invalidate_server_read_cache(user.id, server.id)
     return ServerActionResponse(id=server.id, state=server.state)
 
 
@@ -750,6 +905,7 @@ def stop_server(
     _stop_server_process(server)
     db.commit()
     _drop_server_stats_snapshot(str(server.id))
+    _invalidate_server_read_cache(user.id, server.id)
     return ServerActionResponse(id=server.id, state=server.state)
 
 
@@ -806,6 +962,12 @@ def toggle_server(
                 _server_props_from_config(server=server, port=server.vm_port),
             )
             _start_bedrock_process(server=server, settings=settings, db=db)
+        except BillingError as e:
+            server.state = ServerState.suspended
+            _drop_server_stats_snapshot(str(server.id))
+            raise HTTPException(
+                status_code=402, detail={"error": e.code, "message": e.message}
+            )
         except Exception as e:
             server.state = ServerState.suspended
             _drop_server_stats_snapshot(str(server.id))
@@ -815,6 +977,7 @@ def toggle_server(
 
     db.commit()
     _drop_server_stats_snapshot(str(server.id))
+    _invalidate_server_read_cache(user.id, server.id)
     return ServerActionResponse(id=server.id, state=server.state)
 
 
@@ -831,7 +994,14 @@ def get_server_config(
     server = db.get(Server, server_uuid)
     if not server or server.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Server not found")
-    return ServerConfigOut(id=server.id, mc_config=server.mc_config or {})
+    cache = get_api_cache()
+    cache_key = _server_config_cache_key(user.id, server.id)
+    cached = cache.get_json(cache_key)
+    if cached is not None:
+        return cached
+    payload = ServerConfigOut(id=server.id, mc_config=server.mc_config or {}).model_dump(mode="json")
+    cache.set_json(cache_key, payload, _SERVER_CONFIG_TTL_SECONDS)
+    return payload
 
 
 @router.patch("/{server_id}/config", response_model=ServerConfigOut)
@@ -883,6 +1053,7 @@ def update_server_config(
 
     db.commit()
     db.refresh(server)
+    _invalidate_server_read_cache(user.id, server.id)
     return ServerConfigOut(id=server.id, mc_config=server.mc_config or {})
 
 
@@ -900,7 +1071,7 @@ def get_server_stats(
     server = db.get(Server, server_uuid)
     if not server or server.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Server not found")
-    return _get_server_stats_snapshot(server, user, background_tasks)
+    return _get_server_stats_snapshot(server, db, background_tasks)
 
 
 

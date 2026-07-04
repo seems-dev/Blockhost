@@ -8,10 +8,10 @@ from blockhost_backend.config.config_manager import Settings
 from blockhost_backend.database.schema import (
     Server,
     ServerState,
-    SubscriptionTier,
+   
     User,
 )
-from blockhost_backend.orchestrator.resources import TIER_RESOURCE_LIMITS
+from blockhost_backend.orchestrator.resources import get_effective_server_resource_limits
 from blockhost_backend.runtime.interface import (
     LogEntry,
     LogListener,
@@ -21,7 +21,7 @@ from blockhost_backend.runtime.interface import (
     RuntimeStatus,
 )
 from blockhost_backend.services.ban_service import ban_service
-
+#file_name = server_lifecycle.py
 logger = logging.getLogger(__name__)
 
 
@@ -54,11 +54,16 @@ class ServerLifecycleOrchestrator:
         server: Server,
         settings: Settings,
         servers_dir: Path,
-        get_user_tier,
+        
         db: Session | None = None,
     ) -> None:
 
+        if db is not None:
+            from blockhost_backend.services.billing import ensure_server_not_billing_suspended
+            ensure_server_not_billing_suspended(db=db, server=server)
+
         if not server.vm_port:
+
             raise RuntimeError(f"Server {server.id} has no port allocated")
 
         if not (server.mc_config or {}).get("server_dir"):
@@ -69,11 +74,7 @@ class ServerLifecycleOrchestrator:
             servers_dir,
         )
 
-        tier = self._resolve_tier(server=server, db=db, get_user_tier=get_user_tier)
-        limits = TIER_RESOURCE_LIMITS.get(
-            tier,
-            TIER_RESOURCE_LIMITS[SubscriptionTier.free],
-        )
+        limits = get_effective_server_resource_limits(db=db, server=server)
 
         result = self._runtime.start_server(
             RuntimeStartRequest(
@@ -105,14 +106,7 @@ class ServerLifecycleOrchestrator:
         # Attach moderation listener
         ban_service.attach_listener(str(server.id), self)
 
-        logger.info(
-            "Server %s started (runtime=%s, tier=%s, ram=%sMB, cpu=%s%%)",
-            server.id,
-            result.runtime_id,
-            tier.value,
-            limits["ram_mb"],
-            limits["cpu_quota_pct"],
-        )
+        logger.info("Server %s started (runtime=%s, plan=%s, ram=%sMB, cpu=%s%%)", server.id, result.runtime_id, "unpaid" if limits["ram_mb"] == 0 else "paid", limits["ram_mb"], limits["cpu_quota_pct"])
 
     # ---------------- STOP ----------------
     def stop_server(self, server: Server) -> None:
@@ -139,33 +133,8 @@ class ServerLifecycleOrchestrator:
     def remove_log_listener(self, server_id: str, listener: LogListener) -> None:
         self._runtime.remove_log_listener(server_id, listener)
 
-    # ---------------- TIER ----------------
-    def _resolve_tier(
-        self,
-        *,
-        server: Server,
-        db: Session | None,
-        get_user_tier,
-    ) -> SubscriptionTier:
-        try:
-            owner = getattr(server, "owner", None)
-
-            if owner and getattr(owner, "subscription_tier", None):
-                return get_user_tier(owner)
-
-            if db and server.owner_id:
-                db_owner = db.get(User, server.owner_id)
-                if db_owner:
-                    return get_user_tier(db_owner)
-
-        except Exception as exc:
-            logger.warning(
-                "Tier resolve failed for %s: %s",
-                server.id,
-                exc,
-            )
-
-        return SubscriptionTier.free
+    
+    
 
     # ---------------- VALIDATION ----------------
     def _validate_server_dir(self, server_dir: Path, servers_dir: Path) -> Path:

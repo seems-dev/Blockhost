@@ -1,5 +1,6 @@
-from __future__ import annotations
 
+from __future__ import annotations
+from blockhost_backend.database.schema import Node
 import logging
 import re
 import threading
@@ -11,10 +12,10 @@ from pathlib import Path
 import asyncio
 import json
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status, WebSocket, WebSocketDisconnect
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from blockhost_backend.api.deps import get_current_user, get_ws_user
+from blockhost_backend.api.deps import authenticate_ws_user, get_current_user
 from blockhost_backend.api.schemas import (
     BanCheckResponse,
     BanCreateRequest,
@@ -46,6 +47,7 @@ from blockhost_backend.services.api_cache import get_api_cache
 from blockhost_backend.services.system_health import DiskProtectionError, assert_disk_usage_safe
 from blockhost_backend.utils import generate_join_code
 from blockhost_backend.services.billing import BillingError
+from blockhost_backend.services.node_capacity import refresh_node_allocated_ram, select_best_node
 #file_name = servers.py
 logger = logging.getLogger(__name__)
 
@@ -259,6 +261,32 @@ def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
     process_running = runtime_status.running
     uptime = runtime_status.uptime_seconds
 
+    # Reconcile only known mismatch pairs (once per transition, not every poll tick).
+    if process_running and server.state in (ServerState.suspended, ServerState.created):
+        logger.info(
+            "Reconciling server %s: runtime=running but db_state=%s — updating to running",
+            server.id, server.state,
+        )
+        server.state = ServerState.running
+        try:
+            db.add(server)
+            db.commit()
+            _invalidate_server_read_cache(server.owner_id, server.id)
+        except Exception:
+            db.rollback()
+    elif not process_running and server.state == ServerState.running:
+        logger.info(
+            "Reconciling server %s: runtime=stopped but db_state=running — updating to suspended",
+            server.id,
+        )
+        server.state = ServerState.suspended
+        try:
+            db.add(server)
+            db.commit()
+            _invalidate_server_read_cache(server.owner_id, server.id)
+        except Exception:
+            db.rollback()
+
     resource_stats = _ORCHESTRATOR.get_stats(str(server.id))
     cpu_usage = resource_stats.cpu_usage
     ram_usage_mb = resource_stats.ram_usage_mb
@@ -283,7 +311,11 @@ def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
     }
 
     try:
-        pong = bedrock_unconnected_ping(host="127.0.0.1", port=port, timeout_seconds=1.0)
+        pong = bedrock_unconnected_ping(
+            host=("127.0.0.1" if not server.node_id else host),
+            port=port,
+            timeout_seconds=1.0,
+        )
         parsed = parse_bedrock_pong_payload(pong.payload)
         # Convert online players dict to PlayerInfo list
         players_with_xuid = runtime_status.runtime_id and _ORCHESTRATOR.get_online_players_with_xuid(str(server.id))
@@ -481,9 +513,12 @@ def _normalize_requested_version(requested_version: str | None) -> str | None:
     return rv
 
 
-def _collect_reserved_ports(*, db: Session, port_range: PortRange) -> set[int]:
+def _collect_reserved_ports(*, db: Session, port_range: PortRange, node_id: uuid.UUID | None = None) -> set[int]:
     reserved: set[int] = set()
-    for port in db.execute(select(Server.vm_port)).scalars().all():
+    query = select(Server.vm_port)
+    if node_id:
+        query = query.where(Server.node_id == node_id)
+    for port in db.execute(query).scalars().all():
         if port is None:
             continue
         reserved.add(port)
@@ -492,11 +527,14 @@ def _collect_reserved_ports(*, db: Session, port_range: PortRange) -> set[int]:
     return reserved
 
 
-def _validate_server_port_pairs(*, db: Session, port_range: PortRange) -> None:
+def _validate_server_port_pairs(*, db: Session, port_range: PortRange, node_id: uuid.UUID | None = None) -> None:
     port_map: dict[int, list[str]] = {}
     errors: list[str] = []
 
-    for row in db.execute(select(Server.id, Server.vm_port)).all():
+    query = select(Server.id, Server.vm_port)
+    if node_id:
+        query = query.where(Server.node_id == node_id)
+    for row in db.execute(query).all():
         server_id, port = row
         if port is None:
             continue
@@ -526,14 +564,17 @@ def _validate_server_port_pairs(*, db: Session, port_range: PortRange) -> None:
         raise RuntimeError("Invalid Bedrock port assignments: " + "; ".join(errors))
 
 
-def _allocate_port(*, db: Session) -> int:
+def _allocate_port(*, db: Session, node_id: uuid.UUID | None = None) -> int:
     settings = get_settings()
     port_range = PortRange(
         start=settings.bedrock_port_range_start,
         end=settings.bedrock_port_range_end,
     )
-    _validate_server_port_pairs(db=db, port_range=port_range)
-    used = _collect_reserved_ports(db=db, port_range=port_range)
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(8742031)"))
+    _validate_server_port_pairs(db=db, port_range=port_range, node_id=node_id)
+    used = _collect_reserved_ports(db=db, port_range=port_range, node_id=node_id)
     return pick_free_udp_port(port_range=port_range, used_ports=used)
 
 
@@ -555,6 +596,9 @@ def _server_props_from_config(*, server: Server, port: int) -> BedrockServerProp
 
 
 def _start_bedrock_process(*, server: Server, settings, db: Session | None = None) -> None:
+    from blockhost_backend.orchestrator.runtime_cache import invalidate_server_runtime_cache
+
+    invalidate_server_runtime_cache(server.id)
     _, servers_dir, _ = _server_dirs()
     _ORCHESTRATOR.start_server(server=server, settings=settings, servers_dir=servers_dir, db=db)
 
@@ -589,18 +633,22 @@ def create_server(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    node = select_best_node(db)
+    node_id = node.id if node else None
+
     try:
-        port = _allocate_port(db=db)
+        port = _allocate_port(db=db, node_id=node_id)
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Failed to allocate UDP port: {e}")
 
     server = Server(
         owner_id=user.id,
+        node_id=node_id,
         world_name=payload.world_name,
         join_code="placeholder",
         state=ServerState.created,
         vm_provider=VMProvider.local_bedrock,
-        vm_ipv4=None,
+        vm_ipv4=node.ip_address if node else settings.minecraft_public_host,
         vm_port=port,
         mc_config=config,
     )
@@ -640,21 +688,13 @@ def create_server(
             status_code=503, detail=f"Failed to materialize Bedrock server folder: {e}"
         )
 
-    try:
-        if not server.vm_port:
-            raise RuntimeError("Port not allocated before process startup")
-        _start_bedrock_process(server=server, settings=settings, db=db)
-    except BillingError as e:
-        server.state = ServerState.suspended
-        db.rollback()
-        raise HTTPException(status_code=402, detail={"error": e.code, "message": e.message})
-    except Exception as e:
-        server.state = ServerState.suspended
-        db.rollback()
-        raise HTTPException(status_code=503, detail=f"Failed to start Bedrock process: {e}")
-
+    # Server is created suspended — user must subscribe via Billing, then POST /start.
+    server.state = ServerState.created
     db.commit()
     db.refresh(server)
+    if server.node_id:
+        refresh_node_allocated_ram(db, server.node_id)
+        db.commit()
     _invalidate_server_read_cache(user.id, server.id)
     return _server_to_out(server, owner=user)
 
@@ -798,6 +838,34 @@ def get_server(
     )
 
 
+def _provision_remote_server(server: Server, server_dir: Path, db: Session) -> None:
+    if not server.node_id:
+        return
+    node = db.get(Node, server.node_id)
+    if not node:
+        return
+
+    from blockhost_backend.services.node_provision import provision_remote_server
+
+    cfg = server.mc_config or {}
+    version_name = str(cfg.get("template_version") or "")
+    if not version_name:
+        raise RuntimeError("Server has no template_version for remote provisioning")
+
+    settings = get_settings()
+    versions_dir = Path(settings.bedrock_versions_dir)
+    version_dir = versions_dir / version_name
+    if not version_dir.is_dir():
+        raise RuntimeError(f"Version directory not found: {version_dir}")
+
+    provision_remote_server(
+        server=server,
+        server_dir=server_dir,
+        node=node,
+        version_name=version_name,
+        version_dir=version_dir,
+    )
+
 @router.post("/{server_id}/start", response_model=ServerActionResponse)
 def start_server(
     server_id: str,
@@ -825,7 +893,7 @@ def start_server(
 
     if not server.vm_port:
         try:
-            server.vm_port = _allocate_port(db=db)
+            server.vm_port = _allocate_port(db=db, node_id=server.node_id)
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"Failed to allocate UDP port: {e}")
 
@@ -852,6 +920,8 @@ def start_server(
             cfg["template_version"] = version_name
             cfg["server_dir"] = str(server_dir)
             server.mc_config = cfg
+            
+            _provision_remote_server(server, server_dir, db)
         except Exception as e:
             raise HTTPException(
                 status_code=503, detail=f"Failed to materialize Bedrock server folder: {e}"
@@ -866,6 +936,7 @@ def start_server(
                 server_dir / "server.properties",
                 _server_props_from_config(server=server, port=server.vm_port),
             )
+            _provision_remote_server(server, server_dir, db)
         except Exception as e:
             raise HTTPException(
                 status_code=503, detail=f"Failed to update server.properties: {e}"
@@ -933,7 +1004,7 @@ def toggle_server(
     else:
         try:
             if not server.vm_port:
-                server.vm_port = _allocate_port(db=db)
+                server.vm_port = _allocate_port(db=db, node_id=server.node_id)
 
             if not (server.mc_config or {}).get("server_dir"):
                 versions_dir, servers_dir, _logs_dir = _server_dirs()
@@ -953,9 +1024,12 @@ def toggle_server(
                 cfg["template_version"] = version_name
                 cfg["server_dir"] = str(server_dir)
                 server.mc_config = cfg
+                
+                _provision_remote_server(server, server_dir, db)
             else:
                 _, servers_dir, _ = _server_dirs()
-                _validate_server_dir(Path(server.mc_config["server_dir"]), servers_dir)
+                server_dir = _validate_server_dir(Path(server.mc_config["server_dir"]), servers_dir)
+                _provision_remote_server(server, server_dir, db)
 
             write_server_properties(
                 Path(server.mc_config["server_dir"]) / "server.properties",
@@ -1103,53 +1177,52 @@ async def console_websocket(
     token: str | None = None,
     db: Session = Depends(get_db),
 ):
-    await websocket.accept()
-    
+    user = authenticate_ws_user(token=token, db=db)
+    if user is None:
+        await websocket.close(code=4001, reason="Authentication failed")
+        return
+
     try:
-        user = get_ws_user(token=token, db=db)
-        try:
-            server_uuid = uuid.UUID(server_id)
-        except ValueError:
-            await websocket.send_json({"type": "error", "error": "Invalid server ID"})
-            await websocket.close(code=4004)
-            return
-        
-        server = db.get(Server, server_uuid)
-        if not server or server.owner_id != user.id:
-            await websocket.send_json({"type": "error", "error": "Not authorized"})
-            await websocket.close(code=4003)
-            return
+        server_uuid = uuid.UUID(server_id)
+    except ValueError:
+        await websocket.close(code=4004, reason="Invalid server ID")
+        return
 
-        if not _ORCHESTRATOR.is_running(server_id):
-            await websocket.send_json({"type": "error", "error": "Server is not running"})
-            await websocket.close(code=4000)
-            return
+    server = db.get(Server, server_uuid)
+    if not server or server.owner_id != user.id:
+        await websocket.close(code=4003, reason="Not authorized")
+        return
 
+    if not _ORCHESTRATOR.is_running(server_id):
+        await websocket.close(code=4000, reason="Server is not running")
+        return
+
+    await websocket.accept()
+
+    listener_callback = None
+    try:
         import dataclasses
         from blockhost_backend.config.config_manager import get_settings
-        
+
         settings = get_settings()
-        
-        # Send last 500 lines as history
+
         history = _ORCHESTRATOR.read_logs(server_id, tail=500)
         await websocket.send_json({"type": "history", "logs": [dataclasses.asdict(e) for e in history]})
 
-        # Queue to bridge sync listener to async websocket (bounded to prevent unbounded memory growth)
         queue = asyncio.Queue(maxsize=settings.console_queue_max_size)
         loop = asyncio.get_running_loop()
 
-        def on_log(entry):
+        def listener_callback(entry):
             try:
                 loop.call_soon_threadsafe(queue.put_nowait, dataclasses.asdict(entry))
             except asyncio.QueueFull:
-                # Drop oldest entry when queue is full and add new one
                 try:
-                    queue.get_nowait()  # Discard oldest
+                    queue.get_nowait()
                     loop.call_soon_threadsafe(queue.put_nowait, dataclasses.asdict(entry))
                 except asyncio.QueueEmpty:
-                    pass  # Race condition, queue was emptied
+                    pass
 
-        _ORCHESTRATOR.add_log_listener(server_id, on_log)
+        _ORCHESTRATOR.add_log_listener(server_id, listener_callback)
 
         async def send_logs():
             try:
@@ -1166,7 +1239,9 @@ async def console_websocket(
                     try:
                         msg = json.loads(data)
                         if msg.get("type") == "command" and "command" in msg:
-                            _ORCHESTRATOR.send_command(server_id, msg["command"])
+                            command = str(msg["command"]).replace("\r", "").replace("\n", " ").strip()
+                            if command and len(command) <= 512:
+                                _ORCHESTRATOR.send_command(server_id, command)
                     except json.JSONDecodeError:
                         pass
             except WebSocketDisconnect:
@@ -1182,12 +1257,9 @@ async def console_websocket(
         for task in pending:
             task.cancel()
 
-    except HTTPException:
-        await websocket.send_json({"type": "error", "error": "Authentication failed"})
-        await websocket.close(code=4001)
     finally:
-        if 'on_log' in locals():
-            _ORCHESTRATOR.remove_log_listener(server_id, on_log)
+        if listener_callback is not None:
+            _ORCHESTRATOR.remove_log_listener(server_id, listener_callback)
 
 
 

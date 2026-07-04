@@ -61,6 +61,32 @@ class Settings(BaseSettings):
     razorpay_key_secret: str = ""          # matches RAZORPAY_KEY_SECRET in .env
     razorpay_webhook_secret: str = ""     # matches RAZORPAY_WEBHOOK_SECRET in .env
 
+    # When true: require Postgres, strong secrets, Alembic-only schema (no create_all).
+    production_mode: bool = False
+
+    # Comma-separated origins, or "*" for dev only.
+    cors_origins: str = "*"
+    cors_allow_credentials: bool = False
+
+    # Rate limits (requests per window per IP)
+    rate_limit_auth_per_minute: int = 10
+    rate_limit_upload_per_minute: int = 20
+
+    # When false, nodes must be pre-registered by an admin before agents can connect.
+    allow_auto_node_registration: bool = True
+
+    # None = auto (workers in API only when not production_mode).
+    # Set false in production multi-worker deployments; run blockhost-worker separately.
+    background_workers_in_api: bool | None = None
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+def get_cors_origins(settings: Settings | None = None) -> list[str]:
+    settings = settings or get_settings()
+    raw = settings.cors_origins.strip()
+    if raw == "*":
+        return ["*"]
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]

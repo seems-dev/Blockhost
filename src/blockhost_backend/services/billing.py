@@ -333,6 +333,24 @@ def ensure_server_not_billing_suspended(*, db: Session, server: Server) -> None:
         raise BillingError("subscription_suspended", "Subscription is suspended. Renew before starting this server.")
 
 
+def ensure_active_subscription_for_start(*, db: Session, server: Server) -> None:
+    """Require a paid, non-expired subscription before starting a server."""
+    from blockhost_backend.orchestrator.resources import active_subscription_for_server
+
+    ensure_server_not_billing_suspended(db=db, server=server)
+    subscription = active_subscription_for_server(db, server.id)
+    if subscription is None:
+        raise BillingError(
+            "subscription_required",
+            "An active subscription is required to start this server. Choose a plan in Billing.",
+        )
+    if subscription.plan is None or subscription.plan.ram_mb <= 0:
+        raise BillingError(
+            "subscription_invalid",
+            "Active subscription has no resource limits. Contact support.",
+        )
+
+
 def process_subscription_expirations(db: Session) -> dict[str, int]:
     settings = get_settings()
     now = utcnow()

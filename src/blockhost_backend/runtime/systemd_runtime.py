@@ -39,7 +39,9 @@ class SystemdRuntime:
     systemd-based Bedrock runtime (production-safe).
     systemd = source of truth.
     """
-    def __init__(self):
+    def __init__(self, *, servers_root: Path | None = None):
+        self._servers_root = servers_root
+        self._server_dirs: dict[str, Path] = {}
         self._listeners: dict[str, list[LogListener]] = {}
         self._log_procs: dict[str, subprocess.Popen] = {}
         self._threads: dict[str, threading.Thread] = {}
@@ -49,8 +51,11 @@ class SystemdRuntime:
 
     # ---------------- START ----------------
     def start_server(self, request: RuntimeStartRequest) -> RuntimeStartResult:
+        # Resolved CWD: Bedrock resolves worlds/ relative to WorkingDirectory, not the binary path.
+        server_dir = request.server_dir.resolve()
+        self._server_dirs[request.server_id] = server_dir
         executable = self._find_executable(
-            request.server_dir,
+            server_dir,
             request.executable_name,
         )
 
@@ -64,9 +69,16 @@ class SystemdRuntime:
         with self._lock:
             self._online_players[request.server_id] = {}
 
-        fifo_path = request.server_dir / "stdin.fifo"
+        fifo_path = server_dir / "stdin.fifo"
         if not fifo_path.exists():
             os.mkfifo(fifo_path)
+
+        # Prefer ./binary when the executable lives in server_dir (including symlinks)
+        # so systemd WorkingDirectory governs world/config resolution.
+        if executable.parent == server_dir:
+            exe_cmd = f"./{executable.name}"
+        else:
+            exe_cmd = f"'{executable.resolve()}'"
 
         cmd = [
             "systemd-run",
@@ -75,7 +87,7 @@ class SystemdRuntime:
             "--collect",
 
             "--property",
-            f"WorkingDirectory={request.server_dir}",
+            f"WorkingDirectory={server_dir}",
 
             "--property",
             f"MemoryMax={request.ram_mb}M",
@@ -86,7 +98,7 @@ class SystemdRuntime:
             "--property",
             "TasksMax=512",
 
-            "/bin/bash", "-c", f"exec 3<> stdin.fifo; exec '{executable}' <&3",
+            "/bin/bash", "-c", f"exec 3<> stdin.fifo; exec {exe_cmd} <&3",
         ]
 
         subprocess.Popen(cmd)
@@ -121,6 +133,7 @@ class SystemdRuntime:
         # Clear player list on stop, stop log stream, and clear listeners
         with self._lock:
             self._online_players.pop(server_id, None)
+            self._server_dirs.pop(server_id, None)
             self._stop_log_stream(server_id)
             self._listeners.pop(server_id, None)
 
@@ -256,8 +269,11 @@ class SystemdRuntime:
 
     # ---------------- COMMAND ----------------
     def send_command(self, server_id: str, command: str) -> None:
-        from blockhost_backend.config.config_manager import get_settings
-        server_dir = Path(get_settings().bedrock_servers_dir) / server_id
+        server_dir = self._server_dirs.get(server_id)
+        if server_dir is None:
+            from blockhost_backend.config.config_manager import get_settings
+            root = self._servers_root or Path(get_settings().bedrock_servers_dir)
+            server_dir = (root / server_id).resolve()
         fifo_path = server_dir / "stdin.fifo"
 
         status = self.get_status(server_id)
@@ -380,7 +396,7 @@ class SystemdRuntime:
 
     # ---------------- EXECUTABLE ----------------
     def _find_executable(self, server_dir: Path, preferred: str | None) -> Path:
-        candidates = []
+        candidates: list[str] = []
 
         if preferred:
             candidates.append(preferred)
@@ -388,7 +404,7 @@ class SystemdRuntime:
         candidates += list(_COMMON_BEDROCK_BINARIES)
 
         for name in candidates:
-            path = server_dir / name
+            path = Path(name) if Path(name).is_absolute() else server_dir / name
             if path.exists():
                 return path
 

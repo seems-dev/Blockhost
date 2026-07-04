@@ -42,6 +42,11 @@ def _local_set(key: str, value: Any, ttl_seconds: int) -> None:
         _LOCAL_CACHE[key] = (time.monotonic() + ttl_seconds, value)
 
 
+def _local_delete(key: str) -> None:
+    with _LOCAL_CACHE_LOCK:
+        _LOCAL_CACHE.pop(key, None)
+
+
 def _local_delete_prefix(prefix: str) -> None:
     with _LOCAL_CACHE_LOCK:
         for key in list(_LOCAL_CACHE):
@@ -125,7 +130,7 @@ class ApiCache:
         return value
 
     def delete(self, key: str) -> None:
-        _local_delete_prefix(key)
+        _local_delete(key)
         client = _get_redis_client()
         if client is None:
             return

@@ -98,6 +98,7 @@ yarn-error.log
 
 # Servers (large files)
 servers/
+agent_storage/
 
 # Build artifacts
 *.jar

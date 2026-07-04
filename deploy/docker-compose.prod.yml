@@ -1,0 +1,106 @@
+# Production stack: Postgres + Redis + API + background worker + Caddy reverse proxy.
+# Bedrock servers run on the host (systemd) or on separate agent nodes — not inside these containers.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: blockhost
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-postgres}
+      POSTGRES_DB: blockhost
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blockhost -d blockhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    restart: unless-stopped
+    command: >
+      uvicorn blockhost_backend.main:app
+      --host 0.0.0.0
+      --port 8000
+      --workers 2
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://blockhost:${POSTGRES_PASSWORD:-change-me-postgres}@postgres:5432/blockhost
+      REDIS_URL: redis://redis:6379/0
+      PRODUCTION_MODE: "true"
+      BACKGROUND_WORKERS_IN_API: "false"
+    volumes:
+      - bedrock_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    restart: unless-stopped
+    command: blockhost-worker
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://blockhost:${POSTGRES_PASSWORD:-change-me-postgres}@postgres:5432/blockhost
+      REDIS_URL: redis://redis:6379/0
+      PRODUCTION_MODE: "true"
+    volumes:
+      - bedrock_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+
+volumes:
+  postgres_data:
+  redis_data:
+  bedrock_data:
+  caddy_data:
+  caddy_config:

@@ -59,8 +59,8 @@ class ServerLifecycleOrchestrator:
     ) -> None:
 
         if db is not None:
-            from blockhost_backend.services.billing import ensure_server_not_billing_suspended
-            ensure_server_not_billing_suspended(db=db, server=server)
+            from blockhost_backend.services.billing import ensure_active_subscription_for_start
+            ensure_active_subscription_for_start(db=db, server=server)
 
         if not server.vm_port:
 
@@ -99,7 +99,10 @@ class ServerLifecycleOrchestrator:
                     )
 
         server.vm_id = result.runtime_id
-        server.vm_ipv4 = settings.minecraft_public_host
+        if server.node_id and server.vm_ipv4:
+            pass  # keep node-assigned IP for remote servers
+        else:
+            server.vm_ipv4 = settings.minecraft_public_host
         server.vm_port = result.port
         server.state = ServerState.running
 

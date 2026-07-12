@@ -134,3 +134,106 @@ def provision_remote_server(
     """Two-phase: ensure version binary on node, then sync config only."""
     ensure_version_on_node(node=node, version_name=version_name, version_dir=version_dir)
     sync_server_config(node=node, server=server, server_dir=server_dir)
+
+
+def provision_remote_java_server(*, server: Server, server_dir: Path, node: Node) -> None:
+    """Upload a Java server directory (jar + config) to the agent."""
+    base = _agent_base(node)
+    headers = _agent_headers()
+    fd, path = tempfile.mkstemp(suffix=".tar.gz")
+    os.close(fd)
+    try:
+        with tarfile.open(path, "w:gz") as tar:
+            for item in server_dir.iterdir():
+                if item.name in {"stdin.fifo", "logs"}:
+                    continue
+                tar.add(item, arcname=item.name)
+        with open(path, "rb") as f:
+            resp = httpx.post(
+                f"{base}/agent/servers/{server.id}/provision",
+                headers=headers,
+                files={"file": ("server.tar.gz", f, "application/gzip")},
+                timeout=600.0,
+            )
+            resp.raise_for_status()
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def sync_remote_java_config(*, server: Server, server_dir: Path, node: Node) -> None:
+    """Sync Java server.properties to the agent without re-uploading the JAR."""
+    sync_server_config(node=node, server=server, server_dir=server_dir)
+
+
+# ---------------------------------------------------------------------------
+# Mod management helpers (Modrinth)
+# ---------------------------------------------------------------------------
+
+def download_mods_on_agent(
+    *,
+    node: Node,
+    server_id: str,
+    files: list[dict],
+    subdir: str,
+) -> None:
+    """
+    Tell the agent to download mod/plugin JARs directly from Modrinth CDN.
+
+    ``files`` is a list of dicts with keys: url, filename, subdir.
+    The agent streams each file to disk; the backend never touches the bytes.
+    """
+    base = _agent_base(node)
+    headers = _agent_headers()
+
+    # Inject subdir into each file entry (agent validates it server-side too)
+    enriched = [dict(f, subdir=subdir) for f in files]
+    payload = {"files": enriched}
+
+    resp = httpx.post(
+        f"{base}/agent/servers/{server_id}/mods/download",
+        headers=headers,
+        json=payload,
+        timeout=300.0,  # Large mod packs can take time; use streaming on agent side
+    )
+    resp.raise_for_status()
+
+
+def list_mods_on_agent(
+    *,
+    node: Node,
+    server_id: str,
+    subdir: str,
+) -> list[str]:
+    """
+    Return the list of installed mod/plugin filenames from the agent's disk.
+
+    Used both for display (GET /mods) and dedup checks before install.
+    """
+    base = _agent_base(node)
+    resp = httpx.get(
+        f"{base}/agent/servers/{server_id}/mods",
+        headers=_agent_headers(),
+        params={"subdir": subdir},
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+    return resp.json().get("files", [])
+
+
+def delete_mod_on_agent(
+    *,
+    node: Node,
+    server_id: str,
+    filename: str,
+    subdir: str,
+) -> None:
+    """Delete a single mod/plugin JAR from the agent's disk."""
+    base = _agent_base(node)
+    resp = httpx.delete(
+        f"{base}/agent/servers/{server_id}/mods/{filename}",
+        headers=_agent_headers(),
+        params={"subdir": subdir},
+        timeout=30.0,
+    )
+    resp.raise_for_status()

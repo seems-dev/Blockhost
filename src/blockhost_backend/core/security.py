@@ -5,36 +5,31 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from jose import JWTError, jwt
-from passlib.context import CryptContext
-
+from pwdlib import PasswordHash
 from blockhost_backend.config.config_manager import get_settings
 
 
 _pwd_context = None
 
 
-def _get_pwd_context() -> CryptContext:
+def _get_pwd_context() -> PasswordHash:
     global _pwd_context
     if _pwd_context is None:
-        _pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+        _pwd_context = PasswordHash.recommended()
     return _pwd_context
 
 
-def _normalize_password_for_bcrypt(password: str) -> str:
-    # bcrypt only uses the first 72 bytes; passlib raises if it's longer.
-    # Normalize deterministically so we can accept longer user passwords safely.
-    password_bytes = password.encode("utf-8")
-    if len(password_bytes) <= 72:
-        return password
-    return hashlib.sha256(password_bytes).hexdigest()
-
-
 def hash_password(password: str) -> str:
-    return _get_pwd_context().hash(_normalize_password_for_bcrypt(password))
+    return _get_pwd_context().hash(password)
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return _get_pwd_context().verify(_normalize_password_for_bcrypt(password), password_hash)
+    if not password_hash:
+        return False
+    try:
+        return _get_pwd_context().verify(password, password_hash)
+    except Exception:
+        return False
 
 
 def _utcnow() -> datetime:

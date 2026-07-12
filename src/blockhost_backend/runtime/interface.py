@@ -29,6 +29,8 @@ class RuntimeStartRequest:
     executable_name: str | None
     ram_mb: int
     cpu_quota_pct: int
+    flavor: str | None = None
+    jdk_path: Path | None = None
 
 
 # -------------------------

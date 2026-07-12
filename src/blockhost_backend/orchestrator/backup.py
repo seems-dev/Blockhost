@@ -33,12 +33,11 @@ from blockhost_backend.database.schema import (
     User,
     utcnow,
 )
+from blockhost_backend.minecraft.java_compat import is_java_flavor
 from blockhost_backend.orchestrator.lifecycle_manager import get_server_lifecycle_orchestrator
 from blockhost_backend.services.system_health import assert_disk_usage_safe
 
 _ORCHESTRATOR = get_server_lifecycle_orchestrator()
-_LOCKS_GUARD = threading.Lock()
-_SERVER_LOCKS: dict[str, threading.Lock] = {}
 _EXECUTOR = ThreadPoolExecutor(max_workers=max(1, get_settings().backup_worker_threads), thread_name_prefix="backup-worker")
 _SCHEDULER_STARTED = False
 _SCHEDULER_GUARD = threading.Lock()
@@ -64,32 +63,16 @@ ACTIVE_RESTORE_STATUSES = {
     RestoreStatus.starting_server,
 }
 
-
 class BackupRestoreError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
 
+from blockhost_backend.services.api_cache import get_api_cache
 
-def _server_lock(server_id: uuid.UUID | str) -> threading.Lock:
-    key = str(server_id)
-    with _LOCKS_GUARD:
-        lock = _SERVER_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _SERVER_LOCKS[key] = lock
-        return lock
-
-
-@contextmanager
 def server_backup_restore_lock(server_id: uuid.UUID | str):
-    lock = _server_lock(server_id)
-    lock.acquire()
-    try:
-        yield
-    finally:
-        lock.release()
+    return get_api_cache().lock(f"lock:backup:{server_id}", timeout=3600)
 
 
 def backup_storage_root() -> Path:
@@ -144,8 +127,27 @@ def _world_name(server: Server) -> str:
     return str(cfg.get("level_name") or server.world_name)
 
 
-def _included_backup_paths(server_dir: Path, world_name: str) -> list[tuple[Path, str]]:
+def _included_backup_paths(server: Server, server_dir: Path, world_name: str) -> list[tuple[Path, str]]:
     candidates: list[tuple[Path, str]] = []
+    if is_java_flavor(server.flavor):
+        world_path = server_dir / "world"
+        if world_path.exists():
+            candidates.append((world_path, "java/world"))
+        else:
+            raise BackupRestoreError("world_missing", "No Java world directory found for this server")
+        for filename in (
+            "server.properties",
+            "eula.txt",
+            "ops.json",
+            "banned-players.json",
+            "banned-ips.json",
+            "whitelist.json",
+        ):
+            path = server_dir / filename
+            if path.exists() and path.is_file():
+                candidates.append((path, f"java/{filename}"))
+        return candidates
+
     world_path = server_dir / "worlds" / world_name
     worlds_path = server_dir / "worlds"
 
@@ -170,10 +172,18 @@ def _included_backup_paths(server_dir: Path, world_name: str) -> list[tuple[Path
     return candidates
 
 
-def _backup_world_size_path(server_dir: Path, world_name: str) -> Path:
+def _backup_world_size_path(server: Server, server_dir: Path, world_name: str) -> Path:
+    if is_java_flavor(server.flavor):
+        return server_dir / "world"
     world_path = server_dir / "worlds" / world_name
     if world_path.exists():
         return world_path
+    return server_dir / "worlds"
+
+
+def _active_world_path(server: Server, server_dir: Path) -> Path:
+    if is_java_flavor(server.flavor):
+        return server_dir / "world"
     return server_dir / "worlds"
 
 
@@ -377,7 +387,7 @@ def run_backup_job(job_id: uuid.UUID) -> None:
             owner = db.get(User, backup.owner_id)
             assert_disk_usage_safe("run_backup_job")
             
-            includes = _included_backup_paths(server_dir, world_name)
+            includes = _included_backup_paths(server, server_dir, world_name)
             total = _size_bytes(path for path, _arcname in includes)
             job.total_bytes = total
             backup.uncompressed_size_bytes = total
@@ -404,7 +414,10 @@ def run_backup_job(job_id: uuid.UUID) -> None:
             if temp_archive.exists():
                 temp_archive.unlink(missing_ok=True)
 
-            has_worlds = any(archive_name.startswith("bedrock/worlds") for _, archive_name in includes)
+            has_worlds = any(
+                archive_name.startswith("bedrock/worlds") or archive_name.startswith("java/world")
+                for _, archive_name in includes
+            )
             if not has_worlds:
                 raise BackupRestoreError("invalid_backup_contents", "Backup contents have no worlds content")
 
@@ -510,9 +523,15 @@ def _validate_archive_members(archive: Path) -> None:
         try:
             tar.getmember("bedrock/worlds")
         except KeyError:
-            has_world_child = any(m.name.startswith("bedrock/worlds/") for m in tar.getmembers())
-            if not has_world_child:
-                raise BackupRestoreError("invalid_archive", "Archive does not contain bedrock/worlds")
+            try:
+                tar.getmember("java/world")
+            except KeyError:
+                has_world_child = any(
+                    m.name.startswith("bedrock/worlds/") or m.name.startswith("java/world")
+                    for m in tar.getmembers()
+                )
+                if not has_world_child:
+                    raise BackupRestoreError("invalid_archive", "Archive does not contain a world directory")
 
 
 def _extract_safely(archive: Path, target: Path) -> None:
@@ -579,7 +598,7 @@ def run_restore_job(job_id: uuid.UUID) -> None:
             _validate_archive_members(archive)
 
             server_dir = _require_server_dir(server)
-            active_worlds = server_dir / "worlds"
+            active_worlds = _active_world_path(server, server_dir)
             server_was_running = _ORCHESTRATOR.is_running(str(server.id))
             job.server_was_running = server_was_running
             db.commit()
@@ -597,13 +616,13 @@ def run_restore_job(job_id: uuid.UUID) -> None:
             _update_restore_job(db, job, RestoreStatus.extracting, "extracting", 25)
             _extract_safely(archive, restore_tmp)
 
-            restored_worlds = restore_tmp / "bedrock" / "worlds"
+            restored_worlds = restore_tmp / ("java/world" if is_java_flavor(server.flavor) else "bedrock/worlds")
             if not restored_worlds.exists() or not restored_worlds.is_dir():
-                raise BackupRestoreError("restored_world_missing", "Extracted backup has no worlds directory")
+                raise BackupRestoreError("restored_world_missing", "Extracted backup has no world directory")
 
             _update_restore_job(db, job, RestoreStatus.validating_restore, "validating_restore", 65)
             rollback_root = runtime_tmp / "rollback" / str(job.id)
-            rollback_worlds = rollback_root / "worlds"
+            rollback_worlds = rollback_root / active_worlds.name
             _safe_rmtree(rollback_root)
             rollback_root.mkdir(parents=True, exist_ok=True)
             job.rollback_path = str(rollback_worlds)
@@ -619,6 +638,7 @@ def run_restore_job(job_id: uuid.UUID) -> None:
                     os.replace(rollback_worlds, active_worlds)
                 raise
 
+            config_prefix = "java" if is_java_flavor(server.flavor) else "bedrock"
             for filename in (
                 "server.properties",
                 "allowlist.json",
@@ -626,8 +646,13 @@ def run_restore_job(job_id: uuid.UUID) -> None:
                 "valid_known_packs.json",
                 "world_behavior_packs.json",
                 "world_resource_packs.json",
+                "eula.txt",
+                "ops.json",
+                "banned-players.json",
+                "banned-ips.json",
+                "whitelist.json",
             ):
-                restored_file = restore_tmp / "bedrock" / filename
+                restored_file = restore_tmp / config_prefix / filename
                 if restored_file.exists() and restored_file.is_file():
                     shutil.copy2(restored_file, server_dir / filename)
 

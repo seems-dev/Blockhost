@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+import httpx
 
 from blockhost_backend.api.deps import get_current_user
 from blockhost_backend.config.config_manager import get_settings
@@ -125,6 +126,25 @@ def get_catalog(user: User = Depends(get_current_user)) -> dict:
     versions_dir = Path(settings.bedrock_versions_dir).resolve()
     installed = sorted([p.name for p in versions_dir.iterdir() if p.is_dir()]) if versions_dir.exists() else []
     return {"available": versions, "recommended": rec, "installed": installed}
+
+
+@router.get("/java-catalog")
+def get_java_catalog(user: User = Depends(get_current_user)) -> dict:
+    """
+    Returns a list of Java edition versions available from Mojang's manifest.
+    Only returns 'release' type versions (not snapshots).
+    """
+    try:
+        manifest = httpx.get("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json", timeout=10.0)
+        manifest.raise_for_status()
+        versions = [
+            v["id"] for v in manifest.json()["versions"]
+            if v["type"] == "release"
+        ]
+        recommended = versions[0] if versions else None
+        return {"available": versions, "recommended": recommended, "installed": []}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch Java versions: {e}")
 
 
 @router.post("/{version}/download")

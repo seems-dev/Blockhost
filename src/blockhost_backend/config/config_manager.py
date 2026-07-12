@@ -1,8 +1,22 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Repo root: .../blockhost (parent of src/)
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def resolve_data_path(path: str) -> Path:
+    """Resolve storage paths relative to the repo root, not process cwd."""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    return (_PROJECT_ROOT / candidate).resolve()
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file="src/.env", env_file_encoding="utf-8", extra="ignore")
 
@@ -26,6 +40,8 @@ class Settings(BaseSettings):
     bedrock_versions_manifest: str = "versions/manifest.json"
     bedrock_port_range_start: int = 19132
     bedrock_port_range_end: int = 19232
+    java_port_range_start: int = 25565
+    java_port_range_end: int = 25665
     backup_storage_dir: str = "backups"
     backup_temp_dir: str = "backups/tmp"
     backup_retention_count: int = 7
@@ -52,6 +68,10 @@ class Settings(BaseSettings):
     worker_agent_url: str = "http://localhost:9000"
     worker_agent_token: str = "change-me-in-dev"
 
+    # Add these fields to your Settings class
+    software_cache_dir: str = "software_cache"
+    java_home_path: str | None = None  # e.g., "/usr/lib/jvm/java-21-openjdk-amd64" (for local non-agent runs)
+
     # Console streaming configuration
     console_queue_max_size: int = 1000  # Max buffered log lines per websocket connection
     console_stream_cleanup_enabled: bool = True  # Stop log stream when no listeners remain (but keep running if player tracking active)
@@ -69,8 +89,9 @@ class Settings(BaseSettings):
     cors_allow_credentials: bool = False
 
     # Rate limits (requests per window per IP)
-    rate_limit_auth_per_minute: int = 10
-    rate_limit_upload_per_minute: int = 20
+    # Relaxed for local development so repeated auth/sign-up attempts do not fail with 429s.
+    rate_limit_auth_per_minute: int = 120
+    rate_limit_upload_per_minute: int = 120
 
     # When false, nodes must be pre-registered by an admin before agents can connect.
     allow_auto_node_registration: bool = True

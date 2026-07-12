@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 from pathlib import Path
 from sqlalchemy.orm import Session
 
+import httpx
+
 from blockhost_backend.config.config_manager import Settings
 from blockhost_backend.database.schema import (
+    Node,
     Server,
     ServerState,
-   
     User,
 )
+from blockhost_backend.minecraft.java_compat import is_java_flavor, required_java_version
 from blockhost_backend.orchestrator.resources import get_effective_server_resource_limits
 from blockhost_backend.runtime.interface import (
     LogEntry,
@@ -75,22 +80,36 @@ class ServerLifecycleOrchestrator:
         )
 
         limits = get_effective_server_resource_limits(db=db, server=server)
+        mc_config = server.mc_config or {}
+        is_java = is_java_flavor(server.flavor)
+        executable_name = (
+            mc_config.get("executable_name")
+            if is_java
+            else (settings.bedrock_executable_name or None)
+        )
+        requested_version = (
+            str(server.mc_version or "")
+            if is_java
+            else str(mc_config.get("template_version") or "")
+        ) or None
 
         result = self._runtime.start_server(
             RuntimeStartRequest(
                 server_id=str(server.id),
                 server_dir=server_dir,
                 port=server.vm_port,
-                requested_version=str(server.mc_config.get("template_version") or ""),
-                executable_name=settings.bedrock_executable_name or None,
+                requested_version=requested_version,
+                executable_name=executable_name,
                 ram_mb=limits["ram_mb"],
                 cpu_quota_pct=limits["cpu_quota_pct"],
+                flavor=server.flavor.value if server.flavor else None,
+                jdk_path=self._resolve_jdk_path(server=server, settings=settings, db=db),
             )
         )
 
-        # OPTIONAL VERSION CHECK
-        requested = server.mc_config.get("template_version")
-        if requested and result.actual_version:
+        # OPTIONAL VERSION CHECK (Bedrock only)
+        requested = mc_config.get("template_version")
+        if not is_java and requested and result.actual_version:
             if requested not in {"LATEST", "PREVIEW"}:
                 if not str(result.actual_version).startswith(str(requested)):
                     self._runtime.stop_server(str(server.id))
@@ -138,6 +157,57 @@ class ServerLifecycleOrchestrator:
 
     
     
+
+    def _resolve_jdk_path(
+        self,
+        *,
+        server: Server,
+        settings: Settings,
+        db: Session | None,
+    ) -> Path | None:
+        if not is_java_flavor(server.flavor):
+            return None
+
+        java_ver = server.java_version or required_java_version(server.mc_version or "1.21")
+
+        if server.node_id and db is not None:
+            node = db.get(Node, server.node_id)
+            if node:
+                return self._ensure_remote_jdk(node=node, java_version=java_ver, settings=settings)
+
+        if settings.java_home_path:
+            jdk_path = Path(settings.java_home_path)
+            if (jdk_path / "bin" / "java").exists():
+                return jdk_path
+
+        java_home = os.environ.get("JAVA_HOME")
+        if java_home:
+            jdk_path = Path(java_home)
+            if (jdk_path / "bin" / "java").exists():
+                return jdk_path
+
+        java_bin = shutil.which("java")
+        if java_bin:
+            return Path(java_bin).resolve().parent.parent
+
+        return None
+
+    def _ensure_remote_jdk(self, *, node: Node, java_version: int, settings: Settings) -> Path:
+        base = f"http://{node.ip_address}:{node.agent_port}"
+        headers = {"Authorization": f"Bearer {settings.worker_agent_token}"}
+        resp = httpx.post(
+            f"{base}/agent/jdks/{java_version}/ensure",
+            headers=headers,
+            timeout=300.0,
+        )
+        resp.raise_for_status()
+        path = resp.json().get("path")
+        if not path:
+            raise RuntimeError(f"Agent did not return a JDK path for Java {java_version}")
+        jdk_path = Path(path)
+        if not (jdk_path / "bin" / "java").exists():
+            raise RuntimeError(f"JDK not found on agent at {jdk_path}")
+        return jdk_path
 
     # ---------------- VALIDATION ----------------
     def _validate_server_dir(self, server_dir: Path, servers_dir: Path) -> Path:

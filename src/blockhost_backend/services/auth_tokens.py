@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from blockhost_backend.config.config_manager import get_settings

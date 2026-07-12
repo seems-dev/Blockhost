@@ -36,22 +36,18 @@ class NodeRouter(Runtime):
 
     def __init__(self):
         self._local = SystemdRuntime()
-        self._agent_cache: dict[uuid.UUID, AgentRuntime] = {}
-        self._server_cache: dict[str, _CachedRuntime] = {}
-        self._lock = threading.Lock()
 
     def _get_agent_runtime(self, node: Node) -> AgentRuntime:
-        if node.id not in self._agent_cache:
-            agent_token = get_settings().worker_agent_token
-            agent_base_url = f"http://{node.ip_address}:{node.agent_port}"
-            self._agent_cache[node.id] = AgentRuntime(
-                agent_base_url=agent_base_url, agent_token=agent_token
-            )
-        return self._agent_cache[node.id]
+        agent_token = get_settings().worker_agent_token
+        agent_base_url = f"http://{node.ip_address}:{node.agent_port}"
+        return AgentRuntime(agent_base_url=agent_base_url, agent_token=agent_token)
 
-    def _resolve_runtime(self, server_id: str) -> Runtime:
+    def _get_runtime(self, server_id: str) -> Runtime:
         with SessionLocal() as db:
-            server = db.get(Server, uuid.UUID(server_id))
+            try:
+                server = db.get(Server, uuid.UUID(server_id))
+            except ValueError:
+                return self._local
             if not server or not server.node_id:
                 return self._local
 
@@ -61,30 +57,11 @@ class NodeRouter(Runtime):
 
             return self._get_agent_runtime(node)
 
-    def _get_runtime(self, server_id: str) -> Runtime:
-        now = time.monotonic()
-        with self._lock:
-            cached = self._server_cache.get(server_id)
-            if cached is not None and cached.expires_at > now:
-                return cached.runtime
-
-        runtime = self._resolve_runtime(server_id)
-        with self._lock:
-            self._server_cache[server_id] = _CachedRuntime(
-                runtime=runtime,
-                expires_at=now + _RUNTIME_CACHE_TTL_SECONDS,
-            )
-        return runtime
-
     def invalidate_server(self, server_id: str) -> None:
-        with self._lock:
-            self._server_cache.pop(server_id, None)
+        pass
 
     def invalidate_node(self, node_id: uuid.UUID) -> None:
-        with self._lock:
-            self._agent_cache.pop(node_id, None)
-            # Drop any server entries pointing at this node's agent (conservative: clear all).
-            self._server_cache.clear()
+        pass
 
     def start_server(self, request: RuntimeStartRequest) -> RuntimeStartResult:
         return self._get_runtime(request.server_id).start_server(request)

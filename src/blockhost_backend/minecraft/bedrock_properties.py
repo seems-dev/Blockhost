@@ -11,7 +11,7 @@ class BedrockServerProperties:
     difficulty: str | None = None
     max_players: int | None = None
     allow_cheats: bool | None = None
-    online_mode: bool | None = None
+    online_mode: bool | None = False
     level_name: str | None = None
     level_seed: str | None = None
     enable_lan_visibility: bool = False

@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
 from typing import Any, AsyncGenerator
-
+import httpx
 import psutil
 import websockets
 from fastapi import (
@@ -33,6 +33,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import shutil
 
+from blockhost_backend.api.files import download_file
 from blockhost_backend.runtime.systemd_runtime import SystemdRuntime
 from blockhost_backend.runtime.interface import RuntimeStartRequest
 
@@ -112,6 +113,7 @@ class StartPayload(BaseModel):
     executable_name: str | None = None
     ram_mb: int
     cpu_quota_pct: int
+    jdk_path: str | None = None  # NEW
 
 
 class CommandPayload(BaseModel):
@@ -135,7 +137,49 @@ def health_check() -> Any:
 # ---------------------------------------------------------------------------
 # Server Lifecycle
 # ---------------------------------------------------------------------------
+JDK_CACHE_DIR = Path(os.environ.get("JDK_CACHE_DIR", f"./agent_storage/jdks")).resolve()
+JDK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+@app.post("/agent/jdks/{java_version}/ensure")
+async def ensure_jdk(java_version: int, _token: str = Depends(verify_token)) -> Any:
+    jdk_dir = JDK_CACHE_DIR / str(java_version)
+    if (jdk_dir / "bin" / "java").exists():
+        return {"status": "already_installed", "path": str(jdk_dir)}
+
+    import httpx
+    download_url = f"https://api.adoptium.net/v3/binary/latest/{java_version}/ga/linux/x64/jdk/hotspot/normal/eclipse?project=jdk"
+    
+    tar_path = JDK_CACHE_DIR / f"{java_version}.tar.gz"
+    try:
+        async with httpx.AsyncClient() as client:
+            async with client.stream("GET", download_url, follow_redirects=True, timeout=300.0) as resp:
+                if resp.status_code != 200:
+                    raise HTTPException(status_code=400, detail=f"Failed to fetch JDK: {resp.status_code}")
+                with open(tar_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(1024 * 1024):
+                        f.write(chunk)
+                        
+        shutil.unpack_archive(tar_path, JDK_CACHE_DIR)
+        
+        # Adoptium extracts to a folder like `jdk-21.0.4+7`. Rename it to just the version.
+        extracted = None
+        for item in JDK_CACHE_DIR.iterdir():
+            if item.is_dir() and item.name.startswith(f"jdk-{java_version}"):
+                extracted = item
+                break
+                
+        if extracted and extracted != jdk_dir:
+            if jdk_dir.exists():
+                shutil.rmtree(jdk_dir)
+            extracted.rename(jdk_dir)
+            
+        if not (jdk_dir / "bin" / "java").exists():
+            raise HTTPException(status_code=500, detail="JDK extraction failed")
+            
+        return {"status": "installed", "path": str(jdk_dir)}
+    finally:
+        if tar_path.exists():
+            tar_path.unlink()
 
 @app.post("/agent/servers/{server_id}/start")
 def start_server(
@@ -144,10 +188,21 @@ def start_server(
     _token: str = Depends(verify_token),
 ) -> Any:
     _validate_server_id(server_id)
-    version_name = (payload.requested_version or "").strip()
-    if not version_name:
-        raise HTTPException(status_code=400, detail="requested_version is required on agent")
-    server_dir = _ensure_server_layout(server_id, version_name)
+    is_java = (payload.executable_name or "").endswith(".jar")
+
+    if is_java:
+        server_dir = SERVERS_ROOT_DIR / server_id
+        if not server_dir.is_dir():
+            raise HTTPException(status_code=404, detail="Java server directory not provisioned on agent")
+        jar_name = payload.executable_name or "server.jar"
+        if not (server_dir / jar_name).is_file():
+            raise HTTPException(status_code=404, detail=f"Java server JAR not found: {jar_name}")
+    else:
+        version_name = (payload.requested_version or "").strip()
+        if not version_name:
+            raise HTTPException(status_code=400, detail="requested_version is required on agent")
+        server_dir = _ensure_server_layout(server_id, version_name)
+
     if not server_dir.resolve().is_relative_to(SERVERS_ROOT_DIR):
         raise HTTPException(status_code=403, detail="Path traversal detected")
 
@@ -159,6 +214,7 @@ def start_server(
         executable_name=payload.executable_name,
         ram_mb=payload.ram_mb,
         cpu_quota_pct=payload.cpu_quota_pct,
+        jdk_path=Path(payload.jdk_path) if payload.jdk_path else None, # NEW
     )
     result = runtime.start_server(req)
     return {
@@ -519,6 +575,7 @@ async def provision_server(
 # ---------------------------------------------------------------------------
 
 ALLOWED_ROOTS = {
+    "world",
     "worlds",
     "development_behavior_packs",
     "development_resource_packs",
@@ -752,6 +809,218 @@ def agent_delete_file(
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
 
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Mod / Plugin Management (Modrinth)
+# ---------------------------------------------------------------------------
+
+# Only these subdirectories are valid install targets.
+# This is a hard security allowlist — prevents path traversal even if
+# the Backend sends a crafted subdir value.
+_ALLOWED_MOD_SUBDIRS: frozenset[str] = frozenset({"mods", "plugins"})
+
+# Maximum size of a single mod JAR to accept (500 MB).
+# Configurable via environment variable MOD_MAX_SIZE_BYTES.
+_MOD_MAX_SIZE_BYTES: int = int(
+    os.environ.get("MOD_MAX_SIZE_BYTES", str(500 * 1024 * 1024))
+)
+
+# Only allow downloads from the official Modrinth CDN (SSRF guard).
+_ALLOWED_MOD_URL_PREFIX = "https://cdn.modrinth.com/"
+
+
+class _ModFile(BaseModel):
+    url: str
+    filename: str
+    subdir: str  # validated against _ALLOWED_MOD_SUBDIRS
+
+
+class _ModDownloadRequest(BaseModel):
+    files: list[_ModFile]
+
+
+def _validate_mod_subdir(subdir: str) -> str:
+    if subdir not in _ALLOWED_MOD_SUBDIRS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid subdir {subdir!r}. Allowed: {sorted(_ALLOWED_MOD_SUBDIRS)}",
+        )
+    return subdir
+
+
+def _validate_mod_filename(filename: str) -> str:
+    """Ensure the filename is a plain .jar with no path components."""
+    safe = Path(filename).name  # strips any directory components
+    if safe != filename:
+        raise HTTPException(status_code=400, detail="Filename must not contain path separators")
+    if not safe.endswith(".jar"):
+        raise HTTPException(status_code=400, detail="Only .jar files are permitted")
+    # Block hidden files and names starting with a dot
+    if safe.startswith("."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return safe
+
+
+def _validate_mod_url(url: str) -> str:
+    """Block non-CDN URLs to prevent SSRF attacks."""
+    if not url.startswith(_ALLOWED_MOD_URL_PREFIX):
+        raise HTTPException(
+            status_code=400,
+            detail=f"URL must start with {_ALLOWED_MOD_URL_PREFIX!r} (SSRF guard)",
+        )
+    return url
+
+
+@app.post("/agent/servers/{server_id}/mods/download")
+async def agent_download_mods(
+    server_id: str,
+    payload: _ModDownloadRequest,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """
+    Download a list of mod/plugin JARs directly from Modrinth CDN to disk.
+
+    This is the "muscle" endpoint. The Backend resolves which files are needed;
+    this endpoint does the actual fetching. Files are streamed chunk-by-chunk
+    so the process never loads a full JAR into RAM regardless of file size.
+
+    Security controls:
+      - Token-gated (agent bearer token).
+      - URL must start with https://cdn.modrinth.com/ (SSRF guard).
+      - subdir must be in {"mods", "plugins"} (path traversal guard).
+      - filename must be a plain *.jar with no path separators.
+      - File size is capped at _MOD_MAX_SIZE_BYTES (default 500 MB).
+    """
+    _validate_server_id(server_id)
+
+    if not payload.files:
+        return {"status": "ok", "downloaded": 0}
+
+    # Pre-validate all entries before touching the network
+    for mod_file in payload.files:
+        _validate_mod_url(mod_file.url)
+        _validate_mod_filename(mod_file.filename)
+        _validate_mod_subdir(mod_file.subdir)
+
+    downloaded = 0
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=5.0),
+        follow_redirects=True,
+    ) as client:
+        for mod_file in payload.files:
+            dest_dir = SERVERS_ROOT_DIR / server_id / mod_file.subdir
+            # Path traversal double-check after joining
+            if not dest_dir.resolve().is_relative_to(SERVERS_ROOT_DIR):
+                raise HTTPException(status_code=403, detail="Path traversal detected")
+            dest_dir.mkdir(parents=True, exist_ok=True)
+
+            dest_path = dest_dir / mod_file.filename
+            # Final path traversal check on the full destination
+            if not dest_path.resolve().is_relative_to(dest_dir.resolve()):
+                raise HTTPException(status_code=403, detail="Path traversal detected in filename")
+
+            logger.info(
+                "Downloading mod %s → %s/%s",
+                mod_file.filename, mod_file.subdir, mod_file.filename,
+            )
+
+            total_bytes = 0
+            try:
+                async with client.stream("GET", mod_file.url) as resp:
+                    resp.raise_for_status()
+                    with open(dest_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(1024 * 1024):  # 1 MB chunks
+                            total_bytes += len(chunk)
+                            if total_bytes > _MOD_MAX_SIZE_BYTES:
+                                # Truncate and abort — remove partial file
+                                f.close()
+                                dest_path.unlink(missing_ok=True)
+                                raise HTTPException(
+                                    status_code=413,
+                                    detail=(
+                                        f"Mod {mod_file.filename!r} exceeds size limit "
+                                        f"({_MOD_MAX_SIZE_BYTES // (1024*1024)} MB)"
+                                    ),
+                                )
+                            f.write(chunk)
+            except httpx.HTTPStatusError as exc:
+                dest_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"CDN returned {exc.response.status_code} "
+                        f"for {mod_file.filename!r}"
+                    ),
+                )
+            except httpx.HTTPError as exc:
+                dest_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Network error downloading {mod_file.filename!r}: {exc}",
+                )
+
+            downloaded += 1
+            logger.info("Saved %s (%d bytes)", mod_file.filename, total_bytes)
+
+    return {"status": "ok", "downloaded": downloaded}
+
+
+@app.get("/agent/servers/{server_id}/mods")
+def agent_list_mods(
+    server_id: str,
+    subdir: str = Query(default="mods"),
+    _token: str = Depends(verify_token),
+) -> Any:
+    """
+    List all .jar files in the server's mods/ or plugins/ directory.
+
+    Returns filenames only (not full paths). The Backend uses this both
+    to display the installed mods list and to check for already-installed
+    files before downloading (dedup).
+    """
+    _validate_server_id(server_id)
+    _validate_mod_subdir(subdir)
+
+    mods_dir = SERVERS_ROOT_DIR / server_id / subdir
+    if not mods_dir.exists():
+        return {"files": []}
+
+    files = sorted(
+        entry.name
+        for entry in mods_dir.iterdir()
+        if entry.is_file() and entry.suffix == ".jar" and not entry.name.startswith(".")
+    )
+    return {"files": files}
+
+
+@app.delete("/agent/servers/{server_id}/mods/{filename}")
+def agent_delete_mod(
+    server_id: str,
+    filename: str,
+    subdir: str = Query(default="mods"),
+    _token: str = Depends(verify_token),
+) -> Any:
+    """
+    Delete a single .jar from the server's mods/ or plugins/ directory.
+
+    Validates subdir and filename for path traversal before deleting.
+    """
+    _validate_server_id(server_id)
+    _validate_mod_subdir(subdir)
+    safe_filename = _validate_mod_filename(filename)
+
+    target = SERVERS_ROOT_DIR / server_id / subdir / safe_filename
+    # Path traversal final check
+    if not target.resolve().is_relative_to((SERVERS_ROOT_DIR / server_id / subdir).resolve()):
+        raise HTTPException(status_code=403, detail="Path traversal detected")
+
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"Mod {safe_filename!r} not found")
+
+    target.unlink()
+    logger.info("Deleted mod %s/%s for server %s", subdir, safe_filename, server_id)
     return {"status": "ok"}
 
 

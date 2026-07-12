@@ -57,6 +57,7 @@ class VMProvider(str, enum.Enum):
     oracle_free = "oracle_free"
     hetzner = "hetzner"
     local_bedrock = "local_bedrock"
+    local_java = "local_java"
 
 
 class BackupStatus(str, enum.Enum):
@@ -119,6 +120,17 @@ class NodeState(str, enum.Enum):
     online = "online"
     offline = "offline"
     draining = "draining"
+
+
+class ServerFlavor(str, enum.Enum):
+    BEDROCK = "bedrock"
+    JAVA_VANILLA = "java_vanilla"
+    PAPER = "paper"
+    PURPUR = "purpur"
+    FABRIC = "fabric"
+    FORGE = "forge"
+    NEOFORGE = "neoforge"
+
 
 
 class User(Base):
@@ -202,6 +214,9 @@ class Server(Base):
 
     owner: Mapped[User] = relationship(back_populates="servers")
     bans: Mapped[list["Ban"]] = relationship(back_populates="server", cascade="all, delete-orphan")
+    flavor: Mapped[ServerFlavor] = mapped_column(Enum(ServerFlavor), default=ServerFlavor.BEDROCK)
+    mc_version: Mapped[str | None] = mapped_column(String(32)) # e.g., "1.21.4"
+    java_version: Mapped[int | None] = mapped_column(Integer, nullable=True) # e.g., 21
 
 
 class BillingPlan(Base):
@@ -314,6 +329,7 @@ class Backup(Base):
 
     world_name: Mapped[str] = mapped_column(String(128), nullable=False)
     bedrock_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    mc_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     consistency_method: Mapped[BackupConsistencyMethod | None] = mapped_column(Enum(BackupConsistencyMethod), nullable=True)
     server_was_running: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 

@@ -16,43 +16,16 @@ from blockhost_backend.config.config_manager import get_settings
 
 logger = logging.getLogger(__name__)
 
-_LOCAL_CACHE: dict[str, tuple[float, Any]] = {}
-_LOCAL_CACHE_LOCK = threading.Lock()
 _REDIS_CLIENT: Any | None = None
 _REDIS_LOCK = threading.Lock()
 _REDIS_DISABLED_UNTIL = 0.0
 _REDIS_BACKOFF_SECONDS = 30.0
 
 
-def _local_get(key: str) -> Any | None:
-    now = time.monotonic()
-    with _LOCAL_CACHE_LOCK:
-        cached = _LOCAL_CACHE.get(key)
-        if not cached:
-            return None
-        expires_at, value = cached
-        if expires_at <= now:
-            _LOCAL_CACHE.pop(key, None)
-            return None
-        return value
-
-
-def _local_set(key: str, value: Any, ttl_seconds: int) -> None:
-    with _LOCAL_CACHE_LOCK:
-        _LOCAL_CACHE[key] = (time.monotonic() + ttl_seconds, value)
-
-
-def _local_delete_prefix(prefix: str) -> None:
-    with _LOCAL_CACHE_LOCK:
-        for key in list(_LOCAL_CACHE):
-            if key.startswith(prefix):
-                _LOCAL_CACHE.pop(key, None)
-
-
 def _disable_redis_temporarily(exc: Exception) -> None:
     global _REDIS_DISABLED_UNTIL
     _REDIS_DISABLED_UNTIL = time.monotonic() + _REDIS_BACKOFF_SECONDS
-    logger.debug("Redis cache unavailable; falling back to local cache: %s", exc)
+    logger.debug("Redis cache unavailable: %s", exc)
 
 
 def _get_redis_client() -> Any | None:
@@ -71,8 +44,8 @@ def _get_redis_client() -> Any | None:
             client = redis.Redis.from_url(
                 settings.redis_url,
                 decode_responses=True,
-                socket_connect_timeout=0.05,
-                socket_timeout=0.05,
+                socket_connect_timeout=0.5,
+                socket_timeout=0.5,
             )
             client.ping()
         except Exception as exc:
@@ -82,12 +55,26 @@ def _get_redis_client() -> Any | None:
         return client
 
 
+class DummyLock:
+    def __init__(self):
+        self._lock = threading.Lock()
+        
+    def acquire(self, *args, **kwargs):
+        return self._lock.acquire(*args, **kwargs)
+        
+    def release(self):
+        self._lock.release()
+        
+    def __enter__(self):
+        self.acquire()
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+
 class ApiCache:
     def get_json(self, key: str) -> Any | None:
-        local = _local_get(key)
-        if local is not None:
-            return local
-
         client = _get_redis_client()
         if client is None:
             return None
@@ -105,12 +92,10 @@ class ApiCache:
             return None
 
     def set_json(self, key: str, value: Any, ttl_seconds: int) -> None:
-        ttl = max(1, int(ttl_seconds))
-        _local_set(key, value, ttl)
-
         client = _get_redis_client()
         if client is None:
             return
+        ttl = max(1, int(ttl_seconds))
         try:
             client.setex(key, ttl, json.dumps(value, separators=(",", ":")))
         except Exception as exc:
@@ -125,7 +110,6 @@ class ApiCache:
         return value
 
     def delete(self, key: str) -> None:
-        _local_delete_prefix(key)
         client = _get_redis_client()
         if client is None:
             return
@@ -135,7 +119,6 @@ class ApiCache:
             _disable_redis_temporarily(exc)
 
     def delete_prefix(self, prefix: str) -> None:
-        _local_delete_prefix(prefix)
         client = _get_redis_client()
         if client is None:
             return
@@ -144,6 +127,12 @@ class ApiCache:
                 client.delete(key)
         except Exception as exc:
             _disable_redis_temporarily(exc)
+
+    def lock(self, name: str, timeout: int = 600) -> Any:
+        client = _get_redis_client()
+        if client is None:
+            return DummyLock()
+        return client.lock(name, timeout=timeout)
 
 
 _API_CACHE = ApiCache()

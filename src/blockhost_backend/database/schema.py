@@ -5,11 +5,23 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, Index, text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    Uuid,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.types import JSON
 
-from blockhost_backend.database.types import GUID, JSONType
-#file_name = schema.pyS
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -45,6 +57,7 @@ class VMProvider(str, enum.Enum):
     oracle_free = "oracle_free"
     hetzner = "hetzner"
     local_bedrock = "local_bedrock"
+    local_java = "local_java"
 
 
 class BackupStatus(str, enum.Enum):
@@ -93,35 +106,91 @@ class BackupConsistencyMethod(str, enum.Enum):
     server_stop = "server_stop"
     filesystem_snapshot = "filesystem_snapshot"
 
+
+class BlockcoinReason(str, enum.Enum):
+    referral = "referral"
+    ad_view = "ad_view"
+    daily_task = "daily_task"
+    server_hosting = "server_hosting"
+    purchase = "purchase"
+    admin_adjustment = "admin_adjustment"
+
+
+class NodeState(str, enum.Enum):
+    online = "online"
+    offline = "offline"
+    draining = "draining"
+
+
+class ServerFlavor(str, enum.Enum):
+    BEDROCK = "bedrock"
+    JAVA_VANILLA = "java_vanilla"
+    PAPER = "paper"
+    PURPUR = "purpur"
+    FABRIC = "fabric"
+    FORGE = "forge"
+    NEOFORGE = "neoforge"
+
+
+
 class User(Base):
     __tablename__ = "users"
- 
-    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
     phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
     auth_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     nickname: Mapped[str] = mapped_column(String(64), nullable=False)
     referrer_code: Mapped[str] = mapped_column(String(16), unique=True, index=True, nullable=False)
-    referred_by_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), ForeignKey("users.id"), nullable=True)
+    referred_by_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("users.id"), nullable=True)
     blockcoin_balance: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     stripe_customer_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-   
- 
+
     # --- OAuth fields ---
     google_sub: Mapped[str | None] = mapped_column(String(128), unique=True, index=True, nullable=True)
     auth_provider: Mapped[str] = mapped_column(String(32), nullable=False, default="local")
- 
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
- 
+
+    refresh_tokens: Mapped[list["RefreshToken"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     servers: Mapped[list["Server"]] = relationship(back_populates="owner", cascade="all, delete-orphan")
+
+
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+    __table_args__ = (
+        UniqueConstraint("jti", name="uq_refresh_tokens_jti"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
+    jti: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    user: Mapped[User] = relationship(back_populates="refresh_tokens")
+
 
 class Server(Base):
     __tablename__ = "servers"
+    __table_args__ = (
+        UniqueConstraint("node_id", "vm_port", name="uq_servers_node_port"),
+    )
 
-    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
-    owner_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("users.id"), index=True, nullable=False)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    node_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("nodes.id"),
+        index=True,
+        nullable=True,
+    )
+
+    node: Mapped["Node"] = relationship(back_populates="servers")
+    owner_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
     world_name: Mapped[str] = mapped_column(String(128), nullable=False)
     join_code: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
     state: Mapped[ServerState] = mapped_column(Enum(ServerState), nullable=False, default=ServerState.created)
@@ -131,10 +200,7 @@ class Server(Base):
     vm_ipv4: Mapped[str | None] = mapped_column(String(64), nullable=True)
     vm_port: Mapped[int] = mapped_column(Integer, nullable=False, default=19132)
 
-    # Minecraft Bedrock server.properties-like config (stored for production orchestration).
-    # Setup-stage note: local docker-compose uses a single shared Bedrock container, so this
-    # config may not be applied until orchestration is wired up.
-    mc_config: Mapped[dict] = mapped_column(JSONType, nullable=False, default=dict)
+    mc_config: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
 
     is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     creator_earnings_total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
@@ -148,6 +214,9 @@ class Server(Base):
 
     owner: Mapped[User] = relationship(back_populates="servers")
     bans: Mapped[list["Ban"]] = relationship(back_populates="server", cascade="all, delete-orphan")
+    flavor: Mapped[ServerFlavor] = mapped_column(Enum(ServerFlavor), default=ServerFlavor.BEDROCK)
+    mc_version: Mapped[str | None] = mapped_column(String(32)) # e.g., "1.21.4"
+    java_version: Mapped[int | None] = mapped_column(Integer, nullable=True) # e.g., 21
 
 
 class BillingPlan(Base):
@@ -169,9 +238,9 @@ class BillingPlan(Base):
 class BillingSubscription(Base):
     __tablename__ = "subscriptions"
 
-    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
-    user_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("users.id"), index=True, nullable=False)
-    server_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("servers.id"), index=True, nullable=False)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
+    server_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=False)
     plan_id: Mapped[str] = mapped_column(String(64), ForeignKey("plans.id"), index=True, nullable=False)
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
@@ -187,10 +256,10 @@ class BillingSubscription(Base):
 class BillingTransaction(Base):
     __tablename__ = "transactions"
 
-    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
-    user_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("users.id"), index=True, nullable=False)
-    server_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("servers.id"), index=True, nullable=False)
-    subscription_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), ForeignKey("subscriptions.id"), nullable=True)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
+    server_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=False)
+    subscription_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("subscriptions.id"), nullable=True)
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     provider_order_id: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
     provider_payment_id: Mapped[str | None] = mapped_column(String(128), unique=True, nullable=True)
@@ -213,12 +282,12 @@ class BillingTransaction(Base):
 class BillingAuditLog(Base):
     __tablename__ = "billing_audit_logs"
 
-    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
-    user_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("users.id"), index=True, nullable=False)
-    server_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("servers.id"), index=True, nullable=False)
-    transaction_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), ForeignKey("transactions.id"), nullable=True)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
+    server_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=False)
+    transaction_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("transactions.id"), nullable=True)
     action: Mapped[str] = mapped_column(String(64), nullable=False)
-    details: Mapped[dict] = mapped_column(JSONType, nullable=False, default=dict)
+    details: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
@@ -228,8 +297,8 @@ class Ban(Base):
         UniqueConstraint("server_id", "xuid", "active", name="uq_bans_server_xuid_active"),
     )
 
-    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
-    server_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("servers.id"), index=True, nullable=False)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    server_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=False)
     xuid: Mapped[str] = mapped_column(String(64), nullable=False)
     player_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
@@ -237,8 +306,8 @@ class Ban(Base):
     banned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     unbanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), ForeignKey("users.id"), nullable=True)
-    unbanned_by_user_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), ForeignKey("users.id"), nullable=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("users.id"), nullable=True)
+    unbanned_by_user_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("users.id"), nullable=True)
 
     server: Mapped["Server"] = relationship(back_populates="bans")
 
@@ -246,11 +315,11 @@ class Ban(Base):
 class Backup(Base):
     __tablename__ = "backups"
 
-    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
-    server_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("servers.id"), index=True, nullable=False)
-    owner_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("users.id"), index=True, nullable=False)
-    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), ForeignKey("users.id"), nullable=True)
-    schedule_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), ForeignKey("backup_schedules.id"), nullable=True)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    server_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=False)
+    owner_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("users.id"), nullable=True)
+    schedule_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("backup_schedules.id"), nullable=True)
 
     kind: Mapped[BackupKind] = mapped_column(Enum(BackupKind), nullable=False, default=BackupKind.manual)
     status: Mapped[BackupStatus] = mapped_column(Enum(BackupStatus), index=True, nullable=False, default=BackupStatus.pending)
@@ -260,6 +329,7 @@ class Backup(Base):
 
     world_name: Mapped[str] = mapped_column(String(128), nullable=False)
     bedrock_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    mc_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     consistency_method: Mapped[BackupConsistencyMethod | None] = mapped_column(Enum(BackupConsistencyMethod), nullable=True)
     server_was_running: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
@@ -271,7 +341,7 @@ class Backup(Base):
     checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     uncompressed_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
-    included_paths: Mapped[list] = mapped_column(JSONType, nullable=False, default=list)
+    included_paths: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
 
     failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     failure_message: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -285,10 +355,10 @@ class Backup(Base):
 class BackupJob(Base):
     __tablename__ = "backup_jobs"
 
-    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
-    backup_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("backups.id"), index=True, nullable=False)
-    server_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("servers.id"), index=True, nullable=False)
-    requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), ForeignKey("users.id"), nullable=True)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    backup_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("backups.id"), index=True, nullable=False)
+    server_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=False)
+    requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("users.id"), nullable=True)
 
     status: Mapped[BackupStatus] = mapped_column(Enum(BackupStatus), index=True, nullable=False, default=BackupStatus.pending)
     phase: Mapped[str] = mapped_column(String(64), nullable=False, default="pending")
@@ -316,9 +386,9 @@ class BackupJob(Base):
 class BackupSchedule(Base):
     __tablename__ = "backup_schedules"
 
-    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
-    server_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("servers.id"), index=True, nullable=False)
-    owner_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("users.id"), index=True, nullable=False)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    server_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=False)
+    owner_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
 
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     cron_expression: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -342,10 +412,10 @@ class BackupSchedule(Base):
 class RestoreJob(Base):
     __tablename__ = "restore_jobs"
 
-    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
-    backup_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("backups.id"), index=True, nullable=False)
-    server_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("servers.id"), index=True, nullable=False)
-    requested_by_user_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("users.id"), nullable=False)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    backup_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("backups.id"), index=True, nullable=False)
+    server_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=False)
+    requested_by_user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), nullable=False)
 
     status: Mapped[RestoreStatus] = mapped_column(Enum(RestoreStatus), index=True, nullable=False, default=RestoreStatus.pending)
     phase: Mapped[str] = mapped_column(String(64), nullable=False, default="pending")
@@ -372,23 +442,54 @@ class RestoreJob(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
 
 
-class BlockcoinReason(str, enum.Enum):
-    referral = "referral"
-    ad_view = "ad_view"
-    daily_task = "daily_task"
-    server_hosting = "server_hosting"
-    purchase = "purchase"
-    admin_adjustment = "admin_adjustment"
-
-
 class BlockcoinTransaction(Base):
     __tablename__ = "blockcoin_ledger"
 
-    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
-    user_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("users.id"), index=True, nullable=False)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
     amount: Mapped[int] = mapped_column(Integer, nullable=False)
     reason: Mapped[BlockcoinReason] = mapped_column(Enum(BlockcoinReason), nullable=False)
-    server_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), ForeignKey("servers.id"), nullable=True)
-    # "metadata" is reserved by SQLAlchemy's Declarative API, keep DB column name but rename attribute.
-    meta: Mapped[dict | None] = mapped_column("metadata", JSONType, nullable=True)
+    server_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("servers.id"), nullable=True)
+    meta: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class Node(Base):
+    __tablename__ = "nodes"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    ip_address: Mapped[str] = mapped_column(String(64), nullable=False)
+    agent_port: Mapped[int] = mapped_column(Integer, nullable=False, default=8001)
+
+    status: Mapped[NodeState] = mapped_column(Enum(NodeState), nullable=False, default=NodeState.offline)
+    approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    agent_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    total_ram_mb: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    used_ram_mb: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cpu_cores: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    cpu_usage_percent: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+
+    last_heartbeat: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    servers: Mapped[list["Server"]] = relationship(back_populates="node")
+
+
+class RuntimeBinary(Base):
+    __tablename__ = "runtime_binaries"
+    __table_args__ = (
+        UniqueConstraint("flavor", "version", name="uq_runtime_binaries_flavor_version"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    game: Mapped[str] = mapped_column(String(64), nullable=False, default="minecraft")
+    edition: Mapped[str] = mapped_column(String(64), nullable=False)
+    flavor: Mapped[ServerFlavor] = mapped_column(Enum(ServerFlavor), nullable=False)
+    version: Mapped[str] = mapped_column(String(64), nullable=False)
+    executable_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    installed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)

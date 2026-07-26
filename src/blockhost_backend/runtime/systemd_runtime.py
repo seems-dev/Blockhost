@@ -26,20 +26,25 @@ _UNIT_RE = re.compile(r"[^A-Za-z0-9_.@-]+")
 
 import threading
 
-# Matches: "Player connected: PlayerName, xuid: 1234567890123456" or "Player Spawned: PlayerName, xuid: 1234567890123456"
+# Matches: Bedrock: "Player connected: Name, xuid: ..." or Java: "]: Name joined the game"
 _PLAYER_CONNECTED_RE = re.compile(
-    r"Player (?:connected|Spawned):\s*([^,]+)(?:,\s*xuid:\s*(\d+))?",
+    r"(?:Player (?:connected|Spawned):\s*([^,]+)(?:,\s*xuid:\s*(\d+))?)|(?:\]:\s*([A-Za-z0-9_]+)\s+joined the game)",
     re.IGNORECASE
 )
-# Matches: "Player disconnected: PlayerName"
-_PLAYER_DISCONNECTED_RE = re.compile(r"Player disconnected:\s*([^,]+)", re.IGNORECASE)
+# Matches: Bedrock: "Player disconnected: Name" or Java: "]: Name left the game"
+_PLAYER_DISCONNECTED_RE = re.compile(
+    r"(?:Player disconnected:\s*([^,]+))|(?:\]:\s*([A-Za-z0-9_]+)\s+left the game)", 
+    re.IGNORECASE
+)
 
 class SystemdRuntime:
     """
     systemd-based Bedrock runtime (production-safe).
     systemd = source of truth.
     """
-    def __init__(self):
+    def __init__(self, *, servers_root: Path | None = None):
+        self._servers_root = servers_root
+        self._server_dirs: dict[str, Path] = {}
         self._listeners: dict[str, list[LogListener]] = {}
         self._log_procs: dict[str, subprocess.Popen] = {}
         self._threads: dict[str, threading.Thread] = {}
@@ -49,51 +54,91 @@ class SystemdRuntime:
 
     # ---------------- START ----------------
     def start_server(self, request: RuntimeStartRequest) -> RuntimeStartResult:
-        executable = self._find_executable(
-            request.server_dir,
-            request.executable_name,
-        )
-
+        server_dir = request.server_dir.resolve()
+        self._server_dirs[request.server_id] = server_dir
+        executable = request.executable_path.resolve()
         self._ensure_executable(executable)
 
         unit = self._unit_name(request.server_id)
-
         self.stop_server(request.server_id)
 
-        # Clear player list for fresh start
         with self._lock:
             self._online_players[request.server_id] = {}
 
-        fifo_path = request.server_dir / "stdin.fifo"
+        fifo_path = server_dir / "stdin.fifo"
         if not fifo_path.exists():
             os.mkfifo(fifo_path)
+
+        is_java = executable.name.endswith(".jar")
+        
+        if is_java:
+            # --- JAVA STARTUP LOGIC ---
+            jdk_path = request.jdk_path
+            if not jdk_path:
+                from blockhost_backend.config.config_manager import get_settings
+                jdk_path = Path(get_settings().java_home_path) if get_settings().java_home_path else None
+                
+            if not jdk_path or not (jdk_path / "bin" / "java").exists():
+                raise RuntimeError(f"JDK not found at {jdk_path}. Cannot start Java server.")
+
+            java_bin = jdk_path / "bin" / "java"
+            jvm_flags = [
+                f"-Xms{request.ram_mb}M",
+                f"-Xmx{request.ram_mb}M",
+                "-Donline-mode=false",
+                "-Dfile.encoding=UTF-8",
+                "-XX:+UseG1GC",
+                "-XX:+ParallelRefProcEnabled",
+                "-XX:MaxGCPauseMillis=200",
+                "-XX:+UnlockExperimentalVMOptions",
+                "-XX:+DisableExplicitGC",
+                "-XX:G1NewSizePercent=30",
+                "-XX:G1MaxNewSizePercent=40",
+                "-XX:G1HeapRegionSize=8M",
+                "-XX:G1ReservePercent=20",
+                "-XX:G1HeapWastePercent=5",
+                "-XX:G1MixedGCCountTarget=4",
+                "-XX:InitiatingHeapOccupancyPercent=15",
+                "-XX:G1MixedGCLiveThresholdPercent=90",
+                "-XX:G1RSetUpdatingPauseTimePercent=5",
+                "-XX:SurvivorRatio=32",
+                "-XX:+PerfDisableSharedMem",
+                "-XX:MaxTenuringThreshold=1",
+                "-Dusing.aikars.flags=https://mcflags.emc.gs",
+                "-Daikars.new.flags=true",
+            ]
+            
+            # Flavor specific JVM optimizations
+            if request.flavor in ("paper", "purpur") and request.ram_mb > 2048:
+                jvm_flags.extend([
+                    "-XX:+UseStringDeduplication",
+                    "-XX:+OptimizeStringConcat",
+                ])
+            
+            flags_str = " ".join(jvm_flags)
+            exe_cmd = f"exec 3<> stdin.fifo; exec '{java_bin}' {flags_str} -jar '{executable}' nogui <&3"
+        else:
+            # --- BEDROCK STARTUP LOGIC ---
+            exe_cmd = f"exec 3<> stdin.fifo; exec '{executable}' <&3"
 
         cmd = [
             "systemd-run",
             "--user",
             "--unit", unit,
             "--collect",
-
-            "--property",
-            f"WorkingDirectory={request.server_dir}",
-
-            "--property",
-            f"MemoryMax={request.ram_mb}M",
-
-            "--property",
-            f"CPUQuota={request.cpu_quota_pct}%",
-
-            "--property",
-            "TasksMax=512",
-
-            "/bin/bash", "-c", f"exec 3<> stdin.fifo; exec '{executable}' <&3",
+            "--property", f"WorkingDirectory={server_dir}",
+            "--property", f"MemoryMax={request.ram_mb + 512}M" if is_java else f"MemoryMax={request.ram_mb}M",
+            "--property", f"CPUQuota={request.cpu_quota_pct}%",
+            "--property", "TasksMax=512",
+            "/bin/bash", "-c", exe_cmd,
         ]
 
         subprocess.Popen(cmd)
 
-        version = self._wait_for_ready(request.port)
+        # Wait for ready (Java uses TCP, Bedrock uses UDP ping)
+        timeout = 120.0 if is_java else 25.0
+        version = self._wait_for_ready(request.port, timeout=timeout, is_java=is_java, requested_version=request.requested_version)
 
-        # Always start background log stream for player tracking
         with self._lock:
             if request.server_id not in self._log_procs:
                 self._start_log_stream(request.server_id)
@@ -101,7 +146,7 @@ class SystemdRuntime:
         return RuntimeStartResult(
             runtime_id=unit,
             port=request.port,
-            actual_version=version,
+            actual_version=version or request.requested_version,
         )
 
     # ---------------- STOP ----------------
@@ -121,6 +166,7 @@ class SystemdRuntime:
         # Clear player list on stop, stop log stream, and clear listeners
         with self._lock:
             self._online_players.pop(server_id, None)
+            self._server_dirs.pop(server_id, None)
             self._stop_log_stream(server_id)
             self._listeners.pop(server_id, None)
 
@@ -256,8 +302,11 @@ class SystemdRuntime:
 
     # ---------------- COMMAND ----------------
     def send_command(self, server_id: str, command: str) -> None:
-        from blockhost_backend.config.config_manager import get_settings
-        server_dir = Path(get_settings().bedrock_servers_dir) / server_id
+        server_dir = self._server_dirs.get(server_id)
+        if server_dir is None:
+            from blockhost_backend.config.config_manager import get_settings
+            root = self._servers_root or Path(get_settings().bedrock_servers_dir)
+            server_dir = (root / server_id).resolve()
         fifo_path = server_dir / "stdin.fifo"
 
         status = self.get_status(server_id)
@@ -320,11 +369,11 @@ class SystemdRuntime:
                     m_disc = _PLAYER_DISCONNECTED_RE.search(stripped)
                     with self._lock:
                         if m_conn:
-                            player_name = m_conn.group(1).strip()
-                            xuid = m_conn.group(2) if m_conn.lastindex >= 2 else None
+                            player_name = (m_conn.group(1) or m_conn.group(3)).strip()
+                            xuid = m_conn.group(2) if m_conn.lastindex >= 2 and m_conn.group(2) else None
                             self._online_players.setdefault(server_id, {})[player_name] = xuid
                         elif m_disc:
-                            player_name = m_disc.group(1).strip()
+                            player_name = (m_disc.group(1) or m_disc.group(2)).strip()
                             self._online_players.setdefault(server_id, {}).pop(player_name, None)
                         listeners = list(self._listeners.get(server_id, []))
 
@@ -354,48 +403,40 @@ class SystemdRuntime:
         self._threads.pop(server_id, None)
 
     # ---------------- READY CHECK ----------------
-    def _wait_for_ready(self, port: int, timeout: float = 25.0) -> str | None:
+    def _wait_for_ready(self, port: int, timeout: float = 25.0, is_java: bool = False, requested_version: str | None = None) -> str | None:
+        import socket
         start = time.time()
         version = None
 
         while time.time() - start < timeout:
-            try:
-                pong = bedrock_unconnected_ping(
-                    host="127.0.0.1",
-                    port=port,
-                    timeout_seconds=0.5,
-                )
-
-                parsed = parse_bedrock_pong_payload(pong.payload)
-
-                v = parsed.get("version")
-                if isinstance(v, str):
-                    version = v.strip()
-
-                break
-            except Exception:
-                time.sleep(0.25)
+            if is_java:
+                # Simple TCP connect check for Java servers
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(0.5)
+                        s.connect(("127.0.0.1", port))
+                        return requested_version # Return requested version since we skip SLP for speed
+                except Exception:
+                    pass
+            else:
+                # Existing Bedrock UDP Ping logic
+                try:
+                    pong = bedrock_unconnected_ping(host="127.0.0.1", port=port, timeout_seconds=0.5)
+                    parsed = parse_bedrock_pong_payload(pong.payload)
+                    v = parsed.get("version")
+                    if isinstance(v, str):
+                        version = v.strip()
+                    break
+                except Exception:
+                    pass
+            time.sleep(0.25)
 
         return version
 
     # ---------------- EXECUTABLE ----------------
-    def _find_executable(self, server_dir: Path, preferred: str | None) -> Path:
-        candidates = []
-
-        if preferred:
-            candidates.append(preferred)
-
-        candidates += list(_COMMON_BEDROCK_BINARIES)
-
-        for name in candidates:
-            path = server_dir / name
-            if path.exists():
-                return path
-
-        raise FileNotFoundError("Bedrock executable not found")
 
     def _ensure_executable(self, exe: Path) -> None:
-        if os.name == "nt":
+        if os.name == "nt" or exe.suffix == ".jar":
             return
 
         mode = os.stat(exe).st_mode
@@ -404,4 +445,4 @@ class SystemdRuntime:
 
     def _unit_name(self, server_id: str) -> str:
         safe = _UNIT_RE.sub("-", server_id).strip("-")
-        return f"blockhost-bedrock-{safe}.service"
+        return f"blockhost-server-{safe}.service"

@@ -1,8 +1,23 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Repo root: .../blockhost (parent of src/)
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def resolve_data_path(path: str) -> Path:
+    """Resolve storage paths relative to the repo root, not process cwd."""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    return (_PROJECT_ROOT / candidate).resolve()
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file="src/.env", env_file_encoding="utf-8", extra="ignore")
 
@@ -15,7 +30,7 @@ class Settings(BaseSettings):
     jwt_access_token_expire_seconds: int = 60 * 60 * 24
     jwt_refresh_token_expire_seconds: int = 60 * 60 * 24 * 30
 
-    minecraft_public_host: str = "192.168.29.102"
+    minecraft_public_host: str = ""
     minecraft_port: int = 19132
 
     # Local Bedrock runtime (direct process spawning).
@@ -23,15 +38,17 @@ class Settings(BaseSettings):
     bedrock_versions_dir: str = "versions"
     bedrock_servers_dir: str = "servers"
     bedrock_logs_dir: str = "logs"
-    bedrock_versions_manifest: str = "versions/manifest.json"
+    bedrock_versions_manifest: str = "runtime_binaries/bedrock/manifest.json"
     bedrock_port_range_start: int = 19132
     bedrock_port_range_end: int = 19232
+    java_port_range_start: int = 25565
+    java_port_range_end: int = 25665
     backup_storage_dir: str = "backups"
     backup_temp_dir: str = "backups/tmp"
     backup_retention_count: int = 7
     backup_save_hold_seconds: float = 2.0
-    backup_worker_threads: int = 2
-    backup_scheduler_enabled: bool = False
+    backup_worker_threads: int = max(2, min((os.cpu_count() or 4) // 2, 4))
+    backup_scheduler_enabled: bool = True
     backup_scheduler_poll_seconds: int = 60
     subscription_expiration_enabled: bool = True
     subscription_expiration_poll_seconds: int = 60
@@ -52,6 +69,13 @@ class Settings(BaseSettings):
     worker_agent_url: str = "http://localhost:9000"
     worker_agent_token: str = "change-me-in-dev"
 
+    # Runtime Binaries Registry
+    runtime_binaries_dir: str = "runtime_binaries"
+
+    # Add these fields to your Settings class
+    software_cache_dir: str = "software_cache"
+    java_home_path: str | None = None  # e.g., "/usr/lib/jvm/java-21-openjdk-amd64" (for local non-agent runs)
+
     # Console streaming configuration
     console_queue_max_size: int = 1000  # Max buffered log lines per websocket connection
     console_stream_cleanup_enabled: bool = True  # Stop log stream when no listeners remain (but keep running if player tracking active)
@@ -61,6 +85,33 @@ class Settings(BaseSettings):
     razorpay_key_secret: str = ""          # matches RAZORPAY_KEY_SECRET in .env
     razorpay_webhook_secret: str = ""     # matches RAZORPAY_WEBHOOK_SECRET in .env
 
+    # When true: require Postgres, strong secrets, Alembic-only schema (no create_all).
+    production_mode: bool = False
+
+    # Comma-separated origins, or "*" for dev only.
+    cors_origins: str = "*"
+    cors_allow_credentials: bool = False
+
+    # Rate limits (requests per window per IP)
+    # Relaxed for local development so repeated auth/sign-up attempts do not fail with 429s.
+    rate_limit_auth_per_minute: int = 120
+    rate_limit_upload_per_minute: int = 120
+
+    # When false, nodes must be pre-registered by an admin before agents can connect.
+    allow_auto_node_registration: bool = True
+
+    # None = auto (workers in API only when not production_mode).
+    # Set false in production multi-worker deployments; run blockhost-worker separately.
+    background_workers_in_api: bool | None = None
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+def get_cors_origins(settings: Settings | None = None) -> list[str]:
+    settings = settings or get_settings()
+    raw = settings.cors_origins.strip()
+    if raw == "*":
+        return ["*"]
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]

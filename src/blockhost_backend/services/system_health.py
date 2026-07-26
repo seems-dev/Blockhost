@@ -5,6 +5,10 @@ import shutil
 import threading
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from blockhost_backend.database.schema import Server
 
 from blockhost_backend.config.config_manager import get_settings
 
@@ -99,22 +103,19 @@ def calculate_directory_size(path: Path) -> int:
     return total
 
 
-def world_limit_bytes_for_tier(tier: object) -> int:
-    settings = get_settings()
-    tier_value = getattr(tier, "value", tier)
-    if str(tier_value) == "premium":
-        limit_gb = settings.premium_world_limit_gb
-    else:
-        limit_gb = settings.free_world_limit_gb
-    return int(limit_gb * (1024**3))
-
-
-def assert_world_size_within_plan(world_path: Path, tier: object) -> int:
+def assert_world_size_within_plan(world_path: Path, server: "Server") -> int:
     size = calculate_directory_size(world_path)
-    limit = world_limit_bytes_for_tier(tier)
-    if size > limit:
-        raise WorldSizeLimitError("World size exceeds plan limit.")
-    return size
+    limit_mb = None
+    if server.mc_config and "resource_limits" in server.mc_config:
+        limit_mb = server.mc_config["resource_limits"].get("storage_mb")
+    
+    if not limit_mb:
+        limit_mb = int(get_settings().free_world_limit_gb * 1024)
+        
+    limit_bytes = limit_mb * 1024 * 1024
+    if size > limit_bytes:
+        raise WorldSizeLimitError(f"World size exceeds plan limit ({size // (1024*1024)}MB > {limit_mb}MB).")
+    return size 
 
 
 def _disk_monitor_loop() -> None:

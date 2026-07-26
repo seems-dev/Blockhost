@@ -68,3 +68,24 @@ def pick_free_udp_port(*, port_range: PortRange, used_ports: set[int]) -> int:
         return port
 
     raise RuntimeError("No free UDP ports available in configured range")
+
+def _is_tcp_port_free(port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+
+def pick_free_tcp_port(*, port_range: PortRange, used_ports: set[int]) -> int:
+    if port_range.end < port_range.start:
+        raise ValueError("Invalid port range")
+
+    for port in range(port_range.start, port_range.end + 1):
+        if port in used_ports:
+            continue
+        if _is_tcp_port_free(port):
+            return port
+
+    raise RuntimeError("No free TCP ports available in configured range")

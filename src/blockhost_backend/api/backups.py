@@ -45,12 +45,14 @@ from blockhost_backend.services.system_health import (
 from blockhost_backend.orchestrator.backup import (
     ACTIVE_BACKUP_STATUSES,
     ACTIVE_RESTORE_STATUSES,
+    BackupRestoreError,
     apply_backup_retention,
     backup_object_path,
     backup_storage_key,
     next_schedule_run,
     submit_backup_job,
     submit_restore_job,
+    verify_backup_artifact,
 )
 
 
@@ -85,7 +87,7 @@ def _world_path(server: Server) -> Path:
 
 def _guard_world_size_for_backup(server: Server, user: User) -> None:
     try:
-        assert_world_size_within_plan(_world_path(server), )
+        assert_world_size_within_plan(_world_path(server), server)
     except WorldSizeLimitError as exc:
         raise HTTPException(status_code=413, detail={"error": exc.message})
 
@@ -405,9 +407,10 @@ def download_backup(
     backup = _require_backup(server, backup_id, user, db)
     if backup.status != BackupStatus.completed:
         raise HTTPException(status_code=409, detail="Backup is not completed")
-    path = backup_object_path(server.id, backup.id)
-    if not path.exists():
-        raise HTTPException(status_code=410, detail="Backup archive is no longer available")
+    try:
+        path = verify_backup_artifact(backup).path
+    except BackupRestoreError as exc:
+        raise HTTPException(status_code=410, detail=exc.message)
     filename = f"erex-{server.id}-{backup.id}.tar.gz"
     return FileResponse(path=path, filename=filename, media_type="application/gzip")
 
@@ -464,6 +467,10 @@ def create_restore(
     backup = _require_backup(server, str(payload.backup_id), user, db)
     if backup.status != BackupStatus.completed:
         raise HTTPException(status_code=409, detail="Backup is not completed")
+    try:
+        verify_backup_artifact(backup)
+    except BackupRestoreError as exc:
+        raise HTTPException(status_code=410, detail=exc.message)
     if _active_backup(db, server.id):
         raise HTTPException(status_code=409, detail="Backup already active for this server")
     if _active_restore(db, server.id):

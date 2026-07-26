@@ -53,7 +53,19 @@ def run_migrations_offline():
         context.run_migrations()
 
 
-def run_migrations_online():
+def run_migrations_online() -> None:
+    """Run migrations in 'online' mode."""
+    db_url = os.getenv("DATABASE_URL") or get_settings().database_url
+    print("ALEMBIC IS USING DB_URL:", db_url)
+    print("ALEMBIC CWD IS:", os.getcwd())
+    
+    # Alembic handles SQLite URLs slightly differently, so strip +pysqlite if present
+    if db_url.startswith("sqlite+pysqlite://"):
+        db_url = db_url.replace("sqlite+pysqlite://", "sqlite://")
+        print("ALEMBIC MODIFIED DB_URL:", db_url)
+    
+    config.set_main_option("sqlalchemy.url", db_url)
+
     """Run migrations in 'online' mode.
 
     In this scenario we need to create an Engine

@@ -1,5 +1,8 @@
+
 from __future__ import annotations
 
+from uvicorn import server
+from blockhost_backend.database.schema import Node, ServerFlavor
 import logging
 import re
 import threading
@@ -11,10 +14,10 @@ from pathlib import Path
 import asyncio
 import json
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status, WebSocket, WebSocketDisconnect
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from blockhost_backend.api.deps import get_current_user, get_ws_user
+from blockhost_backend.api.deps import authenticate_ws_user, get_current_user
 from blockhost_backend.api.schemas import (
     BanCheckResponse,
     BanCreateRequest,
@@ -27,6 +30,7 @@ from blockhost_backend.api.schemas import (
     ServerActionResponse,
     ServerConfigOut,
     ServerConfigUpdateRequest,
+    SoftwareSwitchRequest,
     ServerDetail,
     ServerOut,
     ServerStateSnapshot,
@@ -38,7 +42,13 @@ from blockhost_backend.database.schema import Ban, Server, ServerState, User, VM
 from blockhost_backend.minecraft.bedrock_ping import bedrock_unconnected_ping, parse_bedrock_pong_payload
 from blockhost_backend.minecraft.bedrock_properties import BedrockServerProperties, write_server_properties
 from blockhost_backend.minecraft.bedrock_download import recommended_version
-from blockhost_backend.minecraft.port_alloc import PortRange, pick_free_udp_port
+from blockhost_backend.minecraft.port_alloc import PortRange, pick_free_udp_port, pick_free_tcp_port
+from blockhost_backend.minecraft.java_properties import (
+    JavaServerProperties,
+    set_java_server_property,
+    write_java_server_properties,
+)
+from blockhost_backend.minecraft.java_compat import is_java_flavor, required_java_version, get_protocol_version
 from blockhost_backend.orchestrator.lifecycle_manager import get_server_lifecycle_orchestrator
 from blockhost_backend.orchestrator.resources import get_effective_server_resource_limits, UNPAID_SERVER_LIMITS
 from blockhost_backend.runtime.bedrock_process import materialize_server_dir, resolve_version_dir
@@ -46,21 +56,19 @@ from blockhost_backend.services.api_cache import get_api_cache
 from blockhost_backend.services.system_health import DiskProtectionError, assert_disk_usage_safe
 from blockhost_backend.utils import generate_join_code
 from blockhost_backend.services.billing import BillingError
+from blockhost_backend.services.node_capacity import refresh_node_allocated_ram, select_best_node
 #file_name = servers.py
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/servers", tags=["servers"])
 
 _ORCHESTRATOR = get_server_lifecycle_orchestrator()
-_STATS_SNAPSHOT_TTL_SECONDS = 2.0
+_STATS_SNAPSHOT_TTL_SECONDS = 5.0
 _STATS_REDIS_TTL_SECONDS = 5
 _SERVER_LIST_TTL_SECONDS = 5
 _SERVER_DETAIL_TTL_SECONDS = 15
 _SERVER_CONFIG_TTL_SECONDS = 30
 _PLANS_TTL_SECONDS = 300
-_STATS_SNAPSHOT_CACHE: dict[str, tuple[float, BedrockServerStats]] = {}
-_STATS_REFRESHING: set[str] = set()
-_STATS_CACHE_LOCK = threading.Lock()
 
 # Maximum servers allowed per tier — enforced server-side only, never from client.
 
@@ -170,6 +178,8 @@ def _server_to_out(server: Server, owner: User | None = None) -> ServerOut:
         owner_nickname=owner_nickname,
         created_at=server.created_at,
         last_activity=server.last_activity,
+        flavor=server.flavor,
+        mc_version=server.mc_version,
         mc_config=server.mc_config,
     )
 
@@ -259,6 +269,32 @@ def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
     process_running = runtime_status.running
     uptime = runtime_status.uptime_seconds
 
+    # Reconcile only known mismatch pairs (once per transition, not every poll tick).
+    if process_running and server.state in (ServerState.suspended, ServerState.created):
+        logger.info(
+            "Reconciling server %s: runtime=running but db_state=%s — updating to running",
+            server.id, server.state,
+        )
+        server.state = ServerState.running
+        try:
+            db.add(server)
+            db.commit()
+            _invalidate_server_read_cache(server.owner_id, server.id)
+        except Exception:
+            db.rollback()
+    elif not process_running and server.state == ServerState.running:
+        logger.info(
+            "Reconciling server %s: runtime=stopped but db_state=running — updating to suspended",
+            server.id,
+        )
+        server.state = ServerState.suspended
+        try:
+            db.add(server)
+            db.commit()
+            _invalidate_server_read_cache(server.owner_id, server.id)
+        except Exception:
+            db.rollback()
+
     resource_stats = _ORCHESTRATOR.get_stats(str(server.id))
     cpu_usage = resource_stats.cpu_usage
     ram_usage_mb = resource_stats.ram_usage_mb
@@ -283,29 +319,73 @@ def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
     }
 
     try:
-        pong = bedrock_unconnected_ping(host="127.0.0.1", port=port, timeout_seconds=1.0)
-        parsed = parse_bedrock_pong_payload(pong.payload)
-        # Convert online players dict to PlayerInfo list
-        players_with_xuid = runtime_status.runtime_id and _ORCHESTRATOR.get_online_players_with_xuid(str(server.id))
-        player_info_list = [
-            PlayerInfo(name=name, xuid=xuid)
-            for name, xuid in (players_with_xuid or {}).items()
-        ]
-        return BedrockServerStats(
-            **base_stats,
-            reachable=True,
-            latency_ms=pong.latency_ms,
-            edition=parsed.get("edition"),
-            motd=parsed.get("motd"),
-            motd2=parsed.get("motd2"),
-            protocol=parsed.get("protocol"),
-            version=parsed.get("version"),
-            players_online=parsed.get("players_online"),
-            players_max=parsed.get("players_max"),
-            server_id=parsed.get("server_id"),
-            gamemode=parsed.get("gamemode"),
-            online_players_list=player_info_list,
-        )
+        is_bedrock = server.flavor == ServerFlavor.BEDROCK
+        
+        if is_bedrock:
+            pong = bedrock_unconnected_ping(
+                host=("127.0.0.1" if not server.node_id else host),
+                port=port,
+                timeout_seconds=1.0,
+            )
+            parsed = parse_bedrock_pong_payload(pong.payload)
+            # Convert online players dict to PlayerInfo list
+            players_with_xuid = runtime_status.runtime_id and _ORCHESTRATOR.get_online_players_with_xuid(str(server.id))
+            player_info_list = [
+                PlayerInfo(name=name, xuid=xuid)
+                for name, xuid in (players_with_xuid or {}).items()
+            ]
+            return BedrockServerStats(
+                **base_stats,
+                reachable=True,
+                latency_ms=pong.latency_ms,
+                edition=parsed.get("edition"),
+                motd=parsed.get("motd"),
+                motd2=parsed.get("motd2"),
+                protocol=parsed.get("protocol"),
+                version=parsed.get("version"),
+                players_online=parsed.get("players_online"),
+                players_max=parsed.get("players_max"),
+                server_id=parsed.get("server_id"),
+                gamemode=parsed.get("gamemode"),
+                online_players_list=player_info_list,
+            )
+        else:
+            from blockhost_backend.minecraft.java_ping import java_server_ping
+            import time
+            start = time.monotonic()
+            protocol = get_protocol_version(server.mc_version) if server.mc_version else None
+            java_pong = java_server_ping(
+                host=("127.0.0.1" if not server.node_id else host),
+                port=port,
+                timeout_seconds=1.0,
+                protocol_version=protocol,
+            )
+            latency = int((time.monotonic() - start) * 1000)
+            if java_pong:
+                players_node = java_pong.get("players", {})
+                version_node = java_pong.get("version", {})
+                motd_node = java_pong.get("description", "")
+                if isinstance(motd_node, dict):
+                    motd_node = motd_node.get("text", str(motd_node))
+                
+                return BedrockServerStats(
+                    **base_stats,
+                    reachable=True,
+                    latency_ms=latency,
+                    edition="Java",
+                    motd=motd_node,
+                    protocol=version_node.get("protocol"),
+                    version=version_node.get("name"),
+                    players_online=players_node.get("online"),
+                    players_max=players_node.get("max"),
+                    online_players_list=[],
+                )
+            else:
+                return BedrockServerStats(
+                    **base_stats,
+                    reachable=False,
+                    online_players_list=[],
+                )
     except Exception:
         return BedrockServerStats(
             **base_stats,
@@ -315,9 +395,6 @@ def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
 
 
 def _store_server_stats_snapshot(server_id: str, stats: BedrockServerStats) -> None:
-    with _STATS_CACHE_LOCK:
-        _STATS_SNAPSHOT_CACHE[server_id] = (time.monotonic(), stats)
-        _STATS_REFRESHING.discard(server_id)
     get_api_cache().set_json(
         _server_stats_cache_key(server_id),
         stats.model_dump(mode="json"),
@@ -326,48 +403,44 @@ def _store_server_stats_snapshot(server_id: str, stats: BedrockServerStats) -> N
 
 
 def _drop_server_stats_snapshot(server_id: str) -> None:
-    with _STATS_CACHE_LOCK:
-        _STATS_SNAPSHOT_CACHE.pop(server_id, None)
-        _STATS_REFRESHING.discard(server_id)
     get_api_cache().delete(_server_stats_cache_key(server_id))
 
 
-def _cached_server_stats_snapshot(server_id: str, now: float) -> BedrockServerStats | None:
-    with _STATS_CACHE_LOCK:
-        cached = _STATS_SNAPSHOT_CACHE.get(server_id)
-        if cached:
-            cached_at, stats = cached
-            if now - cached_at <= _STATS_SNAPSHOT_TTL_SECONDS:
-                return stats
-
+def _cached_server_stats_snapshot(server_id: str) -> BedrockServerStats | None:
     cached_payload = get_api_cache().get_json(_server_stats_cache_key(server_id))
     if cached_payload is None:
         return None
     try:
-        stats = BedrockServerStats.model_validate(cached_payload)
+        return BedrockServerStats.model_validate(cached_payload)
     except Exception:
         get_api_cache().delete(_server_stats_cache_key(server_id))
         return None
-    with _STATS_CACHE_LOCK:
-        _STATS_SNAPSHOT_CACHE[server_id] = (now, stats)
-    return stats
 
 
 def _refresh_server_stats_snapshot(server_id: str) -> None:
-    db = SessionLocal()
+    # Use a distributed lock to ensure only one worker refreshes stats concurrently
+    lock = get_api_cache().lock(f"lock:stats:{server_id}", timeout=5)
+    acquired = lock.acquire(blocking=False)
+    if not acquired:
+        return
     try:
+        db = SessionLocal()
         try:
-            server_uuid = uuid.UUID(server_id)
-        except ValueError:
-            return
-        server = db.get(Server, server_uuid)
-        if not server:
-            return
-        _store_server_stats_snapshot(server_id, _compute_server_stats(server, db))
+            try:
+                server_uuid = uuid.UUID(server_id)
+            except ValueError:
+                return
+            server = db.get(Server, server_uuid)
+            if not server:
+                return
+            _store_server_stats_snapshot(server_id, _compute_server_stats(server, db))
+        finally:
+            db.close()
     finally:
-        with _STATS_CACHE_LOCK:
-            _STATS_REFRESHING.discard(server_id)
-        db.close()
+        try:
+            lock.release()
+        except Exception:
+            pass
 
 
 def _get_server_stats_snapshot(
@@ -376,20 +449,9 @@ def _get_server_stats_snapshot(
     background_tasks: BackgroundTasks | None = None,
 ) -> BedrockServerStats:
     server_id = str(server.id)
-    now = time.monotonic()
-    cached_stats = _cached_server_stats_snapshot(server_id, now)
+    cached_stats = _cached_server_stats_snapshot(server_id)
     if cached_stats is not None:
         return cached_stats
-
-    stale_stats = None
-    with _STATS_CACHE_LOCK:
-        cached = _STATS_SNAPSHOT_CACHE.get(server_id)
-        if cached:
-            stale_stats = cached[1]
-        if background_tasks and stale_stats is not None and server_id not in _STATS_REFRESHING:
-            _STATS_REFRESHING.add(server_id)
-            background_tasks.add_task(_refresh_server_stats_snapshot, server_id)
-            return stale_stats
 
     if background_tasks is None:
         stats = _compute_server_stats(server, db)
@@ -422,21 +484,19 @@ def _get_server_stats_snapshot(
         _STATS_REDIS_TTL_SECONDS,
     )
 
-    with _STATS_CACHE_LOCK:
-        _STATS_SNAPSHOT_CACHE[server_id] = (now, placeholder_stats)
-        if server_id not in _STATS_REFRESHING:
-            _STATS_REFRESHING.add(server_id)
-            background_tasks.add_task(_refresh_server_stats_snapshot, server_id)
+    background_tasks.add_task(_refresh_server_stats_snapshot, server_id)
 
     return placeholder_stats
 
 
 def _server_dirs() -> tuple[Path, Path, Path]:
     settings = get_settings()
+    from blockhost_backend.config.config_manager import resolve_data_path
+
     return (
-        Path(settings.bedrock_versions_dir).resolve(),
-        Path(settings.bedrock_servers_dir).resolve(),
-        Path(settings.bedrock_logs_dir).resolve(),
+        resolve_data_path(settings.runtime_binaries_dir) / "bedrock",
+        resolve_data_path(settings.bedrock_servers_dir),
+        resolve_data_path(settings.bedrock_logs_dir),
     )
 
 
@@ -481,24 +541,57 @@ def _normalize_requested_version(requested_version: str | None) -> str | None:
     return rv
 
 
-def _collect_reserved_ports(*, db: Session, port_range: PortRange) -> set[int]:
+def _collect_reserved_ports(
+    *,
+    db: Session,
+    port_range: PortRange,
+    flavor: ServerFlavor,
+    node_id: uuid.UUID | None = None,
+) -> set[int]:
     reserved: set[int] = set()
-    for port in db.execute(select(Server.vm_port)).scalars().all():
+    is_bedrock = flavor == ServerFlavor.BEDROCK
+    query = select(Server.vm_port, Server.flavor).where(Server.vm_port.between(port_range.start, port_range.end))
+    if node_id:
+        query = query.where(Server.node_id == node_id)
+    for row in db.execute(query).all():
+        port = row.vm_port
+        server_flavor = row.flavor
         if port is None:
             continue
+        if is_bedrock:
+            if server_flavor != ServerFlavor.BEDROCK:
+                continue
+        elif not is_java_flavor(server_flavor):
+            continue
         reserved.add(port)
-        if port + 1 <= port_range.end:
+        if server_flavor == ServerFlavor.BEDROCK and port + 1 <= port_range.end:
             reserved.add(port + 1)
     return reserved
 
 
-def _validate_server_port_pairs(*, db: Session, port_range: PortRange) -> None:
+def _validate_server_port_pairs(
+    *,
+    db: Session,
+    port_range: PortRange,
+    flavor: ServerFlavor,
+    node_id: uuid.UUID | None = None,
+) -> None:
     port_map: dict[int, list[str]] = {}
     errors: list[str] = []
+    is_bedrock = flavor == ServerFlavor.BEDROCK
 
-    for row in db.execute(select(Server.id, Server.vm_port)).all():
-        server_id, port = row
+    query = select(Server.id, Server.vm_port, Server.flavor).where(Server.vm_port.between(port_range.start, port_range.end))
+    if node_id:
+        query = query.where(Server.node_id == node_id)
+    for row in db.execute(query).all():
+        server_id, port, server_flavor = row.id, row.vm_port, row.flavor
         if port is None:
+            continue
+
+        if is_bedrock:
+            if server_flavor != ServerFlavor.BEDROCK:
+                continue
+        elif not is_java_flavor(server_flavor):
             continue
 
         if port < port_range.start or port > port_range.end:
@@ -506,13 +599,16 @@ def _validate_server_port_pairs(*, db: Session, port_range: PortRange) -> None:
                 f"Server {server_id} has vm_port={port} outside configured range {port_range.start}-{port_range.end}"
             )
 
-        ipv6_port = port + 1
-        if ipv6_port > port_range.end:
-            errors.append(
-                f"Server {server_id} has vm_port={port} with invalid server-portv6={ipv6_port} beyond range end {port_range.end}"
-            )
+        ports_to_check = [port]
+        if server_flavor == ServerFlavor.BEDROCK:
+            ipv6_port = port + 1
+            if ipv6_port > port_range.end:
+                errors.append(
+                    f"Server {server_id} has vm_port={port} with invalid server-portv6={ipv6_port} beyond range end {port_range.end}"
+                )
+            ports_to_check.append(ipv6_port)
 
-        for p in (port, ipv6_port):
+        for p in ports_to_check:
             if p <= port_range.end:
                 port_map.setdefault(p, []).append(str(server_id))
 
@@ -523,18 +619,25 @@ def _validate_server_port_pairs(*, db: Session, port_range: PortRange) -> None:
             )
 
     if errors:
-        raise RuntimeError("Invalid Bedrock port assignments: " + "; ".join(errors))
+        raise RuntimeError("Invalid port assignments: " + "; ".join(errors))
 
 
-def _allocate_port(*, db: Session) -> int:
+def _allocate_port(*, db: Session, flavor: ServerFlavor, node_id: uuid.UUID | None = None) -> int:
     settings = get_settings()
+    is_bedrock = flavor == ServerFlavor.BEDROCK
     port_range = PortRange(
-        start=settings.bedrock_port_range_start,
-        end=settings.bedrock_port_range_end,
+        start=settings.bedrock_port_range_start if is_bedrock else settings.java_port_range_start,
+        end=settings.bedrock_port_range_end if is_bedrock else settings.java_port_range_end,
     )
-    _validate_server_port_pairs(db=db, port_range=port_range)
-    used = _collect_reserved_ports(db=db, port_range=port_range)
-    return pick_free_udp_port(port_range=port_range, used_ports=used)
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(8742031)"))
+    _validate_server_port_pairs(db=db, port_range=port_range, flavor=flavor, node_id=node_id)
+    used = _collect_reserved_ports(db=db, port_range=port_range, flavor=flavor, node_id=node_id)
+    if is_bedrock:
+        return pick_free_udp_port(port_range=port_range, used_ports=used)
+    else:
+        return pick_free_tcp_port(port_range=port_range, used_ports=used)
 
 
 def _server_props_from_config(*, server: Server, port: int) -> BedrockServerProperties:
@@ -546,7 +649,7 @@ def _server_props_from_config(*, server: Server, port: int) -> BedrockServerProp
         difficulty=cfg.get("difficulty"),
         max_players=cfg.get("max_players"),
         allow_cheats=cfg.get("allow_cheats"),
-        online_mode=cfg.get("online_mode"),
+        online_mode=False,
         level_name=cfg.get("level_name") or server.world_name,
         level_seed=cfg.get("level_seed"),
         enable_lan_visibility=False,
@@ -554,8 +657,119 @@ def _server_props_from_config(*, server: Server, port: int) -> BedrockServerProp
     )
 
 
-def _start_bedrock_process(*, server: Server, settings, db: Session | None = None) -> None:
+def _java_server_properties_from_config(*, server: Server, port: int) -> JavaServerProperties:
+    cfg = dict(server.mc_config or {})
+    online_mode = cfg.get("online_mode")
+    if online_mode is None:
+        online_mode = False
+
+    return JavaServerProperties(
+        server_port=port,
+        motd=cfg.get("motd") or server.world_name,
+        max_players=cfg.get("max_players") or 20,
+        gamemode=cfg.get("gamemode") or "survival",
+        difficulty=cfg.get("difficulty") or "normal",
+        online_mode=False,  # Enforced via JVM flag; property rewritten by server anyway
+        level_name=cfg.get("level_name") or server.world_name,
+        level_seed=cfg.get("level_seed") or "",
+    )
+
+
+def _prepare_java_server_for_start(*, server: Server, db: Session) -> Path:
+    if server.state == ServerState.provisioning:
+        raise HTTPException(
+            status_code=409,
+            detail="Server is still provisioning; check /provision-status and try again",
+        )
+    if not server.vm_port:
+        try:
+            server.vm_port = _allocate_port(db=db, flavor=server.flavor, node_id=server.node_id)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Failed to allocate TCP port: {e}")
+
     _, servers_dir, _ = _server_dirs()
+    if not (server.mc_config or {}).get("server_dir"):
+        raise HTTPException(status_code=503, detail="Server directory not configured")
+
+    server_dir = _validate_server_dir(Path(server.mc_config["server_dir"]), servers_dir)
+    # JAR is now in the shared binary registry — no local JAR check needed.
+    # The binary_manager resolves the executable at start time.
+
+    props_path = server_dir / "server.properties"
+    write_java_server_properties(props_path, _java_server_properties_from_config(server=server, port=server.vm_port))
+    
+    eula_path = server_dir / "eula.txt"
+    if not eula_path.exists():
+        eula_path.write_text("eula=true\n", encoding="utf-8")
+
+    if server.node_id:
+        node = db.get(Node, server.node_id)
+        if node:
+            from blockhost_backend.services.node_provision import sync_remote_java_config
+
+            sync_remote_java_config(node=node, server=server, server_dir=server_dir)
+
+    return server_dir
+
+
+def _prepare_bedrock_server_for_start(*, server: Server, db: Session) -> Path:
+    if not server.vm_port:
+        try:
+            server.vm_port = _allocate_port(db=db, flavor=ServerFlavor.BEDROCK, node_id=server.node_id)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Failed to allocate UDP port: {e}")
+
+    requested_version = _normalize_requested_version(
+        (server.mc_config or {}).get("bedrock_version")
+    )
+    
+    from blockhost_backend.minecraft.binary_manager import ensure_binary_installed
+    binary = ensure_binary_installed(db, ServerFlavor.BEDROCK, requested_version)
+    version_dir = Path(binary.executable_path).parent
+    version_name = binary.version
+
+    if not (server.mc_config or {}).get("server_dir"):
+        _, servers_dir, _ = _server_dirs()
+        server_dir = materialize_server_dir(
+            version_dir=version_dir, servers_dir=servers_dir, server_id=str(server.id)
+        )
+        _validate_server_dir(server_dir, servers_dir)
+        write_server_properties(
+            server_dir / "server.properties",
+            _server_props_from_config(server=server, port=server.vm_port),
+        )
+        cfg = dict(server.mc_config or {})
+        cfg["runtime_mode"] = "process"
+        cfg["template_version"] = version_name
+        cfg["server_dir"] = str(server_dir)
+        server.mc_config = cfg
+        _provision_remote_server(server, server_dir, db, version_name, version_dir)
+    else:
+        _, servers_dir, _ = _server_dirs()
+        server_dir = _validate_server_dir(Path(server.mc_config["server_dir"]), servers_dir)
+        write_server_properties(
+            server_dir / "server.properties",
+            _server_props_from_config(server=server, port=server.vm_port),
+        )
+        _provision_remote_server(server, server_dir, db, version_name, version_dir)
+
+    return server_dir
+
+
+def _start_server_process(*, server: Server, settings, db: Session | None = None) -> None:
+    from blockhost_backend.orchestrator.runtime_cache import invalidate_server_runtime_cache
+
+    invalidate_server_runtime_cache(server.id)
+    _, servers_dir, _ = _server_dirs()
+
+    if is_java_flavor(server.flavor):
+        mc_config = server.mc_config or {}
+        server_dir = (Path(mc_config.get("server_dir", "")) if mc_config.get("server_dir") else None)
+        if server_dir is not None:
+            props_path = server_dir / "server.properties"
+            if props_path.exists():
+                pass # Handled by JVM flag
+
     _ORCHESTRATOR.start_server(server=server, settings=settings, servers_dir=servers_dir, db=db)
 
 def _stop_server_process(server: Server) -> None:
@@ -570,6 +784,7 @@ def _stop_server_process(server: Server) -> None:
 @router.post("", response_model=ServerOut, status_code=status.HTTP_201_CREATED)
 def create_server(
     payload: CreateServerRequest,
+    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerOut:
@@ -589,74 +804,285 @@ def create_server(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    node = select_best_node(db)
+    node_id = node.id if node else None
+
     try:
-        port = _allocate_port(db=db)
+        port = _allocate_port(db=db, flavor=payload.flavor, node_id=node_id)
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Failed to allocate UDP port: {e}")
+        proto = "UDP" if payload.flavor == ServerFlavor.BEDROCK else "TCP"
+        raise HTTPException(status_code=503, detail=f"Failed to allocate {proto} port: {e}")
 
     server = Server(
         owner_id=user.id,
+        node_id=node_id,
         world_name=payload.world_name,
         join_code="placeholder",
         state=ServerState.created,
-        vm_provider=VMProvider.local_bedrock,
-        vm_ipv4=None,
+        vm_provider=VMProvider.local_bedrock if payload.flavor == ServerFlavor.BEDROCK else VMProvider.local_java, 
+        vm_ipv4=node.ip_address if node else None,
         vm_port=port,
         mc_config=config,
+        flavor=payload.flavor,
+        mc_version=payload.mc_version,
+        java_version=required_java_version(payload.mc_version) if is_java_flavor(payload.flavor) else None,
     )
     db.add(server)
-    db.flush()  # Generate server.id
+    db.flush() 
 
     server.join_code = generate_join_code(user.id, server.id)
 
     versions_dir, servers_dir, _logs_dir = _server_dirs()
     try:
-        requested_version = _normalize_requested_version(
-            (server.mc_config or {}).get("bedrock_version")
-        )
-        _ensure_version_on_disk(versions_dir=versions_dir, requested_version=requested_version)
-        version_name, version_dir = resolve_version_dir(
-            versions_dir=versions_dir, requested=requested_version
-        )
-        server_dir = materialize_server_dir(
-            version_dir=version_dir, servers_dir=servers_dir, server_id=str(server.id)
-        )
-        # Validate the produced path is still inside the root
-        _validate_server_dir(server_dir, servers_dir)
+        if payload.flavor == ServerFlavor.BEDROCK:
+            # --- EXISTING BEDROCK LOGIC (UNCHANGED) ---
+            requested_version = _normalize_requested_version(
+                (server.mc_config or {}).get("bedrock_version")
+            )
+            _ensure_version_on_disk(versions_dir=versions_dir, requested_version=requested_version)
+            version_name, version_dir = resolve_version_dir(
+                versions_dir=versions_dir, requested=requested_version
+            )
+            server_dir = materialize_server_dir(
+                version_dir=version_dir, servers_dir=servers_dir, server_id=str(server.id)
+            )
+            _validate_server_dir(server_dir, servers_dir)
 
-        write_server_properties(
-            server_dir / "server.properties",
-            _server_props_from_config(server=server, port=server.vm_port),
-        )
+            write_server_properties(
+                server_dir / "server.properties",
+                _server_props_from_config(server=server, port=server.vm_port),
+            )
 
-        cfg = dict(server.mc_config or {})
-        cfg["runtime_mode"] = "process"
-        cfg["template_version"] = version_name
-        cfg["server_dir"] = str(server_dir)
-        server.mc_config = cfg
+            cfg = dict(server.mc_config or {})
+            cfg["runtime_mode"] = "process"
+            cfg["template_version"] = version_name
+            cfg["server_dir"] = str(server_dir)
+            server.mc_config = cfg
+            
+        else:
+            # --- NEW JAVA LOGIC ---
+            from blockhost_backend.minecraft.binary_manager import ensure_binary_installed
+            
+            server_dir = servers_dir / str(server.id)
+            server_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Ensure the binary is in the shared registry (downloads if needed)
+            binary = ensure_binary_installed(db, payload.flavor, payload.mc_version)
+            
+            # Write eula.txt and server.properties — no JAR copied here
+            (server_dir / "eula.txt").write_text("eula=true\n", encoding="utf-8")
+            props = _java_server_properties_from_config(server=server, port=server.vm_port)
+            write_java_server_properties(server_dir / "server.properties", props)
+            
+            cfg = dict(server.mc_config or {})
+            cfg["runtime_mode"] = "process"
+            cfg["server_dir"] = str(server_dir)
+            # No longer store executable_name — the binary registry handles it
+            server.mc_config = cfg
+
     except Exception as e:
         db.rollback()
         raise HTTPException(
-            status_code=503, detail=f"Failed to materialize Bedrock server folder: {e}"
+            status_code=503, detail=f"Failed to setup server files: {e}"
         )
 
-    try:
-        if not server.vm_port:
-            raise RuntimeError("Port not allocated before process startup")
-        _start_bedrock_process(server=server, settings=settings, db=db)
-    except BillingError as e:
-        server.state = ServerState.suspended
-        db.rollback()
-        raise HTTPException(status_code=402, detail={"error": e.code, "message": e.message})
-    except Exception as e:
-        server.state = ServerState.suspended
-        db.rollback()
-        raise HTTPException(status_code=503, detail=f"Failed to start Bedrock process: {e}")
-
+    # Server is created suspended — user must subscribe via Billing, then POST /start.
+    if server.state != ServerState.provisioning:
+        server.state = ServerState.created
     db.commit()
     db.refresh(server)
+    if server.node_id:
+        refresh_node_allocated_ram(db, server.node_id)
+        db.commit()
     _invalidate_server_read_cache(user.id, server.id)
     return _server_to_out(server, owner=user)
+
+
+def _provision_java_server(server_id: str, jar_url: str, jar_path_str: str, server_dir_str: str, port: int) -> None:
+    from blockhost_backend.database.db import SessionLocal
+    from blockhost_backend.minecraft.software_provider import download_file
+
+    server_uuid = uuid.UUID(server_id)
+    server_dir = Path(server_dir_str)
+    jar_path = Path(jar_path_str)
+    try:
+        download_file(jar_url, jar_path)
+        (server_dir / "eula.txt").write_text("eula=true\n")
+
+        with SessionLocal() as db:
+            server = db.get(Server, server_uuid)
+            if server:
+                props = _java_server_properties_from_config(server=server, port=port)
+                props_path = server_dir / "server.properties"
+                write_java_server_properties(props_path, props)
+                set_java_server_property(props_path, "online-mode", False)
+                cfg = dict(server.mc_config or {})
+                cfg.pop("provision_error", None)
+                server.mc_config = cfg
+                server.state = ServerState.created
+                db.commit()
+                if server.node_id:
+                    node = db.get(Node, server.node_id)
+                    if node:
+                        from blockhost_backend.services.node_provision import provision_remote_java_server
+
+                        provision_remote_java_server(server=server, server_dir=server_dir, node=node)
+    except Exception as exc:
+        logger.exception("Failed to provision java server %s", server_id)
+        with SessionLocal() as db:
+            server = db.get(Server, server_uuid)
+            if server:
+                cfg = dict(server.mc_config or {})
+                cfg["provision_error"] = str(exc)
+                server.mc_config = cfg
+                server.state = ServerState.suspended
+                db.commit()
+
+
+@router.get("/{server_id}/provision-status")
+def get_provision_status(
+    server_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    server = db.query(Server).filter(Server.id == server_id).first()
+    if not server:
+        raise HTTPException(status_code=404, detail="Server not found")
+    if server.owner_id != user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    cfg = server.mc_config or {}
+    server_dir = cfg.get("server_dir")
+    jar_ready = False
+    if server_dir:
+        jar_ready = (Path(server_dir) / "server.jar").is_file()
+
+    return {
+        "state": server.state.value,
+        "server_dir": server_dir,
+        "jar_ready": jar_ready,
+        "provision_error": cfg.get("provision_error"),
+    }
+
+
+@router.post("/{server_id}/reprovision", response_model=ServerActionResponse)
+def reprovision_java_server(
+    server_id: str,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ServerActionResponse:
+    try:
+        server_uuid = uuid.UUID(server_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Server not found")
+    server = db.get(Server, server_uuid)
+    if not server or server.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Server not found")
+    if not is_java_flavor(server.flavor):
+        raise HTTPException(status_code=400, detail="Only Java servers can be reprovisioned")
+    if not server.mc_version:
+        raise HTTPException(status_code=400, detail="Server has no mc_version")
+
+    _, servers_dir, _ = _server_dirs()
+    server_dir = servers_dir / str(server.id)
+    server_dir.mkdir(parents=True, exist_ok=True)
+    jar_path = server_dir / "server.jar"
+
+    from blockhost_backend.minecraft.software_provider import resolve_jar_url
+
+    try:
+        jar_url = resolve_jar_url(server.flavor, server.mc_version)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Failed to resolve JAR URL: {e}")
+
+    cfg = dict(server.mc_config or {})
+    cfg["server_dir"] = str(server_dir)
+    cfg["executable_name"] = "server.jar"
+    cfg.pop("provision_error", None)
+    server.mc_config = cfg
+    server.state = ServerState.provisioning
+    db.commit()
+
+    background_tasks.add_task(
+        _provision_java_server,
+        str(server.id),
+        jar_url,
+        str(jar_path),
+        str(server_dir),
+        server.vm_port or 25565,
+    )
+    _invalidate_server_read_cache(user.id, server.id)
+    return ServerActionResponse(id=server.id, state=server.state)
+
+@router.post("/{server_id}/switch-software", response_model=ServerActionResponse)
+def switch_server_software(
+    server_id: str,
+    payload: SoftwareSwitchRequest,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ServerActionResponse:
+    try:
+        server_uuid = uuid.UUID(server_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Server not found")
+    server = db.get(Server, server_uuid)
+    if not server or server.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Server not found")
+
+    is_currently_java = is_java_flavor(server.flavor)
+    target_is_java = is_java_flavor(payload.target_flavor)
+
+    if is_currently_java != target_is_java:
+        raise HTTPException(status_code=400, detail="Cross-platform switching (Java <-> Bedrock) is not supported.")
+
+    server.flavor = payload.target_flavor
+    
+    if target_is_java:
+        server.mc_version = payload.target_mc_version
+        
+        _, servers_dir, _ = _server_dirs()
+        server_dir = servers_dir / str(server.id)
+        server_dir.mkdir(parents=True, exist_ok=True)
+        jar_path = server_dir / "server.jar"
+
+        from blockhost_backend.minecraft.software_provider import resolve_jar_url
+
+        try:
+            jar_url = resolve_jar_url(server.flavor, server.mc_version)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Failed to resolve JAR URL: {e}")
+
+        cfg = dict(server.mc_config or {})
+        cfg["server_dir"] = str(server_dir)
+        cfg["executable_name"] = "server.jar"
+        cfg.pop("provision_error", None)
+        server.mc_config = cfg
+        server.state = ServerState.provisioning
+        db.commit()
+
+        background_tasks.add_task(
+            _provision_java_server,
+            str(server.id),
+            jar_url,
+            str(jar_path),
+            str(server_dir),
+            server.vm_port or 25565,
+        )
+    else:
+        # Bedrock
+        cfg = dict(server.mc_config or {})
+        try:
+            cfg["bedrock_version"] = _sanitize_version(payload.target_mc_version)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        
+        server.mc_config = cfg
+        db.commit()
+
+    _invalidate_server_read_cache(user.id, server.id)
+    return ServerActionResponse(id=server.id, state=server.state)
 
 
 def _discover_filesystem_servers(*, servers_dir: Path, db: Session) -> list[Server]:
@@ -798,6 +1224,23 @@ def get_server(
     )
 
 
+def _provision_remote_server(server: Server, server_dir: Path, db: Session, version_name: str, version_dir: Path) -> None:
+    if not server.node_id:
+        return
+    node = db.get(Node, server.node_id)
+    if not node:
+        return
+
+    from blockhost_backend.services.node_provision import provision_remote_server
+
+    provision_remote_server(
+        server=server,
+        server_dir=server_dir,
+        node=node,
+        version_name=version_name,
+        version_dir=version_dir,
+    )
+
 @router.post("/{server_id}/start", response_model=ServerActionResponse)
 def start_server(
     server_id: str,
@@ -817,62 +1260,25 @@ def start_server(
         is_actually_running = _ORCHESTRATOR.is_running(str(server.id))
 
     if is_actually_running:
-        # Idempotent — already running, nothing to do
         return ServerActionResponse(id=server.id, state=server.state)
 
     settings = get_settings()
-    server.vm_provider = VMProvider.local_bedrock
-
-    if not server.vm_port:
-        try:
-            server.vm_port = _allocate_port(db=db)
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"Failed to allocate UDP port: {e}")
-
-    if not (server.mc_config or {}).get("server_dir"):
-        versions_dir, servers_dir, _logs_dir = _server_dirs()
-        try:
-            requested_version = _normalize_requested_version(
-                (server.mc_config or {}).get("bedrock_version")
-            )
-            _ensure_version_on_disk(versions_dir=versions_dir, requested_version=requested_version)
-            version_name, version_dir = resolve_version_dir(
-                versions_dir=versions_dir, requested=requested_version
-            )
-            server_dir = materialize_server_dir(
-                version_dir=version_dir, servers_dir=servers_dir, server_id=str(server.id)
-            )
-            _validate_server_dir(server_dir, servers_dir)
-            write_server_properties(
-                server_dir / "server.properties",
-                _server_props_from_config(server=server, port=server.vm_port),
-            )
-            cfg = dict(server.mc_config or {})
-            cfg["runtime_mode"] = "process"
-            cfg["template_version"] = version_name
-            cfg["server_dir"] = str(server_dir)
-            server.mc_config = cfg
-        except Exception as e:
-            raise HTTPException(
-                status_code=503, detail=f"Failed to materialize Bedrock server folder: {e}"
-            )
-    else:
-        try:
-            _, servers_dir, _ = _server_dirs()
-            server_dir = _validate_server_dir(
-                Path(server.mc_config["server_dir"]), servers_dir
-            )
-            write_server_properties(
-                server_dir / "server.properties",
-                _server_props_from_config(server=server, port=server.vm_port),
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=503, detail=f"Failed to update server.properties: {e}"
-            )
+    is_java = is_java_flavor(server.flavor)
 
     try:
-        _start_bedrock_process(server=server, settings=settings, db=db)
+        if is_java:
+            _prepare_java_server_for_start(server=server, db=db)
+        else:
+            server.vm_provider = VMProvider.local_bedrock
+            _prepare_bedrock_server_for_start(server=server, db=db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        detail = "Failed to prepare Java server" if is_java else "Failed to materialize Bedrock server folder"
+        raise HTTPException(status_code=503, detail=f"{detail}: {e}")
+
+    try:
+        _start_server_process(server=server, settings=settings, db=db)
     except BillingError as e:
         server.state = ServerState.suspended
         _drop_server_stats_snapshot(str(server.id))
@@ -880,7 +1286,8 @@ def start_server(
     except Exception as e:
         server.state = ServerState.suspended
         _drop_server_stats_snapshot(str(server.id))
-        raise HTTPException(status_code=503, detail=f"Failed to start Bedrock process: {e}")
+        label = "Java" if is_java else "Bedrock"
+        raise HTTPException(status_code=503, detail=f"Failed to start {label} process: {e}")
 
     db.commit()
     _drop_server_stats_snapshot(str(server.id))
@@ -931,48 +1338,27 @@ def toggle_server(
     if is_actually_running:
         _stop_server_process(server)
     else:
+        is_java = is_java_flavor(server.flavor)
         try:
-            if not server.vm_port:
-                server.vm_port = _allocate_port(db=db)
-
-            if not (server.mc_config or {}).get("server_dir"):
-                versions_dir, servers_dir, _logs_dir = _server_dirs()
-                requested_version = _normalize_requested_version(
-                    (server.mc_config or {}).get("bedrock_version")
-                )
-                _ensure_version_on_disk(versions_dir=versions_dir, requested_version=requested_version)
-                version_name, version_dir = resolve_version_dir(
-                    versions_dir=versions_dir, requested=requested_version
-                )
-                server_dir = materialize_server_dir(
-                    version_dir=version_dir, servers_dir=servers_dir, server_id=str(server.id)
-                )
-                _validate_server_dir(server_dir, servers_dir)
-                cfg = dict(server.mc_config or {})
-                cfg["runtime_mode"] = "process"
-                cfg["template_version"] = version_name
-                cfg["server_dir"] = str(server_dir)
-                server.mc_config = cfg
+            if is_java:
+                _prepare_java_server_for_start(server=server, db=db)
             else:
-                _, servers_dir, _ = _server_dirs()
-                _validate_server_dir(Path(server.mc_config["server_dir"]), servers_dir)
-
-            write_server_properties(
-                Path(server.mc_config["server_dir"]) / "server.properties",
-                _server_props_from_config(server=server, port=server.vm_port),
-            )
-            _start_bedrock_process(server=server, settings=settings, db=db)
+                _prepare_bedrock_server_for_start(server=server, db=db)
+            _start_server_process(server=server, settings=settings, db=db)
         except BillingError as e:
             server.state = ServerState.suspended
             _drop_server_stats_snapshot(str(server.id))
             raise HTTPException(
                 status_code=402, detail={"error": e.code, "message": e.message}
             )
+        except HTTPException:
+            raise
         except Exception as e:
             server.state = ServerState.suspended
             _drop_server_stats_snapshot(str(server.id))
+            label = "Java" if is_java else "Bedrock"
             raise HTTPException(
-                status_code=503, detail=f"Failed to start Bedrock process: {e}"
+                status_code=503, detail=f"Failed to start {label} process: {e}"
             )
 
     db.commit()
@@ -1103,53 +1489,52 @@ async def console_websocket(
     token: str | None = None,
     db: Session = Depends(get_db),
 ):
-    await websocket.accept()
-    
+    user = authenticate_ws_user(token=token, db=db)
+    if user is None:
+        await websocket.close(code=4001, reason="Authentication failed")
+        return
+
     try:
-        user = get_ws_user(token=token, db=db)
-        try:
-            server_uuid = uuid.UUID(server_id)
-        except ValueError:
-            await websocket.send_json({"type": "error", "error": "Invalid server ID"})
-            await websocket.close(code=4004)
-            return
-        
-        server = db.get(Server, server_uuid)
-        if not server or server.owner_id != user.id:
-            await websocket.send_json({"type": "error", "error": "Not authorized"})
-            await websocket.close(code=4003)
-            return
+        server_uuid = uuid.UUID(server_id)
+    except ValueError:
+        await websocket.close(code=4004, reason="Invalid server ID")
+        return
 
-        if not _ORCHESTRATOR.is_running(server_id):
-            await websocket.send_json({"type": "error", "error": "Server is not running"})
-            await websocket.close(code=4000)
-            return
+    server = db.get(Server, server_uuid)
+    if not server or server.owner_id != user.id:
+        await websocket.close(code=4003, reason="Not authorized")
+        return
 
+    if not _ORCHESTRATOR.is_running(server_id):
+        await websocket.close(code=4000, reason="Server is not running")
+        return
+
+    await websocket.accept()
+
+    listener_callback = None
+    try:
         import dataclasses
         from blockhost_backend.config.config_manager import get_settings
-        
+
         settings = get_settings()
-        
-        # Send last 500 lines as history
+
         history = _ORCHESTRATOR.read_logs(server_id, tail=500)
         await websocket.send_json({"type": "history", "logs": [dataclasses.asdict(e) for e in history]})
 
-        # Queue to bridge sync listener to async websocket (bounded to prevent unbounded memory growth)
         queue = asyncio.Queue(maxsize=settings.console_queue_max_size)
         loop = asyncio.get_running_loop()
 
-        def on_log(entry):
+        def listener_callback(entry):
             try:
                 loop.call_soon_threadsafe(queue.put_nowait, dataclasses.asdict(entry))
             except asyncio.QueueFull:
-                # Drop oldest entry when queue is full and add new one
                 try:
-                    queue.get_nowait()  # Discard oldest
+                    queue.get_nowait()
                     loop.call_soon_threadsafe(queue.put_nowait, dataclasses.asdict(entry))
                 except asyncio.QueueEmpty:
-                    pass  # Race condition, queue was emptied
+                    pass
 
-        _ORCHESTRATOR.add_log_listener(server_id, on_log)
+        _ORCHESTRATOR.add_log_listener(server_id, listener_callback)
 
         async def send_logs():
             try:
@@ -1166,7 +1551,9 @@ async def console_websocket(
                     try:
                         msg = json.loads(data)
                         if msg.get("type") == "command" and "command" in msg:
-                            _ORCHESTRATOR.send_command(server_id, msg["command"])
+                            command = str(msg["command"]).replace("\r", "").replace("\n", " ").strip()
+                            if command and len(command) <= 512:
+                                _ORCHESTRATOR.send_command(server_id, command)
                     except json.JSONDecodeError:
                         pass
             except WebSocketDisconnect:
@@ -1182,12 +1569,9 @@ async def console_websocket(
         for task in pending:
             task.cancel()
 
-    except HTTPException:
-        await websocket.send_json({"type": "error", "error": "Authentication failed"})
-        await websocket.close(code=4001)
     finally:
-        if 'on_log' in locals():
-            _ORCHESTRATOR.remove_log_listener(server_id, on_log)
+        if listener_callback is not None:
+            _ORCHESTRATOR.remove_log_listener(server_id, listener_callback)
 
 
 

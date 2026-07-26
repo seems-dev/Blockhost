@@ -1,0 +1,5 @@
+# Set DOMAIN in deploy/.env (e.g. yourdomain.com). Defaults to localhost for local testing.
+{$DOMAIN:localhost} {
+	encode zstd br gzip
+	reverse_proxy api:8000
+}

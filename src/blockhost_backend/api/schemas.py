@@ -3,12 +3,12 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
-from blockhost_backend.database.schema import BackupKind, BackupStatus, RestoreStatus, ServerState,  VMProvider
+from blockhost_backend.database.schema import BackupKind, BackupStatus, RestoreStatus, ServerFlavor, ServerState,  VMProvider
 
 #file_name = schemas.py
-class BedrockConfig(BaseModel):
+class ServerConfig(BaseModel):
     # Mirrors common `server.properties` keys supported by popular Bedrock server containers.
     # `bedrock_image` allows pinning a per-server container image/tag (version).
     bedrock_image: str | None = Field(default=None, max_length=128)
@@ -23,6 +23,7 @@ class BedrockConfig(BaseModel):
     online_mode: bool | None = None
     level_name: str | None = Field(default=None, max_length=64)
     level_seed: str | None = Field(default=None, max_length=64)
+    motd: str | None = None
 
 
 class SignupRequest(BaseModel):
@@ -59,8 +60,20 @@ class AuthResponse(BaseModel):
 
 class CreateServerRequest(BaseModel):
     world_name: str = Field(min_length=1, max_length=128)
-    
-    config: BedrockConfig | None = None
+    flavor: ServerFlavor = Field(default=ServerFlavor.BEDROCK)
+    mc_version: str | None = Field(default=None, max_length=32)
+    config: ServerConfig | None = None
+
+    @model_validator(mode="after")
+    def validate_flavor_requirements(self) -> CreateServerRequest:
+        from blockhost_backend.minecraft.java_compat import is_java_flavor, is_supported_java_flavor
+
+        if is_java_flavor(self.flavor):
+            if not self.mc_version:
+                raise ValueError("mc_version is required for Java servers")
+            if not is_supported_java_flavor(self.flavor):
+                raise ValueError(f"{self.flavor.value} is not supported yet")
+        return self
 
 
 class ServerOut(BaseModel):
@@ -76,6 +89,8 @@ class ServerOut(BaseModel):
     owner_nickname: str
     created_at: datetime
     last_activity: datetime
+    flavor: ServerFlavor
+    mc_version: str | None
     mc_config: dict
 
 
@@ -116,7 +131,7 @@ class BedrockServerStats(BaseModel):
 
 class ServerStateSnapshot(BaseModel):
     server: ServerDetail
-    config: BedrockConfig
+    config: ServerConfig
     stats: BedrockServerStats | None = None
 
 
@@ -177,11 +192,16 @@ class BanCheckResponse(BaseModel):
 
 class ServerConfigOut(BaseModel):
     id: uuid.UUID
-    mc_config: BedrockConfig
+    mc_config: ServerConfig
 
 
 class ServerConfigUpdateRequest(BaseModel):
-    config: BedrockConfig
+    config: ServerConfig
+
+
+class SoftwareSwitchRequest(BaseModel):
+    target_flavor: ServerFlavor
+    target_mc_version: str
 
 
 class CreateBackupRequest(BaseModel):
@@ -298,3 +318,76 @@ class FileInfo(BaseModel):
 
 class FileWriteRequest(BaseModel):
     content: str
+
+
+# ---------------------------------------------------------------------------
+# Mod management (Modrinth)
+# ---------------------------------------------------------------------------
+
+class ModSearchResult(BaseModel):
+    """A single hit from a Modrinth faceted search."""
+    project_id: str
+    slug: str
+    title: str
+    description: str
+    icon_url: str | None = None
+    downloads: int
+    categories: list[str]
+    latest_version: str | None = None
+
+
+class ModSearchResponse(BaseModel):
+    hits: list[ModSearchResult]
+    total_hits: int
+    offset: int
+    limit: int
+
+
+class ModInstallRequest(BaseModel):
+    """Request body for installing a mod by Modrinth project ID."""
+    modrinth_project_id: str = Field(min_length=1, max_length=64)
+    version_id: str | None = None
+
+
+class ModInstallResponse(BaseModel):
+    """Result of a mod install, including resolved dependencies."""
+    installed: list[str]       # filenames of newly downloaded JARs
+    already_present: list[str] # filenames already on disk (skipped)
+    requires_restart: bool
+    install_subdir: str        # "mods" or "plugins"
+
+
+class ModListResponse(BaseModel):
+    """List of installed mod filenames from the agent."""
+    files: list[str]
+    install_subdir: str
+    flavor: str
+
+
+class ModCapabilityResponse(BaseModel):
+    """Whether a server flavor supports mod management."""
+    supported: bool
+    coming_soon: bool
+    install_subdir: str
+    loaders: list[str]
+    reason: str | None = None
+
+
+class ModVersionSchema(BaseModel):
+    id: str
+    name: str
+    version_number: str
+    date_published: str
+    downloads: int
+
+
+class ModProjectDetailsResponse(BaseModel):
+    project_id: str
+    slug: str
+    title: str
+    description: str
+    body: str
+    icon_url: str | None = None
+    downloads: int
+    categories: list[str]
+    versions: list[ModVersionSchema]

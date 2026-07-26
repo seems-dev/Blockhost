@@ -16,16 +16,19 @@ dependencies = [
     "b2sdk>=2.0.0",
     "stripe>=10.0.0",
     "pydantic>=2.0.0",
-    "passlib[bcrypt]>=1.7.4",
     "python-jose[cryptography]>=3.3.0",
     "email-validator>=2.0.0",
-    "bcrypt<4.1",
     "websockets>=12.0",
     "alembic>=1.18.4",
+    "pwdlib[argon2]>=0.3.0",
+    "razorpay>=2.0.1",
+    "psutil>=7.2.2",
+    "google-auth>=2.36.0",
 ]
 
 [project.scripts]
 blockhost-backup-scheduler = "blockhost_backend.backup_scheduler:main"
+blockhost-worker = "blockhost_backend.worker:main"
 
 [project.optional-dependencies]
 dev = [

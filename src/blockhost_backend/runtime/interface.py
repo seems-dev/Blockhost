@@ -26,7 +26,7 @@ class RuntimeStartRequest:
     server_dir: Path
     port: int
     requested_version: str | None
-    executable_name: str | None
+    executable_path: Path
     ram_mb: int
     cpu_quota_pct: int
     flavor: str | None = None

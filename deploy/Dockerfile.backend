@@ -12,7 +12,7 @@ COPY alembic ./alembic
 COPY alembic.ini ./
 COPY deploy/entrypoint.sh /entrypoint.sh
 
-RUN pip install --no-cache-dir . && chmod +x /entrypoint.sh
+RUN pip install --no-cache-dir uv && uv pip install --system --no-cache-dir . && chmod +x /entrypoint.sh
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app/src

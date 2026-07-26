@@ -30,6 +30,7 @@ from blockhost_backend.api.schemas import (
     ServerActionResponse,
     ServerConfigOut,
     ServerConfigUpdateRequest,
+    SoftwareSwitchRequest,
     ServerDetail,
     ServerOut,
     ServerStateSnapshot,
@@ -62,7 +63,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/servers", tags=["servers"])
 
 _ORCHESTRATOR = get_server_lifecycle_orchestrator()
-_STATS_SNAPSHOT_TTL_SECONDS = 2.0
+_STATS_SNAPSHOT_TTL_SECONDS = 5.0
 _STATS_REDIS_TTL_SECONDS = 5
 _SERVER_LIST_TTL_SECONDS = 5
 _SERVER_DETAIL_TTL_SECONDS = 15
@@ -493,7 +494,7 @@ def _server_dirs() -> tuple[Path, Path, Path]:
     from blockhost_backend.config.config_manager import resolve_data_path
 
     return (
-        resolve_data_path(settings.bedrock_versions_dir),
+        resolve_data_path(settings.runtime_binaries_dir) / "bedrock",
         resolve_data_path(settings.bedrock_servers_dir),
         resolve_data_path(settings.bedrock_logs_dir),
     )
@@ -549,7 +550,7 @@ def _collect_reserved_ports(
 ) -> set[int]:
     reserved: set[int] = set()
     is_bedrock = flavor == ServerFlavor.BEDROCK
-    query = select(Server.vm_port, Server.flavor)
+    query = select(Server.vm_port, Server.flavor).where(Server.vm_port.between(port_range.start, port_range.end))
     if node_id:
         query = query.where(Server.node_id == node_id)
     for row in db.execute(query).all():
@@ -579,7 +580,7 @@ def _validate_server_port_pairs(
     errors: list[str] = []
     is_bedrock = flavor == ServerFlavor.BEDROCK
 
-    query = select(Server.id, Server.vm_port, Server.flavor)
+    query = select(Server.id, Server.vm_port, Server.flavor).where(Server.vm_port.between(port_range.start, port_range.end))
     if node_id:
         query = query.where(Server.node_id == node_id)
     for row in db.execute(query).all():
@@ -691,12 +692,8 @@ def _prepare_java_server_for_start(*, server: Server, db: Session) -> Path:
         raise HTTPException(status_code=503, detail="Server directory not configured")
 
     server_dir = _validate_server_dir(Path(server.mc_config["server_dir"]), servers_dir)
-    jar_name = (server.mc_config or {}).get("executable_name") or "server.jar"
-    if not (server_dir / jar_name).is_file():
-        raise HTTPException(
-            status_code=503,
-            detail="Server JAR not found; provisioning may have failed",
-        )
+    # JAR is now in the shared binary registry — no local JAR check needed.
+    # The binary_manager resolves the executable at start time.
 
     props_path = server_dir / "server.properties"
     write_java_server_properties(props_path, _java_server_properties_from_config(server=server, port=server.vm_port))
@@ -722,15 +719,17 @@ def _prepare_bedrock_server_for_start(*, server: Server, db: Session) -> Path:
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"Failed to allocate UDP port: {e}")
 
+    requested_version = _normalize_requested_version(
+        (server.mc_config or {}).get("bedrock_version")
+    )
+    
+    from blockhost_backend.minecraft.binary_manager import ensure_binary_installed
+    binary = ensure_binary_installed(db, ServerFlavor.BEDROCK, requested_version)
+    version_dir = Path(binary.executable_path).parent
+    version_name = binary.version
+
     if not (server.mc_config or {}).get("server_dir"):
-        versions_dir, servers_dir, _logs_dir = _server_dirs()
-        requested_version = _normalize_requested_version(
-            (server.mc_config or {}).get("bedrock_version")
-        )
-        _ensure_version_on_disk(versions_dir=versions_dir, requested_version=requested_version)
-        version_name, version_dir = resolve_version_dir(
-            versions_dir=versions_dir, requested=requested_version
-        )
+        _, servers_dir, _ = _server_dirs()
         server_dir = materialize_server_dir(
             version_dir=version_dir, servers_dir=servers_dir, server_id=str(server.id)
         )
@@ -744,7 +743,7 @@ def _prepare_bedrock_server_for_start(*, server: Server, db: Session) -> Path:
         cfg["template_version"] = version_name
         cfg["server_dir"] = str(server_dir)
         server.mc_config = cfg
-        _provision_remote_server(server, server_dir, db)
+        _provision_remote_server(server, server_dir, db, version_name, version_dir)
     else:
         _, servers_dir, _ = _server_dirs()
         server_dir = _validate_server_dir(Path(server.mc_config["server_dir"]), servers_dir)
@@ -752,7 +751,7 @@ def _prepare_bedrock_server_for_start(*, server: Server, db: Session) -> Path:
             server_dir / "server.properties",
             _server_props_from_config(server=server, port=server.vm_port),
         )
-        _provision_remote_server(server, server_dir, db)
+        _provision_remote_server(server, server_dir, db, version_name, version_dir)
 
     return server_dir
 
@@ -862,26 +861,23 @@ def create_server(
             
         else:
             # --- NEW JAVA LOGIC ---
-            from blockhost_backend.minecraft.software_provider import resolve_jar_url
+            from blockhost_backend.minecraft.binary_manager import ensure_binary_installed
             
             server_dir = servers_dir / str(server.id)
             server_dir.mkdir(parents=True, exist_ok=True)
             
-            # 1. Resolve JAR URL
-            jar_url = resolve_jar_url(payload.flavor, payload.mc_version)
-            jar_path = server_dir / "server.jar"
+            # Ensure the binary is in the shared registry (downloads if needed)
+            binary = ensure_binary_installed(db, payload.flavor, payload.mc_version)
             
-            # 2. Start background task for provisioning
-            server.state = ServerState.provisioning
-            background_tasks.add_task(
-                _provision_java_server,
-                str(server.id), jar_url, str(jar_path), str(server_dir), server.vm_port
-            )
+            # Write eula.txt and server.properties — no JAR copied here
+            (server_dir / "eula.txt").write_text("eula=true\n", encoding="utf-8")
+            props = _java_server_properties_from_config(server=server, port=server.vm_port)
+            write_java_server_properties(server_dir / "server.properties", props)
             
             cfg = dict(server.mc_config or {})
             cfg["runtime_mode"] = "process"
             cfg["server_dir"] = str(server_dir)
-            cfg["executable_name"] = "server.jar"
+            # No longer store executable_name — the binary registry handles it
             server.mc_config = cfg
 
     except Exception as e:
@@ -1016,6 +1012,75 @@ def reprovision_java_server(
         str(server_dir),
         server.vm_port or 25565,
     )
+    _invalidate_server_read_cache(user.id, server.id)
+    return ServerActionResponse(id=server.id, state=server.state)
+
+@router.post("/{server_id}/switch-software", response_model=ServerActionResponse)
+def switch_server_software(
+    server_id: str,
+    payload: SoftwareSwitchRequest,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ServerActionResponse:
+    try:
+        server_uuid = uuid.UUID(server_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Server not found")
+    server = db.get(Server, server_uuid)
+    if not server or server.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Server not found")
+
+    is_currently_java = is_java_flavor(server.flavor)
+    target_is_java = is_java_flavor(payload.target_flavor)
+
+    if is_currently_java != target_is_java:
+        raise HTTPException(status_code=400, detail="Cross-platform switching (Java <-> Bedrock) is not supported.")
+
+    server.flavor = payload.target_flavor
+    
+    if target_is_java:
+        server.mc_version = payload.target_mc_version
+        
+        _, servers_dir, _ = _server_dirs()
+        server_dir = servers_dir / str(server.id)
+        server_dir.mkdir(parents=True, exist_ok=True)
+        jar_path = server_dir / "server.jar"
+
+        from blockhost_backend.minecraft.software_provider import resolve_jar_url
+
+        try:
+            jar_url = resolve_jar_url(server.flavor, server.mc_version)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Failed to resolve JAR URL: {e}")
+
+        cfg = dict(server.mc_config or {})
+        cfg["server_dir"] = str(server_dir)
+        cfg["executable_name"] = "server.jar"
+        cfg.pop("provision_error", None)
+        server.mc_config = cfg
+        server.state = ServerState.provisioning
+        db.commit()
+
+        background_tasks.add_task(
+            _provision_java_server,
+            str(server.id),
+            jar_url,
+            str(jar_path),
+            str(server_dir),
+            server.vm_port or 25565,
+        )
+    else:
+        # Bedrock
+        cfg = dict(server.mc_config or {})
+        try:
+            cfg["bedrock_version"] = _sanitize_version(payload.target_mc_version)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        
+        server.mc_config = cfg
+        db.commit()
+
     _invalidate_server_read_cache(user.id, server.id)
     return ServerActionResponse(id=server.id, state=server.state)
 
@@ -1159,7 +1224,7 @@ def get_server(
     )
 
 
-def _provision_remote_server(server: Server, server_dir: Path, db: Session) -> None:
+def _provision_remote_server(server: Server, server_dir: Path, db: Session, version_name: str, version_dir: Path) -> None:
     if not server.node_id:
         return
     node = db.get(Node, server.node_id)
@@ -1167,17 +1232,6 @@ def _provision_remote_server(server: Server, server_dir: Path, db: Session) -> N
         return
 
     from blockhost_backend.services.node_provision import provision_remote_server
-
-    cfg = server.mc_config or {}
-    version_name = str(cfg.get("template_version") or "")
-    if not version_name:
-        raise RuntimeError("Server has no template_version for remote provisioning")
-
-    settings = get_settings()
-    versions_dir = Path(settings.bedrock_versions_dir)
-    version_dir = versions_dir / version_name
-    if not version_dir.is_dir():
-        raise RuntimeError(f"Version directory not found: {version_dir}")
 
     provision_remote_server(
         server=server,

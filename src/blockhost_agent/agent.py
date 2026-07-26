@@ -54,7 +54,7 @@ AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "change-me-in-dev")
 NODE_NAME = os.environ.get("NODE_NAME", "laptop-worker-1")
 NODE_PUBLIC_IP = os.environ.get("NODE_PUBLIC_IP", "").strip()
 CONTROLLER_WS_URL = os.environ.get(
-    "CONTROLLER_WS_URL", "ws://localhost:8000/api/nodes/ws"
+    "CONTROLLER_WS_URL", "ws://192.168.29.102:8000/api/nodes/ws"
 )
 SERVERS_ROOT_DIR = Path(
     os.environ.get("SERVERS_ROOT_DIR", f"./agent_storage/{NODE_NAME}")
@@ -110,7 +110,7 @@ class StartPayload(BaseModel):
     server_dir_rel: str
     port: int
     requested_version: str | None = None
-    executable_name: str | None = None
+    executable_path: str | None = None
     ram_mb: int
     cpu_quota_pct: int
     jdk_path: str | None = None  # NEW
@@ -188,20 +188,25 @@ def start_server(
     _token: str = Depends(verify_token),
 ) -> Any:
     _validate_server_id(server_id)
-    is_java = (payload.executable_name or "").endswith(".jar")
+    is_java = payload.executable_path and payload.executable_path.endswith(".jar")
 
     if is_java:
         server_dir = SERVERS_ROOT_DIR / server_id
         if not server_dir.is_dir():
             raise HTTPException(status_code=404, detail="Java server directory not provisioned on agent")
-        jar_name = payload.executable_name or "server.jar"
-        if not (server_dir / jar_name).is_file():
-            raise HTTPException(status_code=404, detail=f"Java server JAR not found: {jar_name}")
+        # Ensure executable exists on the agent filesystem
+        executable_path = Path(payload.executable_path)
+        if not executable_path.is_file():
+            raise HTTPException(status_code=404, detail=f"Java executable not found on agent: {executable_path}")
     else:
         version_name = (payload.requested_version or "").strip()
         if not version_name:
             raise HTTPException(status_code=400, detail="requested_version is required on agent")
         server_dir = _ensure_server_layout(server_id, version_name)
+        if payload.executable_path:
+            executable_path = Path(payload.executable_path)
+        else:
+            executable_path = server_dir / "bedrock_server"
 
     if not server_dir.resolve().is_relative_to(SERVERS_ROOT_DIR):
         raise HTTPException(status_code=403, detail="Path traversal detected")
@@ -211,7 +216,7 @@ def start_server(
         server_dir=server_dir,
         port=payload.port,
         requested_version=payload.requested_version,
-        executable_name=payload.executable_name,
+        executable_path=executable_path,
         ram_mb=payload.ram_mb,
         cpu_quota_pct=payload.cpu_quota_pct,
         jdk_path=Path(payload.jdk_path) if payload.jdk_path else None, # NEW
@@ -576,31 +581,80 @@ async def provision_server(
 
 ALLOWED_ROOTS = {
     "world",
+    "world_nether",
+    "world_the_end",
     "worlds",
+    "mods",
+    "plugins",
+    "config",
+    "behavior_packs",
+    "resource_packs",
+    "skin_packs",
+    "world_templates",
     "development_behavior_packs",
     "development_resource_packs",
     "development_skin_packs",
+}
+ALLOWED_ROOT_FILES = {
+    "server.properties",
+    "allowlist.json",
+    "permissions.json",
+    "valid_known_packs.json",
+    "world_behavior_packs.json",
+    "world_resource_packs.json",
+    "eula.txt",
+    "ops.json",
+    "whitelist.json",
+    "banned-players.json",
+    "banned-ips.json",
 }
 MAX_EDIT_SIZE = 5 * 1024 * 1024
 MAX_UPLOAD_SIZE = 100 * 1024 * 1024
 
 
-def _validate_safe_path(server_root: Path, requested_path: str) -> Path:
-    requested_path = requested_path.lstrip("/")
+def _parse_allowed_csv(raw: str | None, allowed_values: set[str]) -> set[str]:
+    if not raw:
+        return set(allowed_values)
+    requested = {item.strip() for item in raw.split(",") if item.strip()}
+    return requested & allowed_values
+
+
+def _parse_relative_parts(requested_path: str) -> tuple[str, ...]:
+    clean = requested_path.strip().lstrip("/")
+    if not clean:
+        return ()
+    parts = tuple(part for part in clean.split("/") if part)
+    if any(part in {".", ".."} for part in parts):
+        raise HTTPException(status_code=403, detail="Path traversal detected")
+    return parts
+
+
+def _validate_safe_path(
+    server_root: Path,
+    requested_path: str,
+    *,
+    allowed_roots: set[str] | None = None,
+    allowed_files: set[str] | None = None,
+    allow_root: bool = False,
+    allow_root_file: bool = True,
+) -> Path:
+    roots = allowed_roots or set(ALLOWED_ROOTS)
+    files = allowed_files or set(ALLOWED_ROOT_FILES)
+    parts = _parse_relative_parts(requested_path)
+    if not parts:
+        if not allow_root:
+            raise HTTPException(status_code=403, detail="Access denied to this folder")
+    elif len(parts) == 1 and parts[0] in files:
+        if not allow_root_file:
+            raise HTTPException(status_code=403, detail="Access denied to this folder")
+    elif parts[0] not in roots:
+        raise HTTPException(status_code=403, detail="Access denied to this folder")
+
+    requested_path = "/".join(parts)
     resolved = (server_root / requested_path).resolve()
 
     if not resolved.is_relative_to(server_root):
         raise HTTPException(status_code=403, detail="Path traversal detected")
-
-    is_allowed = False
-    for allowed in ALLOWED_ROOTS:
-        allowed_path = (server_root / allowed).resolve()
-        if resolved.is_relative_to(allowed_path) or resolved == allowed_path:
-            is_allowed = True
-            break
-
-    if not is_allowed:
-        raise HTTPException(status_code=403, detail="Access denied to this folder")
 
     return resolved
 
@@ -609,28 +663,48 @@ def _validate_safe_path(server_root: Path, requested_path: str) -> Path:
 def agent_list_files(
     server_id: str,
     path: str = "",
+    allowed_roots: str | None = None,
+    allowed_files: str | None = None,
     _token: str = Depends(verify_token),
 ) -> Any:
     _validate_server_id(server_id)
     server_root = SERVERS_ROOT_DIR / server_id
+    roots = _parse_allowed_csv(allowed_roots, ALLOWED_ROOTS)
+    files = _parse_allowed_csv(allowed_files, ALLOWED_ROOT_FILES)
 
     if not server_root.exists():
         return []
 
     if not path or path.strip() == "/":
-        return [
-            {
-                "name": folder,
-                "path": folder,
-                "is_dir": True,
-                "size": None,
-                "last_modified": (server_root / folder).stat().st_mtime,
-            }
-            for folder in ALLOWED_ROOTS
-            if (server_root / folder).is_dir()
-        ]
+        results = []
+        for folder in sorted(roots):
+            folder_path = server_root / folder
+            if folder_path.is_dir():
+                results.append(
+                    {
+                        "name": folder,
+                        "path": folder,
+                        "is_dir": True,
+                        "size": None,
+                        "last_modified": folder_path.stat().st_mtime,
+                    }
+                )
+        for filename in sorted(files):
+            file_path = server_root / filename
+            if file_path.is_file():
+                stat = file_path.stat()
+                results.append(
+                    {
+                        "name": filename,
+                        "path": filename,
+                        "is_dir": False,
+                        "size": stat.st_size,
+                        "last_modified": stat.st_mtime,
+                    }
+                )
+        return results
 
-    target_dir = _validate_safe_path(server_root, path)
+    target_dir = _validate_safe_path(server_root, path, allowed_roots=roots, allowed_files=files)
     if not target_dir.exists():
         raise HTTPException(status_code=404, detail="Path not found")
     if not target_dir.is_dir():
@@ -662,11 +736,15 @@ def agent_list_files(
 def agent_read_file(
     server_id: str,
     path: str,
+    allowed_roots: str | None = None,
+    allowed_files: str | None = None,
     _token: str = Depends(verify_token),
 ) -> Any:
     _validate_server_id(server_id)
     server_root = SERVERS_ROOT_DIR / server_id
-    target_file = _validate_safe_path(server_root, path)
+    roots = _parse_allowed_csv(allowed_roots, ALLOWED_ROOTS)
+    files = _parse_allowed_csv(allowed_files, ALLOWED_ROOT_FILES)
+    target_file = _validate_safe_path(server_root, path, allowed_roots=roots, allowed_files=files)
 
     if not target_file.is_file():
         raise HTTPException(status_code=404, detail="File not found")
@@ -684,11 +762,15 @@ def agent_write_file(
     server_id: str,
     payload: WritePayload,
     path: str,
+    allowed_roots: str | None = None,
+    allowed_files: str | None = None,
     _token: str = Depends(verify_token),
 ) -> Any:
     _validate_server_id(server_id)
     server_root = SERVERS_ROOT_DIR / server_id
-    target_file = _validate_safe_path(server_root, path)
+    roots = _parse_allowed_csv(allowed_roots, ALLOWED_ROOTS)
+    files = _parse_allowed_csv(allowed_files, ALLOWED_ROOT_FILES)
+    target_file = _validate_safe_path(server_root, path, allowed_roots=roots, allowed_files=files)
 
     content_bytes = payload.content.encode("utf-8")
     if len(content_bytes) > MAX_EDIT_SIZE:
@@ -723,11 +805,15 @@ def agent_write_file(
 def agent_download_file(
     server_id: str,
     path: str,
+    allowed_roots: str | None = None,
+    allowed_files: str | None = None,
     _token: str = Depends(verify_token),
 ) -> FileResponse:
     _validate_server_id(server_id)
     server_root = SERVERS_ROOT_DIR / server_id
-    target_file = _validate_safe_path(server_root, path)
+    roots = _parse_allowed_csv(allowed_roots, ALLOWED_ROOTS)
+    files = _parse_allowed_csv(allowed_files, ALLOWED_ROOT_FILES)
+    target_file = _validate_safe_path(server_root, path, allowed_roots=roots, allowed_files=files)
 
     if not target_file.is_file():
         raise HTTPException(status_code=404, detail="File not found")
@@ -743,12 +829,22 @@ def agent_download_file(
 async def agent_upload_file(
     server_id: str,
     path: str,
+    allowed_roots: str | None = None,
+    allowed_files: str | None = None,
     file: UploadFile = File(...),
     _token: str = Depends(verify_token),
 ) -> Any:
     _validate_server_id(server_id)
     server_root = SERVERS_ROOT_DIR / server_id
-    target_dir = _validate_safe_path(server_root, path)
+    roots = _parse_allowed_csv(allowed_roots, ALLOWED_ROOTS)
+    files = _parse_allowed_csv(allowed_files, ALLOWED_ROOT_FILES)
+    target_dir = _validate_safe_path(
+        server_root,
+        path,
+        allowed_roots=roots,
+        allowed_files=files,
+        allow_root_file=False,
+    )
 
     if target_dir.exists() and not target_dir.is_dir():
         raise HTTPException(status_code=400, detail="Target is not a directory")
@@ -760,7 +856,7 @@ async def agent_upload_file(
         filename = "uploaded_file"
 
     target_file = target_dir / filename
-    _validate_safe_path(server_root, target_file.relative_to(server_root).as_posix())
+    _validate_safe_path(server_root, target_file.relative_to(server_root).as_posix(), allowed_roots=roots, allowed_files=files)
 
     fd, tmp_path = tempfile.mkstemp(dir=target_dir, suffix=".upload")
     try:
@@ -788,15 +884,21 @@ async def agent_upload_file(
 def agent_delete_file(
     server_id: str,
     path: str,
+    allowed_roots: str | None = None,
+    allowed_files: str | None = None,
     _token: str = Depends(verify_token),
 ) -> Any:
     _validate_server_id(server_id)
     server_root = SERVERS_ROOT_DIR / server_id
-    target = _validate_safe_path(server_root, path)
+    roots = _parse_allowed_csv(allowed_roots, ALLOWED_ROOTS)
+    files = _parse_allowed_csv(allowed_files, ALLOWED_ROOT_FILES)
+    target = _validate_safe_path(server_root, path, allowed_roots=roots, allowed_files=files)
 
-    for allowed in ALLOWED_ROOTS:
+    for allowed in roots:
         if target == (server_root / allowed).resolve():
             raise HTTPException(status_code=403, detail="Cannot delete root folders")
+    if target.parent == server_root and target.name in files:
+        raise HTTPException(status_code=403, detail="Cannot delete protected server config files")
 
     if not target.exists():
         raise HTTPException(status_code=404, detail="Path not found")
@@ -906,6 +1008,7 @@ async def agent_download_mods(
 
     downloaded = 0
     async with httpx.AsyncClient(
+        headers={"User-Agent": "BlockHostAgent/1.0 (https://blockhost.app)"},
         timeout=httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=5.0),
         follow_redirects=True,
     ) as client:
@@ -922,8 +1025,8 @@ async def agent_download_mods(
                 raise HTTPException(status_code=403, detail="Path traversal detected in filename")
 
             logger.info(
-                "Downloading mod %s → %s/%s",
-                mod_file.filename, mod_file.subdir, mod_file.filename,
+                "Downloading mod %s from %s → %s/%s",
+                mod_file.filename, mod_file.url, mod_file.subdir, mod_file.filename,
             )
 
             total_bytes = 0
@@ -955,6 +1058,7 @@ async def agent_download_mods(
                     ),
                 )
             except httpx.HTTPError as exc:
+                logger.error("HTTPError downloading %s from %s: %s", mod_file.filename, mod_file.url, exc)
                 dest_path.unlink(missing_ok=True)
                 raise HTTPException(
                     status_code=502,

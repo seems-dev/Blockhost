@@ -23,10 +23,11 @@ if settings.database_url.startswith("sqlite"):
                 db_path.parent.mkdir(parents=True, exist_ok=True)
             else:
                 db_path.parent.mkdir(parents=True, exist_ok=True)
+            print(f"DATABASE PATH IS {db_path.absolute()}")
     except Exception:
         # Best-effort; create_engine will raise a clear error if still invalid.
         pass
-    connect_args = {"check_same_thread": False}
+    connect_args = {"check_same_thread": False, "timeout": 15.0}
 
 engine = create_engine(settings.database_url, pool_pre_ping=True, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

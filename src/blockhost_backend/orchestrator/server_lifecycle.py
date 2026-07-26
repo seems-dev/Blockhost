@@ -16,6 +16,7 @@ from blockhost_backend.database.schema import (
     User,
 )
 from blockhost_backend.minecraft.java_compat import is_java_flavor, required_java_version
+from blockhost_backend.minecraft.binary_manager import ensure_binary_installed
 from blockhost_backend.orchestrator.resources import get_effective_server_resource_limits
 from blockhost_backend.runtime.interface import (
     LogEntry,
@@ -82,24 +83,29 @@ class ServerLifecycleOrchestrator:
         limits = get_effective_server_resource_limits(db=db, server=server)
         mc_config = server.mc_config or {}
         is_java = is_java_flavor(server.flavor)
-        executable_name = (
-            mc_config.get("executable_name")
-            if is_java
-            else (settings.bedrock_executable_name or None)
-        )
         requested_version = (
             str(server.mc_version or "")
             if is_java
             else str(mc_config.get("template_version") or "")
         ) or None
+        
+        # Ensure binary is installed and get path
+        if not requested_version:
+            requested_version = "recommended" if not is_java else "1.21.4"
+            
+        # We need db for ensure_binary_installed
+        if db is None:
+            raise RuntimeError("Database session is required to start server")
+            
+        binary = ensure_binary_installed(db, server.flavor, requested_version)
 
         result = self._runtime.start_server(
             RuntimeStartRequest(
                 server_id=str(server.id),
                 server_dir=server_dir,
                 port=server.vm_port,
-                requested_version=requested_version,
-                executable_name=executable_name,
+                requested_version=binary.version,
+                executable_path=Path(binary.executable_path),
                 ram_mb=limits["ram_mb"],
                 cpu_quota_pct=limits["cpu_quota_pct"],
                 flavor=server.flavor.value if server.flavor else None,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import timedelta
+from datetime import timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -30,7 +30,12 @@ def is_node_heartbeat_fresh(node: Node, *, now=None) -> bool:
     if node.last_heartbeat is None:
         return False
     now = now or utcnow()
-    return (now - node.last_heartbeat) <= timedelta(seconds=HEARTBEAT_STALE_SECONDS)
+    last_heartbeat = node.last_heartbeat
+    if last_heartbeat.tzinfo is None:
+        last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return (now - last_heartbeat) <= timedelta(seconds=HEARTBEAT_STALE_SECONDS)
 
 
 def compute_node_allocated_ram_mb(db: Session, node_id: uuid.UUID) -> int:

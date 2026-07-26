@@ -10,31 +10,31 @@ import time
 import uuid
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from blockhost_backend.config.config_manager import get_settings
+from blockhost_backend.config.config_manager import get_settings, resolve_data_path
 from blockhost_backend.database.db import SessionLocal
 from blockhost_backend.database.schema import (
     Backup,
     BackupConsistencyMethod,
     BackupJob,
-
+    BackupKind,
     BackupSchedule,
-
     BackupStatus,
+    BackupStorageBackend,
     RestoreJob,
     RestoreStatus,
     Server,
-    User,
     utcnow,
 )
 from blockhost_backend.minecraft.java_compat import is_java_flavor
 from blockhost_backend.orchestrator.lifecycle_manager import get_server_lifecycle_orchestrator
+from blockhost_backend.services.api_cache import get_api_cache
 from blockhost_backend.services.system_health import assert_disk_usage_safe
 
 _ORCHESTRATOR = get_server_lifecycle_orchestrator()
@@ -63,26 +63,33 @@ ACTIVE_RESTORE_STATUSES = {
     RestoreStatus.starting_server,
 }
 
+
 class BackupRestoreError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
 
-from blockhost_backend.services.api_cache import get_api_cache
+
+@dataclass(frozen=True)
+class StoredBackupArtifact:
+    path: Path
+    checksum_sha256: str
+    size_bytes: int
+
 
 def server_backup_restore_lock(server_id: uuid.UUID | str):
     return get_api_cache().lock(f"lock:backup:{server_id}", timeout=3600)
 
 
 def backup_storage_root() -> Path:
-    root = Path(get_settings().backup_storage_dir).resolve()
+    root = resolve_data_path(get_settings().backup_storage_dir)
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
 def backup_tmp_root() -> Path:
-    root = Path(get_settings().backup_temp_dir).resolve()
+    root = resolve_data_path(get_settings().backup_temp_dir)
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -112,7 +119,7 @@ def _require_server_dir(server: Server) -> Path:
 
     settings = get_settings()
     server_dir = Path(str(raw)).resolve()
-    servers_root = Path(settings.bedrock_servers_dir).resolve()
+    servers_root = resolve_data_path(settings.bedrock_servers_dir)
     try:
         server_dir.relative_to(servers_root)
     except ValueError:
@@ -127,14 +134,27 @@ def _world_name(server: Server) -> str:
     return str(cfg.get("level_name") or server.world_name)
 
 
+def _resolve_existing_world_path(server_dir: Path, world_name: str, *, java_flavor: bool) -> Path | None:
+    candidates: list[Path] = []
+    if world_name:
+        candidates.append(server_dir / world_name)
+    if java_flavor:
+        candidates.extend([server_dir / "world", server_dir / "world"])
+    else:
+        candidates.append(server_dir / "worlds" / world_name)
+        candidates.append(server_dir / "worlds")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _included_backup_paths(server: Server, server_dir: Path, world_name: str) -> list[tuple[Path, str]]:
     candidates: list[tuple[Path, str]] = []
     if is_java_flavor(server.flavor):
-        world_path = server_dir / "world"
-        if world_path.exists():
+        world_path = _resolve_existing_world_path(server_dir, world_name, java_flavor=True)
+        if world_path is not None:
             candidates.append((world_path, "java/world"))
-        else:
-            raise BackupRestoreError("world_missing", "No Java world directory found for this server")
         for filename in (
             "server.properties",
             "eula.txt",
@@ -148,15 +168,16 @@ def _included_backup_paths(server: Server, server_dir: Path, world_name: str) ->
                 candidates.append((path, f"java/{filename}"))
         return candidates
 
-    world_path = server_dir / "worlds" / world_name
+    world_path = _resolve_existing_world_path(server_dir, world_name, java_flavor=False)
     worlds_path = server_dir / "worlds"
 
-    if world_path.exists():
-        candidates.append((world_path, f"bedrock/worlds/{world_name}"))
+    if world_path is not None:
+        if world_path == worlds_path:
+            candidates.append((worlds_path, "bedrock/worlds"))
+        else:
+            candidates.append((world_path, f"bedrock/worlds/{world_name}"))
     elif worlds_path.exists():
         candidates.append((worlds_path, "bedrock/worlds"))
-    else:
-        raise BackupRestoreError("world_missing", "No worlds directory found for this server")
 
     for filename in (
         "server.properties",
@@ -174,16 +195,25 @@ def _included_backup_paths(server: Server, server_dir: Path, world_name: str) ->
 
 def _backup_world_size_path(server: Server, server_dir: Path, world_name: str) -> Path:
     if is_java_flavor(server.flavor):
+        world_path = _resolve_existing_world_path(server_dir, world_name, java_flavor=True)
+        if world_path is not None:
+            return world_path
         return server_dir / "world"
-    world_path = server_dir / "worlds" / world_name
-    if world_path.exists():
+    world_path = _resolve_existing_world_path(server_dir, world_name, java_flavor=False)
+    if world_path is not None:
         return world_path
     return server_dir / "worlds"
 
 
 def _active_world_path(server: Server, server_dir: Path) -> Path:
     if is_java_flavor(server.flavor):
+        world_path = _resolve_existing_world_path(server_dir, str((server.mc_config or {}).get("level_name") or server.world_name), java_flavor=True)
+        if world_path is not None:
+            return world_path
         return server_dir / "world"
+    world_path = _resolve_existing_world_path(server_dir, str((server.mc_config or {}).get("level_name") or server.world_name), java_flavor=False)
+    if world_path is not None:
+        return world_path
     return server_dir / "worlds"
 
 
@@ -287,6 +317,42 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _fsync_file(path: Path) -> None:
+    try:
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
+    except OSError:
+        logger.debug("Could not fsync file %s", path, exc_info=True)
+
+
+def _fsync_dir(path: Path) -> None:
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        logger.debug("Could not open directory for fsync: %s", path, exc_info=True)
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        logger.debug("Could not fsync directory %s", path, exc_info=True)
+    finally:
+        os.close(fd)
+
+
+def _write_text_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4()}.tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        _fsync_file(tmp)
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def _safe_rmtree(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
@@ -306,7 +372,73 @@ def _cleanup_backup_staging(staging: Path | None) -> None:
 
 def _atomic_replace(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
+    _fsync_file(src)
     os.replace(src, dst)
+    _fsync_dir(dst.parent)
+
+
+def _verify_local_backup_artifact(path: Path, *, expected_checksum: str, expected_size: int) -> StoredBackupArtifact:
+    if not path.exists() or not path.is_file():
+        raise BackupRestoreError("backup_object_missing", "Backup archive was not created in storage")
+
+    size = path.stat().st_size
+    if size <= 0:
+        raise BackupRestoreError("backup_object_empty", "Backup archive is empty")
+    if size != expected_size:
+        raise BackupRestoreError("backup_object_size_mismatch", "Backup archive size changed after storage commit")
+
+    checksum = _sha256_file(path)
+    if checksum != expected_checksum:
+        raise BackupRestoreError("checksum_mismatch", "Backup archive checksum verification failed after storage commit")
+
+    checksum_path = path.with_suffix(path.suffix + ".sha256")
+    if not checksum_path.exists() or checksum_path.read_text(encoding="utf-8").strip() != expected_checksum:
+        raise BackupRestoreError("checksum_sidecar_missing", "Backup checksum sidecar was not created correctly")
+
+    return StoredBackupArtifact(path=path, checksum_sha256=checksum, size_bytes=size)
+
+
+def verify_backup_artifact(backup: Backup) -> StoredBackupArtifact:
+    path = backup_object_path(backup.server_id, backup.id)
+    if not path.exists() or not path.is_file():
+        raise BackupRestoreError("backup_object_missing", "Backup archive is missing from storage")
+
+    size = path.stat().st_size
+    if size <= 0:
+        raise BackupRestoreError("backup_object_empty", "Backup archive is empty")
+    if backup.size_bytes and size != backup.size_bytes:
+        raise BackupRestoreError("backup_object_size_mismatch", "Backup archive size does not match metadata")
+
+    checksum = _sha256_file(path)
+    if backup.checksum_sha256 and checksum != backup.checksum_sha256:
+        raise BackupRestoreError("checksum_mismatch", "Backup archive checksum verification failed")
+
+    checksum_path = path.with_suffix(path.suffix + ".sha256")
+    if backup.checksum_sha256:
+        if not checksum_path.exists():
+            raise BackupRestoreError("checksum_sidecar_missing", "Backup checksum sidecar is missing")
+        if checksum_path.read_text(encoding="utf-8").strip() != backup.checksum_sha256:
+            raise BackupRestoreError("checksum_sidecar_mismatch", "Backup checksum sidecar does not match metadata")
+
+    return StoredBackupArtifact(
+        path=path,
+        checksum_sha256=backup.checksum_sha256 or checksum,
+        size_bytes=size,
+    )
+
+
+def _commit_local_backup_artifact(temp_archive: Path, final_archive: Path) -> StoredBackupArtifact:
+    if not temp_archive.exists() or not temp_archive.is_file():
+        raise BackupRestoreError("backup_temp_missing", "Backup archive was not created in temporary storage")
+
+    checksum = _sha256_file(temp_archive)
+    size = temp_archive.stat().st_size
+    if size <= 0:
+        raise BackupRestoreError("backup_temp_empty", "Backup archive is empty")
+
+    _atomic_replace(temp_archive, final_archive)
+    _write_text_atomic(final_archive.with_suffix(final_archive.suffix + ".sha256"), f"{checksum}\n")
+    return _verify_local_backup_artifact(final_archive, expected_checksum=checksum, expected_size=size)
 
 
 def _stop_server(server: Server) -> None:
@@ -318,7 +450,7 @@ def _stop_server(server: Server) -> None:
 
 def _start_server(server: Server, db: Session) -> None:
     settings = get_settings()
-    servers_dir = Path(settings.bedrock_servers_dir).resolve()
+    servers_dir = resolve_data_path(settings.bedrock_servers_dir)
     _ORCHESTRATOR.start_server(
         server=server,
         settings=settings,
@@ -348,10 +480,15 @@ def _save_resume_best_effort(server_id: str) -> None:
 
 def run_backup_job(job_id: uuid.UUID) -> None:
     db = SessionLocal()
+    job: BackupJob | None = None
+    backup: Backup | None = None
+    server: Server | None = None
     save_held = False
     server_was_running = False
     stopped_for_backup = False
     temp_archive: Path | None = None
+    final_archive: Path | None = None
+    completed = False
 
     try:
         job = db.get(BackupJob, job_id)
@@ -384,7 +521,6 @@ def run_backup_job(job_id: uuid.UUID) -> None:
 
             server_dir = _require_server_dir(server)
             world_name = _world_name(server)
-            owner = db.get(User, backup.owner_id)
             assert_disk_usage_safe("run_backup_job")
             
             includes = _included_backup_paths(server, server_dir, world_name)
@@ -414,12 +550,8 @@ def run_backup_job(job_id: uuid.UUID) -> None:
             if temp_archive.exists():
                 temp_archive.unlink(missing_ok=True)
 
-            has_worlds = any(
-                archive_name.startswith("bedrock/worlds") or archive_name.startswith("java/world")
-                for _, archive_name in includes
-            )
-            if not has_worlds:
-                raise BackupRestoreError("invalid_backup_contents", "Backup contents have no worlds content")
+            if not includes:
+                raise BackupRestoreError("invalid_backup_contents", "Backup contents are empty")
 
             processed = 0
             with tarfile.open(temp_archive, "w:gz") as tar:
@@ -441,18 +573,14 @@ def run_backup_job(job_id: uuid.UUID) -> None:
             db.commit()
 
             _update_backup_job(db, job, BackupStatus.verifying, "verifying", 85, 95)
-            checksum = _sha256_file(temp_archive)
-            size = temp_archive.stat().st_size
-            _atomic_replace(temp_archive, final_archive)
-            if temp_archive.exists():
-                temp_archive.unlink(missing_ok=True)
-            final_archive.with_suffix(final_archive.suffix + ".sha256").write_text(checksum, encoding="utf-8")
+            artifact = _commit_local_backup_artifact(temp_archive, final_archive)
+            temp_archive = None
 
             completed_at = utcnow()
             backup.status = BackupStatus.completed
             backup.storage_key = backup_storage_key(server.id, backup.id)
-            backup.checksum_sha256 = checksum
-            backup.size_bytes = size
+            backup.checksum_sha256 = artifact.checksum_sha256
+            backup.size_bytes = artifact.size_bytes
             backup.completed_at = completed_at
             backup.failure_code = None
             backup.failure_message = None
@@ -465,6 +593,7 @@ def run_backup_job(job_id: uuid.UUID) -> None:
             server.last_backup_at = completed_at
             server.backup_count = (server.backup_count or 0) + 1
             db.commit()
+            completed = True
 
             retention_count = None
             if backup.schedule_id:
@@ -488,14 +617,14 @@ def run_backup_job(job_id: uuid.UUID) -> None:
 
         code = getattr(exc, "code", "backup_failed")
         message = getattr(exc, "message", str(exc))
-        if "job" in locals() and job:
+        if job:
             job.status = BackupStatus.failed
             job.phase = "failed"
             job.error_code = code
             job.error_message = message
             job.completed_at = utcnow()
             job.updated_at = utcnow()
-        if "backup" in locals() and backup:
+        if backup:
             backup.status = BackupStatus.failed
             backup.failure_code = code
             backup.failure_message = message
@@ -508,6 +637,9 @@ def run_backup_job(job_id: uuid.UUID) -> None:
     finally:
         if temp_archive and temp_archive.exists():
             temp_archive.unlink(missing_ok=True)
+        if final_archive and not completed and backup and backup.status != BackupStatus.completed:
+            final_archive.unlink(missing_ok=True)
+            final_archive.with_suffix(final_archive.suffix + ".sha256").unlink(missing_ok=True)
         db.close()
 
 
@@ -588,13 +720,8 @@ def run_restore_job(job_id: uuid.UUID) -> None:
             if backup.server_id != server.id:
                 raise BackupRestoreError("backup_server_mismatch", "Backup does not belong to this server")
 
-            archive = backup_object_path(server.id, backup.id)
-            if not archive.exists():
-                raise BackupRestoreError("backup_object_missing", "Backup archive is missing from storage")
-
             _update_restore_job(db, job, RestoreStatus.validating_backup, "validating_backup", 5)
-            if backup.checksum_sha256 and _sha256_file(archive) != backup.checksum_sha256:
-                raise BackupRestoreError("checksum_mismatch", "Backup checksum verification failed")
+            archive = verify_backup_artifact(backup).path
             _validate_archive_members(archive)
 
             server_dir = _require_server_dir(server)
@@ -746,21 +873,106 @@ def next_schedule_run(schedule: BackupSchedule, *, from_time=None):
 
 
 def dispatch_due_backup_schedules() -> int:
-    # Automatic backup scheduler is disabled as per requirements.
-    return 0
+    db = SessionLocal()
+    try:
+        now = utcnow()
+        due_schedules = db.execute(
+            select(BackupSchedule)
+            .where(
+                BackupSchedule.enabled.is_(True),
+                BackupSchedule.next_run_at <= now,
+            )
+        ).scalars().all()
+        
+        dispatched_count = 0
+        for schedule in due_schedules:
+            server = db.get(Server, schedule.server_id)
+            if not server:
+                schedule.enabled = False
+                continue
+
+            if schedule.skip_if_server_offline:
+                is_running = _ORCHESTRATOR.is_running(str(server.id))
+                if not is_running:
+                    schedule.next_run_at = next_schedule_run(schedule, from_time=now)
+                    continue
+
+            if schedule.defer_if_job_active:
+                active_job = db.execute(
+                    select(BackupJob).where(
+                        BackupJob.server_id == server.id,
+                        BackupJob.status.in_(ACTIVE_BACKUP_STATUSES)
+                    )
+                ).scalars().first()
+                if active_job:
+                    # Defer for a bit (e.g. 5 minutes) to try again
+                    schedule.next_run_at = now + timedelta(minutes=5)
+                    continue
+
+            world_name = str((server.mc_config or {}).get("level_name") or server.world_name)
+            backup = Backup(
+                server_id=server.id,
+                owner_id=schedule.owner_id,
+                created_by_user_id=schedule.owner_id,
+                kind=BackupKind.scheduled,
+                status=BackupStatus.pending,
+                name=f"Automated Backup - {now.strftime('%Y-%m-%d %H:%M:%S')}",
+                description="Automatically created by backup schedule",
+                world_name=world_name,
+                storage_backend=BackupStorageBackend.local,
+                storage_key=backup_storage_key(server.id, uuid.uuid4()),
+                schedule_id=schedule.id,
+            )
+            db.add(backup)
+            db.flush()
+            backup.storage_key = backup_storage_key(server.id, backup.id)
+
+            job = BackupJob(
+                backup_id=backup.id,
+                server_id=server.id,
+                requested_by_user_id=schedule.owner_id,
+                status=BackupStatus.pending,
+                phase="pending",
+                force_offline=False,
+            )
+            db.add(job)
+            
+            schedule.last_run_at = now
+            schedule.next_run_at = next_schedule_run(schedule, from_time=now)
+            db.commit()
+            db.refresh(job)
+
+            submit_backup_job(job.id)
+            dispatched_count += 1
+            
+        return dispatched_count
+    except Exception as exc:
+        logger.error("Error in dispatch_due_backup_schedules: %s", exc)
+        return 0
+    finally:
+        db.close()
 
 
-def _scheduler_loop() -> None:
-    # Automatic backup scheduler is disabled as per requirements.
-    pass
+def _scheduler_loop(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        dispatch_due_backup_schedules()
+        # Sleep for a bit before checking again
+        stop_event.wait(60.0)
 
 
 def run_backup_scheduler_forever(*, stop_event: threading.Event | None = None) -> None:
-    # Automatic backup scheduler is disabled as per requirements.
-    logger.info("Backup scheduler is disabled")
-    return
+    logger.info("Backup scheduler is starting")
+    evt = stop_event or threading.Event()
+    _scheduler_loop(evt)
+    logger.info("Backup scheduler stopped")
 
 
 def start_backup_scheduler_once() -> None:
-    # Automatic backup scheduler is disabled as per requirements.
-    return
+    global _SCHEDULER_STARTED
+    with _SCHEDULER_GUARD:
+        if _SCHEDULER_STARTED:
+            return
+        _SCHEDULER_STARTED = True
+    
+    t = threading.Thread(target=run_backup_scheduler_forever, name="backup-scheduler", daemon=True)
+    t.start()

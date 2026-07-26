@@ -9,6 +9,7 @@ import threading
 from blockhost_backend.config.config_manager import get_settings
 from blockhost_backend.services.billing import start_subscription_expiration_worker_once
 from blockhost_backend.services.system_health import start_disk_health_monitor_once
+from blockhost_backend.orchestrator.backup import start_backup_scheduler_once
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ def start_background_workers() -> None:
     start_subscription_expiration_worker_once()
     start_disk_health_monitor_once()
     start_node_watchdog_once()
+    start_backup_scheduler_once()
     logger.info("Background workers started")
 
 

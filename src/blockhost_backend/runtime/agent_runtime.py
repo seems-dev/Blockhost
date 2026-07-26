@@ -47,7 +47,7 @@ class AgentRuntime:
             "server_dir_rel": request.server_id,
             "port": request.port,
             "requested_version": request.requested_version,
-            "executable_name": request.executable_name,
+            "executable_path": str(request.executable_path) if request.executable_path else None,
             "ram_mb": request.ram_mb,
             "cpu_quota_pct": request.cpu_quota_pct,
             "jdk_path": str(request.jdk_path) if request.jdk_path else None,

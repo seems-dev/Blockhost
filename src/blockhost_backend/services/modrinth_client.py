@@ -59,7 +59,7 @@ def get_modrinth_client() -> httpx.AsyncClient:
         _client = httpx.AsyncClient(
             base_url=MODRINTH_API_BASE,
             headers={"User-Agent": _USER_AGENT},
-            timeout=15.0,
+            timeout=8.0,  # Reduced from 15s; cached results absorb most retries
             follow_redirects=True,
         )
     return _client

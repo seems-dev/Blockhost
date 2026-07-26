@@ -69,7 +69,9 @@ async def get_admin_user(user: User = Depends(get_current_user)) -> User:
 def auth_rate_limit() -> Callable:
     async def _dep(request: Request) -> None:
         settings = get_settings()
-        client_ip = request.client.host if request.client else "unknown"
+        # Use X-Forwarded-For from Caddy to get real client IP; fall back to direct connection
+        xff = request.headers.get("x-forwarded-for")
+        client_ip = xff.split(",")[0].strip() if xff else (request.client.host if request.client else "unknown")
         check_rate_limit(
             f"rl:auth:{client_ip}",
             limit=settings.rate_limit_auth_per_minute,
@@ -82,7 +84,8 @@ def auth_rate_limit() -> Callable:
 def upload_rate_limit() -> Callable:
     async def _dep(request: Request) -> None:
         settings = get_settings()
-        client_ip = request.client.host if request.client else "unknown"
+        xff = request.headers.get("x-forwarded-for")
+        client_ip = xff.split(",")[0].strip() if xff else (request.client.host if request.client else "unknown")
         check_rate_limit(
             f"rl:upload:{client_ip}",
             limit=settings.rate_limit_upload_per_minute,

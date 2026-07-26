@@ -56,7 +56,7 @@ class SystemdRuntime:
     def start_server(self, request: RuntimeStartRequest) -> RuntimeStartResult:
         server_dir = request.server_dir.resolve()
         self._server_dirs[request.server_id] = server_dir
-        executable = self._find_executable(server_dir, request.executable_name)
+        executable = request.executable_path.resolve()
         self._ensure_executable(executable)
 
         unit = self._unit_name(request.server_id)
@@ -116,13 +116,10 @@ class SystemdRuntime:
                 ])
             
             flags_str = " ".join(jvm_flags)
-            exe_cmd = f"exec 3<> stdin.fifo; exec '{java_bin}' {flags_str} -jar {executable.name} nogui <&3"
+            exe_cmd = f"exec 3<> stdin.fifo; exec '{java_bin}' {flags_str} -jar '{executable}' nogui <&3"
         else:
             # --- BEDROCK STARTUP LOGIC ---
-            if executable.parent == server_dir:
-                exe_cmd = f"exec 3<> stdin.fifo; exec ./{executable.name} <&3"
-            else:
-                exe_cmd = f"exec 3<> stdin.fifo; exec '{executable.resolve()}' <&3"
+            exe_cmd = f"exec 3<> stdin.fifo; exec '{executable}' <&3"
 
         cmd = [
             "systemd-run",
@@ -437,21 +434,6 @@ class SystemdRuntime:
         return version
 
     # ---------------- EXECUTABLE ----------------
-    def _find_executable(self, server_dir: Path, preferred: str | None) -> Path:
-        candidates: list[str] = []
-        if preferred:
-            candidates.append(preferred)
-
-        # If preferred is not a JAR, fall back to common Bedrock binaries
-        if not (preferred and preferred.endswith(".jar")):
-            candidates += list(_COMMON_BEDROCK_BINARIES)
-
-        for name in candidates:
-            path = Path(name) if Path(name).is_absolute() else server_dir / name
-            if path.exists():
-                return path
-
-        raise FileNotFoundError("Server executable (JAR or binary) not found")
 
     def _ensure_executable(self, exe: Path) -> None:
         if os.name == "nt" or exe.suffix == ".jar":

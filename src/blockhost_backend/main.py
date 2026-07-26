@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -25,9 +27,18 @@ from blockhost_backend.services.health import check_system_health
 from blockhost_backend.services.startup import bootstrap_application_data, bootstrap_database
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    bootstrap_database()
+    bootstrap_application_data()
+    if should_run_workers_in_api():
+        start_background_workers()
+    yield
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="BlockHost Backend", version="0.1.0")
+    app = FastAPI(title="BlockHost Backend", version="0.1.0", lifespan=lifespan)
 
     app.add_middleware(
         CORSMiddleware,
@@ -37,6 +48,11 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
         max_age=600,
     )
+
+    @app.get("/ping", include_in_schema=False)
+    def ping() -> dict:
+        """Lightweight liveness probe — no DB or Redis required."""
+        return {"status": "ok"}
 
     @app.get("/health")
     def health(db: Session = Depends(get_db)) -> dict:
@@ -60,9 +76,4 @@ def create_app() -> FastAPI:
 app = create_app()
 
 
-@app.on_event("startup")
-def _startup() -> None:
-    bootstrap_database()
-    bootstrap_application_data()
-    if should_run_workers_in_api():
-        start_background_workers()
+

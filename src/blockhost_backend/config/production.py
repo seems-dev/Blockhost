@@ -43,6 +43,16 @@ def validate_production_settings(settings: Settings) -> None:
     if settings.allow_auto_node_registration:
         errors.append("ALLOW_AUTO_NODE_REGISTRATION must be false in production")
 
+    if not settings.minecraft_public_host or settings.minecraft_public_host in ("", "localhost", "127.0.0.1"):
+        errors.append("MINECRAFT_PUBLIC_HOST must be set to your public domain or IP in production")
+
+    if settings.rate_limit_auth_per_minute > 10:
+        import logging
+        logging.getLogger(__name__).warning(
+            "RATE_LIMIT_AUTH_PER_MINUTE is %d — consider setting to 5-10 for production brute-force protection.",
+            settings.rate_limit_auth_per_minute,
+        )
+
     if errors:
         raise RuntimeError(
             "Production configuration invalid:\n" + "\n".join(f"  - {e}" for e in errors)

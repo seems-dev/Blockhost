@@ -144,7 +144,7 @@ class _AgentProxy:
         a simple namespace is a perfect duck-type substitute.
         """
         from types import SimpleNamespace
-        return SimpleNamespace(ip_address="127.0.0.1", agent_port=_LOCAL_AGENT_PORT)
+        return SimpleNamespace(ip_address="192.168.29.102", agent_port=_LOCAL_AGENT_PORT)
 
     def list(self, subdir: str) -> list[str]:
         try:

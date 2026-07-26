@@ -1,6 +1,8 @@
-from pathlib import Path
-import uuid
 import os
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+
 import httpx
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
@@ -12,6 +14,7 @@ from blockhost_backend.database.db import get_db
 from blockhost_backend.database.schema import Server, User, Node
 from blockhost_backend.api.schemas import FileInfo, FileWriteRequest
 from blockhost_backend.config.config_manager import get_settings
+from blockhost_backend.minecraft.java_compat import is_java_flavor
 from blockhost_backend.services.system_health import (
     DiskProtectionError,
     WorldSizeLimitError,
@@ -21,12 +24,60 @@ from blockhost_backend.services.system_health import (
 
 router = APIRouter(prefix="/api/servers/{server_id}/files", tags=["files"])
 
-ALLOWED_ROOTS = {
-    "worlds",
-    "development_behavior_packs",
-    "development_resource_packs",
-    "development_skin_packs",
-}
+@dataclass(frozen=True)
+class FileAccessPolicy:
+    roots: frozenset[str]
+    root_files: frozenset[str]
+
+
+BEDROCK_FILE_POLICY = FileAccessPolicy(
+    roots=frozenset(
+        {
+            "worlds",
+            "behavior_packs",
+            "resource_packs",
+            "skin_packs",
+            "world_templates",
+            "development_behavior_packs",
+            "development_resource_packs",
+            "development_skin_packs",
+        }
+    ),
+    root_files=frozenset(
+        {
+            "server.properties",
+            "allowlist.json",
+            "permissions.json",
+            "valid_known_packs.json",
+            "world_behavior_packs.json",
+            "world_resource_packs.json",
+        }
+    ),
+)
+
+JAVA_FILE_POLICY = FileAccessPolicy(
+    roots=frozenset(
+        {
+            "world",
+            "world_nether",
+            "world_the_end",
+            "worlds",
+            "mods",
+            "plugins",
+            "config",
+        }
+    ),
+    root_files=frozenset(
+        {
+            "server.properties",
+            "eula.txt",
+            "ops.json",
+            "whitelist.json",
+            "banned-players.json",
+            "banned-ips.json",
+        }
+    ),
+)
 
 TEXT_EXTENSIONS = {
     ".json", ".txt", ".mcfunction", ".properties", ".yml", ".yaml", ".ini", ".cfg", ".lang", ".mcmeta",
@@ -43,12 +94,56 @@ def _guard_disk_for_operation(operation: str) -> None:
         raise HTTPException(status_code=503, detail={"error": exc.message})
 
 
-def _guard_world_size_after_upload(server_root: Path, user: User) -> None:
+def _guard_world_size_after_upload(server: Server, server_root: Path, user: User) -> None:
     worlds_root = server_root / "worlds"
     try:
-        assert_world_size_within_plan(worlds_root)
+        assert_world_size_within_plan(worlds_root, server)
     except WorldSizeLimitError as exc:
         raise HTTPException(status_code=413, detail={"error": exc.message})
+
+
+def _file_access_policy(server: Server) -> FileAccessPolicy:
+    return JAVA_FILE_POLICY if is_java_flavor(server.flavor) else BEDROCK_FILE_POLICY
+
+
+def _parse_relative_parts(requested_path: str) -> tuple[str, ...]:
+    clean = requested_path.strip().lstrip("/")
+    if not clean:
+        return ()
+    parts = tuple(part for part in clean.split("/") if part)
+    if any(part in {".", ".."} for part in parts):
+        raise HTTPException(status_code=403, detail="Path traversal detected")
+    return parts
+
+
+def _validate_file_policy_path(
+    requested_path: str,
+    policy: FileAccessPolicy,
+    *,
+    allow_root: bool = False,
+    allow_root_file: bool = True,
+) -> tuple[str, ...]:
+    parts = _parse_relative_parts(requested_path)
+    if not parts:
+        if allow_root:
+            return parts
+        raise HTTPException(status_code=403, detail="Access denied to this folder")
+
+    if len(parts) == 1 and parts[0] in policy.root_files:
+        if allow_root_file:
+            return parts
+        raise HTTPException(status_code=403, detail="Access denied to this folder")
+
+    if parts[0] not in policy.roots:
+        raise HTTPException(status_code=403, detail="Access denied to this folder")
+    return parts
+
+
+def _agent_policy_params(policy: FileAccessPolicy, extra: dict | None = None) -> dict:
+    params = dict(extra or {})
+    params["allowed_roots"] = ",".join(sorted(policy.roots))
+    params["allowed_files"] = ",".join(sorted(policy.root_files))
+    return params
 
 
 def _get_server(server_id: str, user: User, db: Session) -> Server:
@@ -76,22 +171,25 @@ def _get_local_server_root(server: Server) -> Path:
     return server_root
 
 
-def _validate_safe_path(server_root: Path, requested_path: str) -> Path:
+def _validate_safe_path(
+    server_root: Path,
+    requested_path: str,
+    policy: FileAccessPolicy,
+    *,
+    allow_root: bool = False,
+    allow_root_file: bool = True,
+) -> Path:
+    _validate_file_policy_path(
+        requested_path,
+        policy,
+        allow_root=allow_root,
+        allow_root_file=allow_root_file,
+    )
     requested_path = requested_path.lstrip("/")
     resolved = (server_root / requested_path).resolve()
 
     if not resolved.is_relative_to(server_root):
         raise HTTPException(status_code=403, detail="Path traversal detected")
-
-    is_allowed = False
-    for allowed in ALLOWED_ROOTS:
-        allowed_path = (server_root / allowed).resolve()
-        if resolved.is_relative_to(allowed_path) or resolved == allowed_path:
-            is_allowed = True
-            break
-
-    if not is_allowed:
-        raise HTTPException(status_code=403, detail="Access denied to this folder")
 
     return resolved
 
@@ -136,16 +234,18 @@ def list_files(
     db: Session = Depends(get_db),
 ):
     server = _get_server(server_id, user, db)
+    policy = _file_access_policy(server)
     if server.node_id:
         node = db.get(Node, server.node_id)
         if node:
-            return _proxy_get(node, str(server.id), "list", {"path": path})
+            _validate_file_policy_path(path, policy, allow_root=True)
+            return _proxy_get(node, str(server.id), "list", _agent_policy_params(policy, {"path": path}))
 
     # Local fallback
     server_root = _get_local_server_root(server)
     if not path or path.strip() == "/":
         results = []
-        for folder in ALLOWED_ROOTS:
+        for folder in sorted(policy.roots):
             folder_path = server_root / folder
             if folder_path.exists() and folder_path.is_dir():
                 stat = folder_path.stat()
@@ -158,9 +258,22 @@ def list_files(
                         last_modified=stat.st_mtime,
                     )
                 )
+        for filename in sorted(policy.root_files):
+            file_path = server_root / filename
+            if file_path.exists() and file_path.is_file():
+                stat = file_path.stat()
+                results.append(
+                    FileInfo(
+                        name=filename,
+                        path=filename,
+                        is_dir=False,
+                        size=stat.st_size,
+                        last_modified=stat.st_mtime,
+                    )
+                )
         return results
 
-    target_dir = _validate_safe_path(server_root, path)
+    target_dir = _validate_safe_path(server_root, path, policy)
     if not target_dir.exists():
         raise HTTPException(status_code=404, detail="Path does not exist")
     if not target_dir.is_dir():
@@ -180,7 +293,7 @@ def list_files(
                 last_modified=stat.st_mtime,
             )
         )
-    
+
     results.sort(key=lambda x: (not x.is_dir, x.name.lower()))
     return results
 
@@ -193,13 +306,15 @@ def read_file(
     db: Session = Depends(get_db),
 ):
     server = _get_server(server_id, user, db)
+    policy = _file_access_policy(server)
     if server.node_id:
         node = db.get(Node, server.node_id)
         if node:
-            return _proxy_get(node, str(server.id), "read", {"path": path})
+            _validate_file_policy_path(path, policy)
+            return _proxy_get(node, str(server.id), "read", _agent_policy_params(policy, {"path": path}))
 
     server_root = _get_local_server_root(server)
-    target_file = _validate_safe_path(server_root, path)
+    target_file = _validate_safe_path(server_root, path, policy)
 
     if not target_file.exists() or not target_file.is_file():
         raise HTTPException(status_code=404, detail="File not found")
@@ -224,13 +339,15 @@ def write_file(
     db: Session = Depends(get_db),
 ):
     server = _get_server(server_id, user, db)
+    policy = _file_access_policy(server)
     if server.node_id:
         node = db.get(Node, server.node_id)
         if node:
-            return _proxy_put(node, str(server.id), "write", {"path": path}, {"content": payload.content})
+            _validate_file_policy_path(path, policy)
+            return _proxy_put(node, str(server.id), "write", _agent_policy_params(policy, {"path": path}), {"content": payload.content})
 
     server_root = _get_local_server_root(server)
-    target_file = _validate_safe_path(server_root, path)
+    target_file = _validate_safe_path(server_root, path, policy)
 
     content_bytes = payload.content.encode("utf-8")
     if len(content_bytes) > MAX_EDIT_SIZE:
@@ -249,18 +366,20 @@ def download_file(
     db: Session = Depends(get_db),
 ):
     server = _get_server(server_id, user, db)
+    policy = _file_access_policy(server)
     if server.node_id:
         node = db.get(Node, server.node_id)
         if node:
+            _validate_file_policy_path(path, policy)
             url = _get_agent_url(node, str(server.id), "download")
             headers = {"Authorization": f"Bearer {get_settings().worker_agent_token}"}
             client = httpx.Client()
-            req = client.build_request("GET", url, params={"path": path}, headers=headers)
+            req = client.build_request("GET", url, params=_agent_policy_params(policy, {"path": path}), headers=headers)
             resp = client.send(req, stream=True)
             if resp.status_code >= 400:
                 resp.close()
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)
-            
+
             return StreamingResponse(
                 resp.iter_bytes(),
                 media_type=resp.headers.get("content-type"),
@@ -269,7 +388,7 @@ def download_file(
             )
 
     server_root = _get_local_server_root(server)
-    target_file = _validate_safe_path(server_root, path)
+    target_file = _validate_safe_path(server_root, path, policy)
 
     if not target_file.exists() or not target_file.is_file():
         raise HTTPException(status_code=404, detail="File not found")
@@ -291,15 +410,17 @@ async def upload_file(
     _: None = Depends(upload_rate_limit()),
 ):
     server = _get_server(server_id, user, db)
-    
+    policy = _file_access_policy(server)
+
     if server.node_id:
         node = db.get(Node, server.node_id)
         if node:
+            _validate_file_policy_path(path, policy, allow_root_file=False)
             url = _get_agent_url(node, str(server.id), "upload")
             headers = {"Authorization": f"Bearer {get_settings().worker_agent_token}"}
             async with httpx.AsyncClient() as client:
                 files_payload = {"file": (file.filename, file.file, file.content_type)}
-                resp = await client.post(url, params={"path": path}, headers=headers, files=files_payload, timeout=300.0)
+                resp = await client.post(url, params=_agent_policy_params(policy, {"path": path}), headers=headers, files=files_payload, timeout=300.0)
                 if resp.status_code >= 400:
                     raise HTTPException(status_code=resp.status_code, detail=resp.text)
                 return resp.json()
@@ -307,16 +428,16 @@ async def upload_file(
     # Local fallback
     server_root = _get_local_server_root(server)
     _guard_disk_for_operation("upload_file")
-    
-    target_dir = _validate_safe_path(server_root, path)
+
+    target_dir = _validate_safe_path(server_root, path, policy, allow_root_file=False)
     if target_dir.exists() and not target_dir.is_dir():
         raise HTTPException(status_code=400, detail="Target path is not a directory")
 
     target_dir.mkdir(parents=True, exist_ok=True)
-    
+
     filename = os.path.basename(file.filename or "uploaded_file")
     target_file = target_dir / filename
-    _validate_safe_path(server_root, target_file.relative_to(server_root).as_posix())
+    _validate_safe_path(server_root, target_file.relative_to(server_root).as_posix(), policy)
 
     total_size = 0
     with open(target_file, "wb") as buffer:
@@ -334,7 +455,7 @@ async def upload_file(
 
     if target_file.is_relative_to(server_root / "worlds"):
         try:
-            _guard_world_size_after_upload(server_root, user)
+            _guard_world_size_after_upload(server, server_root, user)
         except HTTPException:
             target_file.unlink(missing_ok=True)
             raise
@@ -350,19 +471,23 @@ def delete_file_or_folder(
     db: Session = Depends(get_db),
 ):
     server = _get_server(server_id, user, db)
+    policy = _file_access_policy(server)
     if server.node_id:
         node = db.get(Node, server.node_id)
         if node:
-            return _proxy_delete(node, str(server.id), "delete", {"path": path})
+            _validate_file_policy_path(path, policy)
+            return _proxy_delete(node, str(server.id), "delete", _agent_policy_params(policy, {"path": path}))
 
     import shutil
     server_root = _get_local_server_root(server)
-    target = _validate_safe_path(server_root, path)
+    target = _validate_safe_path(server_root, path, policy)
 
-    for allowed in ALLOWED_ROOTS:
+    for allowed in policy.roots:
         allowed_path = (server_root / allowed).resolve()
         if target == allowed_path:
             raise HTTPException(status_code=403, detail="Cannot delete root folders")
+    if target.parent == server_root and target.name in policy.root_files:
+        raise HTTPException(status_code=403, detail="Cannot delete protected server config files")
 
     if not target.exists():
         raise HTTPException(status_code=404, detail="Path not found")
@@ -375,4 +500,3 @@ def delete_file_or_folder(
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete: {str(e)}")
-

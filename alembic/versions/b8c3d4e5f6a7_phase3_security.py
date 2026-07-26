@@ -27,7 +27,6 @@ def upgrade() -> None:
 
     op.add_column("nodes", sa.Column("approved", sa.Boolean(), nullable=False, server_default=sa.false()))
     op.add_column("nodes", sa.Column("agent_token_hash", sa.String(length=64), nullable=True))
-    op.alter_column("nodes", "approved", server_default=None)
 
 
 def downgrade() -> None:

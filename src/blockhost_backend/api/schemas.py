@@ -199,6 +199,11 @@ class ServerConfigUpdateRequest(BaseModel):
     config: ServerConfig
 
 
+class SoftwareSwitchRequest(BaseModel):
+    target_flavor: ServerFlavor
+    target_mc_version: str
+
+
 class CreateBackupRequest(BaseModel):
     name: str | None = Field(default=None, max_length=128)
     description: str | None = Field(default=None, max_length=2000)

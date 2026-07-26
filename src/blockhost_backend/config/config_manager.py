@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -29,7 +30,7 @@ class Settings(BaseSettings):
     jwt_access_token_expire_seconds: int = 60 * 60 * 24
     jwt_refresh_token_expire_seconds: int = 60 * 60 * 24 * 30
 
-    minecraft_public_host: str = "192.168.29.102"
+    minecraft_public_host: str = ""
     minecraft_port: int = 19132
 
     # Local Bedrock runtime (direct process spawning).
@@ -37,7 +38,7 @@ class Settings(BaseSettings):
     bedrock_versions_dir: str = "versions"
     bedrock_servers_dir: str = "servers"
     bedrock_logs_dir: str = "logs"
-    bedrock_versions_manifest: str = "versions/manifest.json"
+    bedrock_versions_manifest: str = "runtime_binaries/bedrock/manifest.json"
     bedrock_port_range_start: int = 19132
     bedrock_port_range_end: int = 19232
     java_port_range_start: int = 25565
@@ -46,8 +47,8 @@ class Settings(BaseSettings):
     backup_temp_dir: str = "backups/tmp"
     backup_retention_count: int = 7
     backup_save_hold_seconds: float = 2.0
-    backup_worker_threads: int = 2
-    backup_scheduler_enabled: bool = False
+    backup_worker_threads: int = max(2, min((os.cpu_count() or 4) // 2, 4))
+    backup_scheduler_enabled: bool = True
     backup_scheduler_poll_seconds: int = 60
     subscription_expiration_enabled: bool = True
     subscription_expiration_poll_seconds: int = 60
@@ -67,6 +68,9 @@ class Settings(BaseSettings):
 
     worker_agent_url: str = "http://localhost:9000"
     worker_agent_token: str = "change-me-in-dev"
+
+    # Runtime Binaries Registry
+    runtime_binaries_dir: str = "runtime_binaries"
 
     # Add these fields to your Settings class
     software_cache_dir: str = "software_cache"

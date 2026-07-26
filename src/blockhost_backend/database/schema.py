@@ -475,3 +475,21 @@ class Node(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
     servers: Mapped[list["Server"]] = relationship(back_populates="node")
+
+
+class RuntimeBinary(Base):
+    __tablename__ = "runtime_binaries"
+    __table_args__ = (
+        UniqueConstraint("flavor", "version", name="uq_runtime_binaries_flavor_version"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    game: Mapped[str] = mapped_column(String(64), nullable=False, default="minecraft")
+    edition: Mapped[str] = mapped_column(String(64), nullable=False)
+    flavor: Mapped[ServerFlavor] = mapped_column(Enum(ServerFlavor), nullable=False)
+    version: Mapped[str] = mapped_column(String(64), nullable=False)
+    executable_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    installed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)

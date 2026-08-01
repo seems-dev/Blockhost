@@ -116,3 +116,33 @@ flutter_client/android/
 flutter_client/ios/
 flutter_client/macos/
 runtime_binaries/
+
+.git
+
+# Frontend
+blockhost-admin/node_modules
+blockhost-admin/dist
+
+flutter_client/build
+flutter_client/.dart_tool
+
+# Local data
+servers
+backups
+agent_storage
+database
+
+# Logs
+*.log
+
+# Python
+__pycache__
+*.pyc
+
+# Tests
+tests
+
+# Development files
+scratch.py
+scratch2.py
+scratch3.py

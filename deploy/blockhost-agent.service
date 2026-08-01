@@ -1,0 +1,40 @@
+[Unit]
+Description=BlockHost Node Agent
+Documentation=https://github.com/seems/blockhost
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/blockhost
+
+# --- Configuration ---
+# Edit /etc/blockhost-agent.env to set secrets (do NOT hardcode them here)
+EnvironmentFile=/etc/blockhost-agent.env
+
+# --- How to start the agent ---
+ExecStart=/home/ubuntu/.local/bin/uvicorn blockhost_agent.agent:app \
+    --host 0.0.0.0 \
+    --port 9000 \
+    --workers 1
+
+# --- Reliability ---
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# --- Logging ---
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=blockhost-agent
+
+# --- Security ---
+# Prevent the agent from accessing most of the system
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

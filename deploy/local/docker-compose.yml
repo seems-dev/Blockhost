@@ -1,0 +1,69 @@
+services:
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: blockhost
+      POSTGRES_DB: blockhost
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+
+  redis:
+    image: redis:7
+
+
+  control-plane:
+    build:
+      context: ../..
+      dockerfile: deploy/local/control.Dockerfile
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      # Fix 1: Use postgresql+psycopg:// (psycopg3 driver, not psycopg2)
+      DATABASE_URL: postgresql+psycopg://postgres:blockhost@postgres/blockhost
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET_KEY: dev-jwt-secret-key-change-in-production
+      WORKER_AGENT_TOKEN: dev-agent-token-change-in-production
+      PRODUCTION_MODE: "false"
+
+    depends_on:
+      - postgres
+      - redis
+
+
+  agent-node-1:
+
+    build:
+      context: ../..
+      dockerfile: deploy/local/agent.Dockerfile
+
+    ports:
+      - "9000:9000"
+      - "19132:19132/udp"
+
+    volumes:
+      # Minecraft files live exclusively on the agent node
+      - node1_servers:/var/lib/blockhost
+
+    environment:
+      # Fix 2: Correct env var name is CONTROLLER_WS_URL (not CONTROLLER_URL)
+      # Fix 3: Must be ws:// not http://, and use docker service name (control-plane)
+      CONTROLLER_WS_URL: ws://control-plane:8000/api/nodes/ws
+      AGENT_TOKEN: dev-agent-token-change-in-production
+      NODE_NAME: node-1
+      NODE_PUBLIC_IP: 127.0.0.1
+      SERVERS_ROOT_DIR: /var/lib/blockhost/servers
+      VERSIONS_ROOT_DIR: /var/lib/blockhost/versions
+
+    depends_on:
+      - control-plane
+
+
+volumes:
+
+  postgres_data:
+
+  node1_servers:

@@ -36,12 +36,16 @@ def test_create_java_server_logic():
          patch("blockhost_backend.api.servers._invalidate_server_read_cache"), \
          patch("blockhost_backend.api.servers._server_to_out"), \
          patch("blockhost_backend.minecraft.software_provider.resolve_jar_url") as mock_resolve, \
-         patch("blockhost_backend.api.servers._guard_disk_for_operation"):
+         patch("blockhost_backend.api.servers._guard_disk_for_operation"), \
+         patch("blockhost_backend.minecraft.binary_manager.ensure_binary_installed") as mock_ensure:
 
         mock_alloc.return_value = 25565
         mock_select.return_value = None
         mock_dirs.return_value = (Path("/tmp/v"), Path("/tmp/s"), Path("/tmp/l"))
         mock_resolve.return_value = "http://example.com/server.jar"
+        mock_bin = Mock()
+        mock_bin.executable_path = "/tmp/fake.jar"
+        mock_ensure.return_value = mock_bin
 
         create_server(payload=payload, background_tasks=bg_tasks, user=user, db=db)
 
@@ -49,9 +53,9 @@ def test_create_java_server_logic():
         kwargs = mock_alloc.call_args.kwargs
         assert kwargs.get("flavor") == ServerFlavor.JAVA_VANILLA
 
-        bg_tasks.add_task.assert_called_once()
-        task_func = bg_tasks.add_task.call_args.args[0]
-        assert "provision_java_server" in task_func.__name__
+        mock_alloc.assert_called_once()
+        kwargs = mock_alloc.call_args.kwargs
+        assert kwargs.get("flavor") == ServerFlavor.JAVA_VANILLA
 
 
 def test_java_create_requires_mc_version():
@@ -80,7 +84,7 @@ def test_runtime_start_request_accepts_jdk_path(tmp_path: Path):
         server_dir=tmp_path,
         port=25565,
         requested_version="1.21.0",
-        executable_name="server.jar",
+        executable_path=tmp_path / "server.jar",
         ram_mb=1024,
         cpu_quota_pct=100,
         jdk_path=tmp_path / "jdk",

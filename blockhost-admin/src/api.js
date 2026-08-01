@@ -1,7 +1,7 @@
 import axios from 'axios';
 
 const api = axios.create({
-    baseURL: 'http://localhost:8000',
+    baseURL: 'http://192.168.29.102:8000',
 });
 
 // Automatically attach JWT token if logged in
@@ -28,5 +28,13 @@ export const getTransactions = () => api.get('/api/admin/transactions').then(r =
 
 export const forceStopServer = (serverId) =>
     api.post(`/api/admin/servers/${serverId}/force-stop`).then(r => r.data);
+
+export const banUser = (userId) =>
+    api.post(`/api/admin/users/${userId}/ban`).then(r => r.data);
+
+export const grantBlockcoins = (userId, amount) =>
+    api.post(`/api/admin/users/${userId}/grant-blockcoins`, null, { params: { amount } }).then(r => r.data);
+
+export const getNodes = () => api.get('/api/admin/nodes').then(r => r.data);
 
 export default api;

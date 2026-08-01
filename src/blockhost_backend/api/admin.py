@@ -4,7 +4,8 @@ from sqlalchemy.orm import Session
 
 from blockhost_backend.api.deps import get_admin_user
 from blockhost_backend.database.db import get_db
-from blockhost_backend.database.schema import User, Server, BillingTransaction, BillingSubscription, ServerState
+from blockhost_backend.database.schema import User, Server, BillingTransaction, BillingSubscription, ServerState, BlockcoinTransaction, BlockcoinReason, Node
+from blockhost_backend.database.schema import utcnow
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -114,3 +115,61 @@ def admin_force_stop_server(
         return {"status": "stopped"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/users/{user_id}/ban")
+def admin_ban_user(
+    user_id: str,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Soft delete a user"""
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.deleted_at = utcnow()
+    db.commit()
+    return {"status": "banned"}
+
+@router.post("/users/{user_id}/grant-blockcoins")
+def admin_grant_blockcoins(
+    user_id: str,
+    amount: float = Query(...),
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Manually add blockcoins to a user"""
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    amount_int = int(amount)
+    user.blockcoin_balance += amount_int
+    
+    tx = BlockcoinTransaction(
+        user_id=user.id,
+        amount=amount_int,
+        reason=BlockcoinReason.admin_adjustment,
+        meta={"granted_by": str(admin.id)}
+    )
+    db.add(tx)
+    db.commit()
+    return {"status": "granted", "new_balance": user.blockcoin_balance}
+
+@router.get("/nodes")
+def list_all_nodes(
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """See all worker nodes"""
+    nodes = db.execute(select(Node).order_by(Node.created_at)).scalars().all()
+    return [
+        {
+            "id": str(n.id),
+            "name": n.name,
+            "ip_address": n.ip_address,
+            "status": n.status.value,
+            "total_ram_mb": n.total_ram_mb,
+            "used_ram_mb": n.used_ram_mb,
+            "cpu_usage_percent": n.cpu_usage_percent,
+        } for n in nodes
+    ]

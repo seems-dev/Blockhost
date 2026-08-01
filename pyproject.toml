@@ -27,7 +27,6 @@ dependencies = [
 ]
 
 [project.scripts]
-blockhost-backup-scheduler = "blockhost_backend.backup_scheduler:main"
 blockhost-worker = "blockhost_backend.worker:main"
 
 [project.optional-dependencies]

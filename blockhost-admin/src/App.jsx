@@ -3,6 +3,8 @@ import { BrowserRouter, Routes, Route, NavLink, Navigate } from 'react-router-do
 import Dashboard from './pages/Dashboard';
 import Servers from './pages/Servers';
 import Transactions from './pages/Transactions';
+import Users from './pages/Users';
+import Nodes from './pages/Nodes';
 import { loginAdmin, logoutAdmin } from './api';
 
 function AdminLayout({ children }) {
@@ -13,7 +15,9 @@ function AdminLayout({ children }) {
         <h1 className="text-xl font-bold text-cyan-400 mb-10">BlockHost Admin</h1>
         <nav className="flex flex-col gap-4">
           <NavLink to="/" className={({ isActive }) => isActive ? "text-cyan-400 font-bold" : "text-slate-400 hover:text-white"}>📊 Dashboard</NavLink>
+          <NavLink to="/users" className={({ isActive }) => isActive ? "text-cyan-400 font-bold" : "text-slate-400 hover:text-white"}>👥 Users</NavLink>
           <NavLink to="/servers" className={({ isActive }) => isActive ? "text-cyan-400 font-bold" : "text-slate-400 hover:text-white"}>🖥️ Servers</NavLink>
+          <NavLink to="/nodes" className={({ isActive }) => isActive ? "text-cyan-400 font-bold" : "text-slate-400 hover:text-white"}>🌐 Nodes</NavLink>
           <NavLink to="/transactions" className={({ isActive }) => isActive ? "text-cyan-400 font-bold" : "text-slate-400 hover:text-white"}>
             💰 Transactions
           </NavLink>
@@ -60,7 +64,9 @@ export default function App() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/servers" element={<Servers />} />
           <Route path="/transactions" element={<Transactions />} />
-          {/* Add routes for /users and /transactions later */}
+          <Route path="/users" element={<Users />} />
+          <Route path="/nodes" element={<Nodes />} />
+          {/* Add routes for /transactions later */}
         </Routes>
       </AdminLayout>
     </BrowserRouter>

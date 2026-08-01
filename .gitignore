@@ -72,6 +72,12 @@ Thumbs.db
 *.bak
 *.swp
 .#*
+scratch.py
+scratch2.py
+scratch3.py
+test_ws.py
+output.log
+uvicorn_test.log
 
 # Local development
 local.properties

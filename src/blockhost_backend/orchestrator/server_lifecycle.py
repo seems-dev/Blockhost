@@ -93,23 +93,31 @@ class ServerLifecycleOrchestrator:
         if not requested_version:
             requested_version = "recommended" if not is_java else "1.21.4"
             
-        # We need db for ensure_binary_installed
-        if db is None:
-            raise RuntimeError("Database session is required to start server")
-            
-        binary = ensure_binary_installed(db, server.flavor, requested_version)
+        jar_download_url = None
+        server_properties_dict = {}
+
+        if is_java:
+            from blockhost_backend.minecraft.software_provider import resolve_jar_url
+            jar_download_url = resolve_jar_url(server.flavor, requested_version)
+            from blockhost_backend.api.servers import _java_server_properties_from_config
+            server_properties_dict = _java_server_properties_from_config(server=server, port=server.vm_port)
+        else:
+            from blockhost_backend.api.servers import _server_props_from_config
+            server_properties_dict = _server_props_from_config(server=server, port=server.vm_port)
 
         result = self._runtime.start_server(
             RuntimeStartRequest(
                 server_id=str(server.id),
                 server_dir=server_dir,
                 port=server.vm_port,
-                requested_version=binary.version,
-                executable_path=Path(binary.executable_path),
+                requested_version=requested_version,
+                executable_path=None,
                 ram_mb=limits["ram_mb"],
                 cpu_quota_pct=limits["cpu_quota_pct"],
                 flavor=server.flavor.value if server.flavor else None,
                 jdk_path=self._resolve_jdk_path(server=server, settings=settings, db=db),
+                server_properties_dict=server_properties_dict,
+                jar_download_url=jar_download_url,
             )
         )
 

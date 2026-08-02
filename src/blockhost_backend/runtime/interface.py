@@ -26,11 +26,13 @@ class RuntimeStartRequest:
     server_dir: Path
     port: int
     requested_version: str | None
-    executable_path: Path
+    executable_path: Path | None
     ram_mb: int
     cpu_quota_pct: int
     flavor: str | None = None
     jdk_path: Path | None = None
+    server_properties_dict: dict[str, str | int | bool] | None = None
+    jar_download_url: str | None = None
 
 
 # -------------------------

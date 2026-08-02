@@ -51,6 +51,8 @@ class AgentRuntime:
             "ram_mb": request.ram_mb,
             "cpu_quota_pct": request.cpu_quota_pct,
             "jdk_path": str(request.jdk_path) if request.jdk_path else None,
+            "server_properties_dict": request.server_properties_dict,
+            "jar_download_url": request.jar_download_url,
         }
         resp = self._post(f"/agent/servers/{request.server_id}/start", json_data=payload)
         data = resp.json()

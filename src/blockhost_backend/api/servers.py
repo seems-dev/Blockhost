@@ -834,56 +834,24 @@ def create_server(
 
     versions_dir, servers_dir, _logs_dir = _server_dirs()
     try:
+        cfg = dict(server.mc_config or {})
+        server_dir = servers_dir / str(server.id)
+        
         if payload.flavor == ServerFlavor.BEDROCK:
-            # --- EXISTING BEDROCK LOGIC (UNCHANGED) ---
-            requested_version = _normalize_requested_version(
-                (server.mc_config or {}).get("bedrock_version")
-            )
-            _ensure_version_on_disk(versions_dir=versions_dir, requested_version=requested_version)
-            version_name, version_dir = resolve_version_dir(
-                versions_dir=versions_dir, requested=requested_version
-            )
-            server_dir = materialize_server_dir(
-                version_dir=version_dir, servers_dir=servers_dir, server_id=str(server.id)
-            )
-            _validate_server_dir(server_dir, servers_dir)
-
-            write_server_properties(
-                server_dir / "server.properties",
-                _server_props_from_config(server=server, port=server.vm_port),
-            )
-
-            cfg = dict(server.mc_config or {})
+            requested_version = _normalize_requested_version(cfg.get("bedrock_version"))
             cfg["runtime_mode"] = "process"
-            cfg["template_version"] = version_name
+            cfg["template_version"] = requested_version or "latest"
             cfg["server_dir"] = str(server_dir)
             server.mc_config = cfg
-            
         else:
-            # --- NEW JAVA LOGIC ---
-            from blockhost_backend.minecraft.binary_manager import ensure_binary_installed
-            
-            server_dir = servers_dir / str(server.id)
-            server_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Ensure the binary is in the shared registry (downloads if needed)
-            binary = ensure_binary_installed(db, payload.flavor, payload.mc_version)
-            
-            # Write eula.txt and server.properties — no JAR copied here
-            (server_dir / "eula.txt").write_text("eula=true\n", encoding="utf-8")
-            props = _java_server_properties_from_config(server=server, port=server.vm_port)
-            write_java_server_properties(server_dir / "server.properties", props)
-            
-            cfg = dict(server.mc_config or {})
             cfg["runtime_mode"] = "process"
             cfg["server_dir"] = str(server_dir)
-            # No longer store executable_name — the binary registry handles it
             server.mc_config = cfg
 
     except Exception as e:
         db.rollback()
         raise HTTPException(
-            status_code=503, detail=f"Failed to setup server files: {e}"
+            status_code=503, detail=f"Failed to setup server config: {e}"
         )
 
     # Server is created suspended — user must subscribe via Billing, then POST /start.

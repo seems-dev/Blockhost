@@ -114,6 +114,8 @@ class StartPayload(BaseModel):
     ram_mb: int
     cpu_quota_pct: int
     jdk_path: str | None = None  # NEW
+    server_properties_dict: dict[str, str | int | bool] | None = None
+    jar_download_url: str | None = None
 
 
 class CommandPayload(BaseModel):
@@ -188,21 +190,46 @@ def start_server(
     _token: str = Depends(verify_token),
 ) -> Any:
     _validate_server_id(server_id)
-    is_java = payload.executable_path and payload.executable_path.endswith(".jar")
+    server_dir = SERVERS_ROOT_DIR / server_id
+    server_dir.mkdir(parents=True, exist_ok=True)
+    is_java = bool(payload.jar_download_url) or (payload.executable_path and payload.executable_path.endswith(".jar"))
+
+    if payload.server_properties_dict is not None:
+        props_path = server_dir / "server.properties"
+        lines = []
+        for k, v in payload.server_properties_dict.items():
+            v_str = "true" if v is True else "false" if v is False else str(v)
+            lines.append(f"{k}={v_str}")
+        props_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     if is_java:
-        server_dir = SERVERS_ROOT_DIR / server_id
-        if not server_dir.is_dir():
-            raise HTTPException(status_code=404, detail="Java server directory not provisioned on agent")
-        # Ensure executable exists on the agent filesystem
-        executable_path = Path(payload.executable_path)
-        if not executable_path.is_file():
-            raise HTTPException(status_code=404, detail=f"Java executable not found on agent: {executable_path}")
+        (server_dir / "eula.txt").write_text("eula=true\n", encoding="utf-8")
+        if payload.jar_download_url:
+            version_str = payload.requested_version or "latest"
+            jar_path = server_dir / f"server-{version_str}.jar"
+            if not jar_path.exists():
+                logger.info(f"Downloading Java jar from {payload.jar_download_url} to {jar_path}")
+                try:
+                    with httpx.Client(follow_redirects=True, timeout=300.0) as client:
+                        with client.stream("GET", payload.jar_download_url) as resp:
+                            resp.raise_for_status()
+                            with open(jar_path, "wb") as f:
+                                for chunk in resp.iter_bytes(1024*1024):
+                                    f.write(chunk)
+                except Exception as e:
+                    if jar_path.exists():
+                        jar_path.unlink()
+                    raise HTTPException(status_code=500, detail=f"Failed to download jar: {e}")
+            executable_path = jar_path
+        else:
+            executable_path = Path(payload.executable_path) if payload.executable_path else None
+            if not executable_path or not executable_path.is_file():
+                raise HTTPException(status_code=404, detail="Java executable not found on agent")
     else:
         version_name = (payload.requested_version or "").strip()
         if not version_name:
             raise HTTPException(status_code=400, detail="requested_version is required on agent")
-        server_dir = _ensure_server_layout(server_id, version_name)
+        _ensure_server_layout(server_id, version_name)
         if payload.executable_path:
             executable_path = Path(payload.executable_path)
         else:

@@ -20,9 +20,7 @@ def upgrade():
     # but to be perfectly safe across configurations, we commit, alter, and begin.
     bind = op.get_bind()
     if bind.dialect.name == "postgresql":
-        op.execute("COMMIT")
         op.execute("ALTER TYPE vmprovider ADD VALUE IF NOT EXISTS 'local_java'")
-        op.execute("BEGIN")
 
 
 def downgrade():

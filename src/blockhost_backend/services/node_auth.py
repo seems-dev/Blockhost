@@ -23,8 +23,7 @@ def verify_node_agent_token(*, node: Node, token: str) -> bool:
     if node.agent_token_hash:
         expected = node.agent_token_hash
         return secrets.compare_digest(hash_agent_token(token), expected)
-    # Legacy/dev: accept shared worker token when node has no per-node token yet.
+    # Legacy/manual registration path: approved nodes without a per-node token
+    # use the shared control-plane worker token.
     settings = get_settings()
-    if not settings.production_mode:
-        return secrets.compare_digest(token, settings.worker_agent_token)
-    return False
+    return bool(node.approved) and secrets.compare_digest(token, settings.worker_agent_token)

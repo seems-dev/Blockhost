@@ -1188,7 +1188,6 @@ async def heartbeat_task() -> None:
                     })
                 )
                 logger.info("Connected to Controller at %s", CONTROLLER_WS_URL)
-                retry_delay = 1.0
 
                 while True:
                     await asyncio.sleep(5)
@@ -1207,6 +1206,7 @@ async def heartbeat_task() -> None:
                             }
                         )
                     )
+                    retry_delay = 1.0
 
         except asyncio.CancelledError:
             logger.info("Heartbeat task cancelled")

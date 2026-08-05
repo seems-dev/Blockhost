@@ -805,6 +805,11 @@ def create_server(
         raise HTTPException(status_code=422, detail=str(e))
 
     node = select_best_node(db)
+    if settings.production_mode and not node:
+        raise HTTPException(
+            status_code=503,
+            detail="No online worker node is available. Check agent registration and heartbeat.",
+        )
     node_id = node.id if node else None
 
     try:
@@ -1231,6 +1236,11 @@ def start_server(
         return ServerActionResponse(id=server.id, state=server.state)
 
     settings = get_settings()
+    if settings.production_mode and not server.node_id:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is not assigned to a worker node. Recreate it after the agent is online.",
+        )
     is_java = is_java_flavor(server.flavor)
 
     try:

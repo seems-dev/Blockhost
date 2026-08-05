@@ -125,10 +125,17 @@ async def node_agent_websocket(
                 node_obj.agent_port = node_port
 
             if not verify_node_agent_token(node=node_obj, token=token):
+                logger.warning(
+                    "Node '%s' rejected: invalid token (has_agent_token=%s, production_mode=%s)",
+                    node_name,
+                    bool(node_obj.agent_token_hash),
+                    settings.production_mode,
+                )
                 await websocket.close(code=1008, reason="Invalid token")
                 return
 
             if not node_obj.approved:
+                logger.warning("Node '%s' rejected: not approved", node_name)
                 await websocket.close(code=4003, reason="Node not approved")
                 return
 

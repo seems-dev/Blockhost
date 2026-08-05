@@ -52,8 +52,14 @@ class SystemdRuntime:
         self._online_players: dict[str, dict[str, str | None]] = {}
         self._lock = threading.Lock()
 
+    def _systemctl_available(self) -> bool:
+        return shutil.which("systemctl") is not None
+
     # ---------------- START ----------------
     def start_server(self, request: RuntimeStartRequest) -> RuntimeStartResult:
+        if shutil.which("systemd-run") is None:
+            raise RuntimeError("Local systemd runtime is unavailable; assign this server to a worker node.")
+
         server_dir = request.server_dir.resolve()
         self._server_dirs[request.server_id] = server_dir
         executable = request.executable_path.resolve()
@@ -151,6 +157,9 @@ class SystemdRuntime:
 
     # ---------------- STOP ----------------
     def stop_server(self, server_id: str) -> None:
+        if not self._systemctl_available():
+            return
+
         unit = self._unit_name(server_id)
 
         subprocess.run(
@@ -177,6 +186,9 @@ class SystemdRuntime:
 
     # ---------------- STATUS ----------------
     def get_status(self, server_id: str) -> RuntimeStatus:
+        if not self._systemctl_available():
+            return RuntimeStatus(running=False)
+
         unit = self._unit_name(server_id)
 
         result = subprocess.run(
@@ -206,6 +218,9 @@ class SystemdRuntime:
             return dict(self._online_players.get(server_id, {}))
     # ---------------- STATS (BASIC) ----------------
     def get_stats(self, server_id: str) -> RuntimeResourceStats:
+        if not self._systemctl_available():
+            return RuntimeResourceStats(cpu_usage=None, ram_usage_mb=None)
+
         unit = self._unit_name(server_id)
 
         # Get memory and all PIDs in the unit's cgroup
@@ -287,6 +302,9 @@ class SystemdRuntime:
 
     # ---------------- LOGS ----------------
     def read_logs(self, server_id: str, tail: int = 200) -> list[LogEntry]:
+        if shutil.which("journalctl") is None:
+            return []
+
         unit = self._unit_name(server_id)
 
         result = subprocess.run(
@@ -320,6 +338,9 @@ class SystemdRuntime:
             f.write(command + "\n")
 
     def add_log_listener(self, server_id: str, listener: LogListener) -> None:
+        if shutil.which("journalctl") is None:
+            return
+
         with self._lock:
             if server_id not in self._listeners:
                 self._listeners[server_id] = []
@@ -347,6 +368,9 @@ class SystemdRuntime:
                     self._stop_log_stream(server_id)
 
     def _start_log_stream(self, server_id: str) -> None:
+        if shutil.which("journalctl") is None:
+            return
+
         unit = self._unit_name(server_id)
         proc = subprocess.Popen(
             ["journalctl", "--user", "-u", unit, "-f", "-n", "0", "--no-pager"],

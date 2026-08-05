@@ -688,27 +688,15 @@ def _prepare_java_server_for_start(*, server: Server, db: Session) -> Path:
             raise HTTPException(status_code=503, detail=f"Failed to allocate TCP port: {e}")
 
     _, servers_dir, _ = _server_dirs()
-    if not (server.mc_config or {}).get("server_dir"):
-        raise HTTPException(status_code=503, detail="Server directory not configured")
-
-    server_dir = _validate_server_dir(Path(server.mc_config["server_dir"]), servers_dir)
-    # JAR is now in the shared binary registry — no local JAR check needed.
-    # The binary_manager resolves the executable at start time.
-
-    props_path = server_dir / "server.properties"
-    write_java_server_properties(props_path, _java_server_properties_from_config(server=server, port=server.vm_port))
     
-    eula_path = server_dir / "eula.txt"
-    if not eula_path.exists():
-        eula_path.write_text("eula=true\n", encoding="utf-8")
-
-    if server.node_id:
-        node = db.get(Node, server.node_id)
-        if node:
-            from blockhost_backend.services.node_provision import sync_remote_java_config
-
-            sync_remote_java_config(node=node, server=server, server_dir=server_dir)
-
+    server_dir = servers_dir / str(server.id)
+    cfg = dict(server.mc_config or {})
+    cfg["runtime_mode"] = "process"
+    cfg["server_dir"] = str(server_dir)
+    server.mc_config = cfg
+    if db:
+        db.commit()
+    
     return server_dir
 
 
@@ -723,35 +711,18 @@ def _prepare_bedrock_server_for_start(*, server: Server, db: Session) -> Path:
         (server.mc_config or {}).get("bedrock_version")
     )
     
-    from blockhost_backend.minecraft.binary_manager import ensure_binary_installed
-    binary = ensure_binary_installed(db, ServerFlavor.BEDROCK, requested_version)
-    version_dir = Path(binary.executable_path).parent
-    version_name = binary.version
+    version_name = requested_version or "latest"
 
-    if not (server.mc_config or {}).get("server_dir"):
-        _, servers_dir, _ = _server_dirs()
-        server_dir = materialize_server_dir(
-            version_dir=version_dir, servers_dir=servers_dir, server_id=str(server.id)
-        )
-        _validate_server_dir(server_dir, servers_dir)
-        write_server_properties(
-            server_dir / "server.properties",
-            _server_props_from_config(server=server, port=server.vm_port),
-        )
-        cfg = dict(server.mc_config or {})
-        cfg["runtime_mode"] = "process"
-        cfg["template_version"] = version_name
-        cfg["server_dir"] = str(server_dir)
-        server.mc_config = cfg
-        _provision_remote_server(server, server_dir, db, version_name, version_dir)
-    else:
-        _, servers_dir, _ = _server_dirs()
-        server_dir = _validate_server_dir(Path(server.mc_config["server_dir"]), servers_dir)
-        write_server_properties(
-            server_dir / "server.properties",
-            _server_props_from_config(server=server, port=server.vm_port),
-        )
-        _provision_remote_server(server, server_dir, db, version_name, version_dir)
+    _, servers_dir, _ = _server_dirs()
+    server_dir = servers_dir / str(server.id)
+    
+    cfg = dict(server.mc_config or {})
+    cfg["runtime_mode"] = "process"
+    cfg["template_version"] = version_name
+    cfg["server_dir"] = str(server_dir)
+    server.mc_config = cfg
+    if db:
+        db.commit()
 
     return server_dir
 

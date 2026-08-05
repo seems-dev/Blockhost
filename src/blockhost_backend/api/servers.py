@@ -1236,11 +1236,17 @@ def start_server(
         return ServerActionResponse(id=server.id, state=server.state)
 
     settings = get_settings()
-    if settings.production_mode and not server.node_id:
-        raise HTTPException(
-            status_code=503,
-            detail="Server is not assigned to a worker node. Recreate it after the agent is online.",
-        )
+    if not server.node_id:
+        node = select_best_node(db)
+        if node:
+            server.node_id = node.id
+            server.vm_ipv4 = node.ip_address
+            db.commit()
+        elif settings.production_mode:
+            raise HTTPException(
+                status_code=503,
+                detail="Server is not assigned to a worker node. Recreate it after the agent is online.",
+            )
     is_java = is_java_flavor(server.flavor)
 
     try:
@@ -1316,6 +1322,17 @@ def toggle_server(
     if is_actually_running:
         _stop_server_process(server)
     else:
+        if not server.node_id:
+            node = select_best_node(db)
+            if node:
+                server.node_id = node.id
+                server.vm_ipv4 = node.ip_address
+                db.commit()
+            elif settings.production_mode:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Server is not assigned to a worker node. Recreate it after the agent is online.",
+                )
         is_java = is_java_flavor(server.flavor)
         try:
             if is_java:

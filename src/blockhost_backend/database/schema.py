@@ -460,7 +460,7 @@ class Node(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
     ip_address: Mapped[str] = mapped_column(String(64), nullable=False)
-    agent_port: Mapped[int] = mapped_column(Integer, nullable=False, default=8001)
+    agent_port: Mapped[int] = mapped_column(Integer, nullable=False, default=9000)
 
     status: Mapped[NodeState] = mapped_column(Enum(NodeState), nullable=False, default=NodeState.offline)
     approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

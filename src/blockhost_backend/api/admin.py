@@ -167,6 +167,7 @@ def list_all_nodes(
             "id": str(n.id),
             "name": n.name,
             "ip_address": n.ip_address,
+            "agent_port": n.agent_port,
             "status": n.status.value,
             "total_ram_mb": n.total_ram_mb,
             "used_ram_mb": n.used_ram_mb,

@@ -35,6 +35,7 @@ _watchdog_started = False
 class RegisterNodeRequest(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     ip_address: str | None = Field(default=None, max_length=64)
+    agent_port: int = Field(default=9000, ge=1, le=65535)
 
 
 def _stale_node_watchdog_loop() -> None:
@@ -95,6 +96,14 @@ async def node_agent_websocket(
             return
 
         node_ip = _resolve_node_ip(register_data, websocket)
+        try:
+            node_port = int(register_data.get("agent_port") or 9000)
+        except (TypeError, ValueError):
+            await websocket.close(code=4001, reason="Invalid agent port")
+            return
+        if node_port < 1 or node_port > 65535:
+            await websocket.close(code=4001, reason="Invalid agent port")
+            return
 
         with SessionLocal() as db:
             node_obj = db.execute(select(Node).where(Node.name == node_name)).scalars().first()
@@ -105,6 +114,7 @@ async def node_agent_websocket(
                 node_obj = Node(
                     name=node_name,
                     ip_address=node_ip,
+                    agent_port=node_port,
                     approved=True,
                 )
                 db.add(node_obj)
@@ -112,6 +122,7 @@ async def node_agent_websocket(
                 db.refresh(node_obj)
             else:
                 node_obj.ip_address = node_ip
+                node_obj.agent_port = node_port
 
             if not verify_node_agent_token(node=node_obj, token=token):
                 await websocket.close(code=1008, reason="Invalid token")
@@ -180,6 +191,7 @@ def register_node(
     node = Node(
         name=payload.name,
         ip_address=payload.ip_address or "0.0.0.0",
+        agent_port=payload.agent_port,
         approved=True,
         agent_token_hash=hash_agent_token(plain_token),
     )
@@ -190,6 +202,7 @@ def register_node(
         "id": node.id,
         "name": node.name,
         "ip_address": node.ip_address,
+        "agent_port": node.agent_port,
         "approved": node.approved,
         "agent_token": plain_token,
         "message": "Save agent_token now — it will not be shown again.",
@@ -242,6 +255,7 @@ def list_nodes(
             "id": n.id,
             "name": n.name,
             "ip": n.ip_address,
+            "agent_port": n.agent_port,
             "status": n.status,
             "approved": n.approved,
             "has_agent_token": bool(n.agent_token_hash),
@@ -266,6 +280,7 @@ def get_node(
         "id": node.id,
         "name": node.name,
         "ip_address": node.ip_address,
+        "agent_port": node.agent_port,
         "status": node.status,
         "approved": node.approved,
         "has_agent_token": bool(node.agent_token_hash),

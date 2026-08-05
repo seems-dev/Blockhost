@@ -51,8 +51,10 @@ security = HTTPBearer()
 # ---------------------------------------------------------------------------
 
 AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "change-me-in-dev")
+CONTROL_AGENT_TOKEN = os.environ.get("CONTROL_AGENT_TOKEN", AGENT_TOKEN)
 NODE_NAME = os.environ.get("NODE_NAME", "laptop-worker-1")
 NODE_PUBLIC_IP = os.environ.get("NODE_PUBLIC_IP", "").strip()
+AGENT_PORT = int(os.environ.get("AGENT_PORT", "9000"))
 CONTROLLER_WS_URL = os.environ.get(
     "CONTROLLER_WS_URL", "ws://192.168.29.102:8000/api/nodes/ws"
 )
@@ -87,7 +89,7 @@ _background_tasks: set[asyncio.Task] = set()
 def verify_token(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> str:
-    if credentials.credentials != AGENT_TOKEN:
+    if credentials.credentials not in {AGENT_TOKEN, CONTROL_AGENT_TOKEN}:
         raise HTTPException(status_code=401, detail="Invalid token")
     return credentials.credentials
 
@@ -337,7 +339,7 @@ async def stream_logs(
     server_id: str,
     token: str = Query(default=""),
 ) -> None:
-    if token != AGENT_TOKEN:
+    if token not in {AGENT_TOKEN, CONTROL_AGENT_TOKEN}:
         await websocket.close(code=1008, reason="Invalid token")
         return
 
@@ -1180,6 +1182,7 @@ async def heartbeat_task() -> None:
                         "type": "register",
                         "data": {
                             "name": NODE_NAME,
+                            "agent_port": AGENT_PORT,
                             **({"ip_address": NODE_PUBLIC_IP} if NODE_PUBLIC_IP else {}),
                         },
                     })
@@ -1244,4 +1247,4 @@ app.router.lifespan_context = lifespan
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=AGENT_PORT)

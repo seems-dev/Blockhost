@@ -5,7 +5,7 @@ import os
 import shutil
 from pathlib import Path
 from sqlalchemy.orm import Session
-
+import dataclasses
 import httpx
 
 from blockhost_backend.config.config_manager import Settings

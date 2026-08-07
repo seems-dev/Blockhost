@@ -100,10 +100,10 @@ class ServerLifecycleOrchestrator:
             from blockhost_backend.minecraft.software_provider import resolve_jar_url
             jar_download_url = resolve_jar_url(server.flavor, requested_version)
             from blockhost_backend.api.servers import _java_server_properties_from_config
-            server_properties_dict = _java_server_properties_from_config(server=server, port=server.vm_port).model_dump(exclude_none=True)
+            server_properties_dict = dataclasses.asdict(_java_server_properties_from_config(server=server, port=server.vm_port))
         else:
             from blockhost_backend.api.servers import _server_props_from_config
-            server_properties_dict = _server_props_from_config(server=server, port=server.vm_port).model_dump(exclude_none=True)
+            server_properties_dict = dataclasses.asdict(_server_props_from_config(server=server, port=server.vm_port))
 
         result = self._runtime.start_server(
             RuntimeStartRequest(

@@ -1250,6 +1250,8 @@ def start_server(
         _drop_server_stats_snapshot(str(server.id))
         raise HTTPException(status_code=402, detail={"error": e.code, "message": e.message})
     except Exception as e:
+        import traceback
+        logger.error("start_server FAILED for %s: %s\n%s", server_id, e, traceback.format_exc())
         server.state = ServerState.suspended
         _drop_server_stats_snapshot(str(server.id))
         label = "Java" if is_java else "Bedrock"
@@ -1331,6 +1333,8 @@ def toggle_server(
         except HTTPException:
             raise
         except Exception as e:
+            import traceback
+            logger.error("toggle_server FAILED for %s: %s\n%s", server_id, e, traceback.format_exc())
             server.state = ServerState.suspended
             _drop_server_stats_snapshot(str(server.id))
             label = "Java" if is_java else "Bedrock"

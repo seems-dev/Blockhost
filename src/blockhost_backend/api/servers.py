@@ -711,7 +711,12 @@ def _prepare_bedrock_server_for_start(*, server: Server, db: Session) -> Path:
         (server.mc_config or {}).get("bedrock_version")
     )
     
-    version_name = requested_version or "latest"
+    # We MUST ensure the binary is installed on the Control Plane and synced to the Agent
+    # because the Agent cannot download Bedrock binaries itself.
+    from blockhost_backend.minecraft.binary_manager import ensure_binary_installed
+    binary = ensure_binary_installed(db, ServerFlavor.BEDROCK, requested_version)
+    version_dir = Path(binary.executable_path).parent
+    version_name = binary.version
 
     _, servers_dir, _ = _server_dirs()
     server_dir = servers_dir / str(server.id)
@@ -723,6 +728,12 @@ def _prepare_bedrock_server_for_start(*, server: Server, db: Session) -> Path:
     server.mc_config = cfg
     if db:
         db.commit()
+
+    if server.node_id:
+        node = db.get(Node, server.node_id)
+        if node:
+            from blockhost_backend.services.node_provision import ensure_version_on_node
+            ensure_version_on_node(node=node, version_name=version_name, version_dir=version_dir)
 
     return server_dir
 

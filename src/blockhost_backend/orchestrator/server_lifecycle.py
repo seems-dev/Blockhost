@@ -218,10 +218,10 @@ class ServerLifecycleOrchestrator:
         path = resp.json().get("path")
         if not path:
             raise RuntimeError(f"Agent did not return a JDK path for Java {java_version}")
-        jdk_path = Path(path)
-        if not (jdk_path / "bin" / "java").exists():
-            raise RuntimeError(f"JDK not found on agent at {jdk_path}")
-        return jdk_path
+        
+        # Return the path directly. The Agent has already verified the file exists.
+        # We cannot check .exists() here because the file is on the Agent's filesystem, not the Control Plane's.
+        return Path(path)
 
     # ---------------- VALIDATION ----------------
     def _validate_server_dir(self, server_dir: Path, servers_dir: Path) -> Path:

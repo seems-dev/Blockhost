@@ -129,7 +129,6 @@ class SystemdRuntime:
 
         cmd = [
             "systemd-run",
-            "--user",
             "--unit", unit,
             "--collect",
             "--property", f"WorkingDirectory={server_dir}",
@@ -163,12 +162,12 @@ class SystemdRuntime:
         unit = self._unit_name(server_id)
 
         subprocess.run(
-            ["systemctl", "--user", "stop", unit],
+            ["systemctl",  "stop", unit],
             capture_output=True
         )
 
         subprocess.run(
-            ["systemctl", "--user", "reset-failed", unit],
+            ["systemctl",  "reset-failed", unit],
             capture_output=True
         )
 
@@ -192,7 +191,7 @@ class SystemdRuntime:
         unit = self._unit_name(server_id)
 
         result = subprocess.run(
-            ["systemctl", "--user", "is-active", unit],
+            ["systemctl",  "is-active", unit],
             capture_output=True,
             text=True,
         )
@@ -225,7 +224,7 @@ class SystemdRuntime:
 
         # Get memory and all PIDs in the unit's cgroup
         show_result = subprocess.run(
-            ["systemctl", "--user", "show", unit, "-p", "MemoryCurrent"],
+            ["systemctl",  "show", unit, "-p", "MemoryCurrent"],
             capture_output=True,
             text=True,
         )
@@ -240,7 +239,7 @@ class SystemdRuntime:
 
         # Get all PIDs in the unit cgroup
         pids_result = subprocess.run(
-            ["systemctl", "--user", "show", unit, "-p", "MainPID,ControlGroup"],
+            ["systemctl",  "show", unit, "-p", "MainPID,ControlGroup"],
             capture_output=True,
             text=True,
         )
@@ -308,7 +307,7 @@ class SystemdRuntime:
         unit = self._unit_name(server_id)
 
         result = subprocess.run(
-            ["journalctl", "--user", "-u", unit, "-n", str(tail), "--no-pager"],
+            ["journalctl", "-u", unit, "-n", str(tail), "--no-pager"],
             capture_output=True,
             text=True,
         )
@@ -373,7 +372,7 @@ class SystemdRuntime:
 
         unit = self._unit_name(server_id)
         proc = subprocess.Popen(
-            ["journalctl", "--user", "-u", unit, "-f", "-n", "0", "--no-pager"],
+            ["journalctl", "-u", unit, "-f", "-n", "0", "--no-pager"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,

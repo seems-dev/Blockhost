@@ -200,8 +200,10 @@ def start_server(
         props_path = server_dir / "server.properties"
         lines = []
         for k, v in payload.server_properties_dict.items():
+            # Replace underscores with hyphens for Java compatibility (e.g. server_port -> server-port)
+            safe_k = k.replace("_", "-")
             v_str = "true" if v is True else "false" if v is False else str(v)
-            lines.append(f"{k}={v_str}")
+            lines.append(f"{safe_k}={v_str}")
         props_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     if is_java:

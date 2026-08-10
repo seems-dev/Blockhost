@@ -24,55 +24,29 @@ class BedrockDownloadTarget:
 DownloadEventCallback = Callable[[str, dict[str, object]], None]
 
 
-def _platform_key() -> str:
-    system = platform.system().lower()
-    machine = platform.machine().lower()
-
-    is_x64 = machine in {"x86_64", "amd64"}
-
-    if system.startswith("linux") and is_x64:
-        return "linux_x86_64"
-
-    if system.startswith("windows") and is_x64:
-        return "windows_x86_64"
-
-    raise RuntimeError(f"Unsupported platform: {system} {machine}")
-
-
-def _read_manifest(path: Path) -> dict:
-    if not path.exists():
-        raise FileNotFoundError(f"Manifest not found: {path}")
-
-    return json.loads(path.read_text(encoding="utf-8"))
-def recommended_version(*, manifest_path: Path) -> str:
-    manifest = _read_manifest(manifest_path)
-
-    version = str(
-        manifest.get("recommended_version") or ""
-    ).strip()
-
-    if not version:
-        raise KeyError(
-            "Manifest missing recommended_version"
-        )
-
-    return version
-
-def available_versions(*, manifest_path: Path) -> list[str]:
-    manifest = _read_manifest(manifest_path)
-
-    versions = manifest.get("versions", {})
-
-    if not isinstance(versions, dict):
+def list_remote_versions() -> list[str]:
+    """Fetch available Linux Bedrock versions from MCJarFiles."""
+    url = "https://mcjarfiles.com/api/get-versions/bedrock/latest/linux"
+    try:
+        res = httpx.get(url, timeout=10.0)
+        res.raise_for_status()
+        versions = res.json()
+        if not isinstance(versions, list):
+            return []
+        return [str(v) for v in versions]
+    except Exception as e:
+        print(f"Error fetching Bedrock versions: {e}")
         return []
 
-    return sorted(
-        [
-            key
-            for key in versions.keys()
-            if isinstance(key, str) and key.strip()
-        ]
-    )
+def get_download_url(version: str) -> str:
+    """Get the download URL for a specific Linux Bedrock version."""
+    if version.lower() in {"recommended", "latest", "default"}:
+        versions = list_remote_versions()
+        if not versions:
+            raise RuntimeError("Failed to fetch Bedrock versions")
+        version = versions[0]
+        
+    return f"https://mcjarfiles.com/api/get-jar/bedrock/latest/linux/{version}"
 
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -82,7 +56,6 @@ def _sha256_file(path: Path) -> str:
             h.update(chunk)
 
     return h.hexdigest()
-
 
 def safe_extract_zip(zip_path: Path, dest_dir: Path) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -107,44 +80,10 @@ def safe_extract_zip(zip_path: Path, dest_dir: Path) -> None:
                 shutil.copyfileobj(src, dst)
 
 
-def resolve_download_target(
-    *,
-    manifest_path: Path,
-    version: str,
-) -> BedrockDownloadTarget:
-
-    manifest = _read_manifest(manifest_path)
-
-    if version.strip().lower() in {"recommended", "default"}:
-        version = str(manifest.get("recommended_version") or "").strip()
-
-    versions = manifest.get("versions", {})
-
-    if version not in versions:
-        raise KeyError(f"Version not found: {version}")
-
-    platform_key = _platform_key()
-
-    target = versions[version].get(platform_key)
-
-    if not target:
-        raise KeyError(
-            f"No download available for platform: {platform_key}"
-        )
-
-    url = str(target["url"]).strip()
-    sha256 = str(target.get("sha256") or "").strip() or None
-
-    return BedrockDownloadTarget(
-        url=url,
-        sha256=sha256,
-    )
-
-
 def ensure_version_installed(
     *,
     versions_dir: Path,
-    manifest_path: Path,
+    manifest_path: Path,  # Kept for compatibility, though unused
     version: str,
     progress_cb: Callable[[int], None] | None = None,
     event_cb: DownloadEventCallback | None = None,
@@ -161,10 +100,7 @@ def ensure_version_installed(
     if dest.exists() and dest.is_dir():
         return dest
 
-    target = resolve_download_target(
-        manifest_path=manifest_path,
-        version=version,
-    )
+    target_url = get_download_url(version)
 
     versions_dir.mkdir(parents=True, exist_ok=True)
 
@@ -187,16 +123,16 @@ def ensure_version_installed(
                 "download_start",
                 {
                     "version": version,
-                    "url": target.url,
+                    "url": target_url,
                 },
             )
 
-        print(f"Downloading from: {target.url}")
+        print(f"Downloading from: {target_url}")
 
         # Download ZIP
         with httpx.stream(
             "GET",
-            target.url,
+            target_url,
             follow_redirects=True,
             headers=headers,
             timeout=600.0,
@@ -232,21 +168,6 @@ def ensure_version_installed(
                             f"Downloading {version}: "
                             f"{percent:.1f}%"
                         )
-
-        # Verify checksum
-        if target.sha256:
-
-            print("Verifying SHA256...")
-
-            actual = _sha256_file(zip_path)
-
-            if actual.lower() != target.sha256.lower():
-
-                raise RuntimeError(
-                    "Checksum mismatch\n"
-                    f"Expected: {target.sha256}\n"
-                    f"Actual:   {actual}"
-                )
 
         print("Extracting ZIP...")
 

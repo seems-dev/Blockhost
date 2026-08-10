@@ -315,8 +315,8 @@ class BlockHostApi {
     return body;
   }
 
-  Future<Map<String, dynamic>> getVersionsCatalog() async {
-    final res = await http.get(_u('/api/versions/catalog'),
+  Future<Map<String, dynamic>> getBedrockVersions() async {
+    final res = await http.get(_u('/api/versions/catalog/remote'),
         headers: _headers(json: false, auth: true));
     final body = _decodeJson(res.body);
     if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));

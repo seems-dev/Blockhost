@@ -87,7 +87,7 @@ class _CreateServerScreenState extends State<CreateServerScreen>
       final isJava = _selectedFlavor?.type == ServerFlavorType.java;
       final catalog = isJava
           ? await widget.state.api.getJavaVersionsCatalog()
-          : await widget.state.api.getVersionsCatalog();
+          : await widget.state.api.getBedrockVersions();
       final available = (catalog['available'] as List?)?.map((e) => e.toString()).toList() ?? [];
       final installed = (catalog['installed'] as List?)?.map((e) => e.toString()).toList() ?? [];
       final recommended = catalog['recommended']?.toString();
@@ -98,12 +98,8 @@ class _CreateServerScreenState extends State<CreateServerScreen>
         installedVersions = installed;
         recommendedVersion = recommended;
         _versionsLoading = false;
-        if (isJava) {
-          if (!available.contains(_selectedVersion)) {
-            _selectedVersion = recommended ?? (available.isNotEmpty ? available.first : null);
-          }
-        } else {
-          _selectedVersion = null;
+        if (!available.contains(_selectedVersion)) {
+          _selectedVersion = recommended ?? (available.isNotEmpty ? available.first : null);
         }
       });
     } catch (_) {
@@ -120,19 +116,15 @@ class _CreateServerScreenState extends State<CreateServerScreen>
       setState(() {
         status = '';
         _currentStep = 1;
-        if (_selectedFlavor!.type == ServerFlavorType.java) {
-          _loadCatalog();
-        }
+        _loadCatalog();
       });
       _animateStep();
       return;
     }
 
     if (_currentStep == 1) {
-      if (_selectedFlavor?.type == ServerFlavorType.java) {
-        if ((_selectedVersion ?? '').trim().isEmpty) {
-          _selectedVersion = recommendedVersion ?? (availableVersions.isNotEmpty ? availableVersions.first : null);
-        }
+      if ((_selectedVersion ?? '').trim().isEmpty) {
+        _selectedVersion = recommendedVersion ?? (availableVersions.isNotEmpty ? availableVersions.first : null);
       }
       setState(() => status = '');
       setState(() => _currentStep = 2);
@@ -719,17 +711,7 @@ class _CreateServerScreenState extends State<CreateServerScreen>
   Widget _buildBedrockVersionSelector() {
     return Column(
       children: [
-        TextField(
-          onChanged: (value) =>
-              setState(() => _selectedVersion = value.isEmpty ? null : value),
-          style: const TextStyle(color: _text, fontSize: 15),
-          cursorColor: _green,
-          decoration: _inputDecoration(
-            label: 'Version (e.g. 1.21.44)',
-            hint: 'Leave empty for latest',
-            prefixIcon: Icons.tag_rounded,
-          ),
-        ),
+        _buildVersionDropdown(),
         const SizedBox(height: 12),
         _infoTile(
           icon: Icons.info_outline_rounded,
@@ -740,6 +722,10 @@ class _CreateServerScreenState extends State<CreateServerScreen>
   }
 
   Widget _buildJavaVersionSelector() {
+    return _buildVersionDropdown();
+  }
+
+  Widget _buildVersionDropdown() {
     if (_versionsLoading) {
       return Container(
         padding: const EdgeInsets.all(40),
@@ -798,9 +784,10 @@ class _CreateServerScreenState extends State<CreateServerScreen>
       style: const TextStyle(color: _text, fontSize: 15),
       icon: const Icon(Icons.keyboard_arrow_down, color: _muted),
       items: versionItems,
-      onChanged: (value) => setState(() => _selectedVersion = value),
+      onChanged: (val) => setState(() => _selectedVersion = val),
     );
   }
+
 
   // ─── Step 2: Details ─────────────────────────────────────────────────────────
 

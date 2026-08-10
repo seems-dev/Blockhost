@@ -13,8 +13,7 @@ from blockhost_backend.api.deps import get_current_user
 from blockhost_backend.config.config_manager import get_settings
 from blockhost_backend.database.schema import User
 from blockhost_backend.minecraft.bedrock_download import (
-    available_versions,
-    recommended_version,
+    list_remote_versions,
     safe_extract_zip,
 )
 from blockhost_backend.minecraft.binary_manager import ensure_binary_installed, get_installed_binary
@@ -98,9 +97,18 @@ def _start_download_in_background(*, version: str, flavor: ServerFlavor, setting
     t.start()
 
 
+_remote_bedrock_cache = []
+_remote_bedrock_cache_time = 0.0
+
+def _get_remote_bedrock_versions() -> list[str]:
+    global _remote_bedrock_cache, _remote_bedrock_cache_time
+    if time.time() - _remote_bedrock_cache_time > 300:
+        _remote_bedrock_cache = list_remote_versions()
+        _remote_bedrock_cache_time = time.time()
+    return _remote_bedrock_cache
+
 @router.get("")
 def list_versions(flavor: str = Query(default=ServerFlavor.BEDROCK.value), user: User = Depends(get_current_user)) -> dict:
-    settings = get_settings()
     flavor_enum = ServerFlavor(flavor)
     
     # List installed from registry directory
@@ -114,31 +122,37 @@ def list_versions(flavor: str = Query(default=ServerFlavor.BEDROCK.value), user:
     
     rec = None
     if flavor_enum == ServerFlavor.BEDROCK:
-        try:
-            rec = recommended_version(manifest_path=Path(settings.bedrock_versions_manifest))
-        except Exception:
-            rec = None
+        remote = _get_remote_bedrock_versions()
+        rec = remote[0] if remote else None
     return {"installed": installed, "recommended": rec}
 
 
 @router.get("/recommended")
 def get_recommended_version(user: User = Depends(get_current_user)) -> dict:
     settings = get_settings()
-    rec = recommended_version(manifest_path=Path(settings.bedrock_versions_manifest))
+    remote = _get_remote_bedrock_versions()
+    rec = remote[0] if remote else None
     versions_dir = Path(settings.bedrock_versions_dir).resolve()
-    installed = (versions_dir / rec).exists()
+    installed = (versions_dir / rec).exists() if rec else False
     return {"version": rec, "installed": installed}
 
 
 @router.get("/catalog")
 def get_catalog(user: User = Depends(get_current_user)) -> dict:
     settings = get_settings()
-    manifest_path = Path(settings.bedrock_versions_manifest)
-    versions = available_versions(manifest_path=manifest_path)
-    rec = recommended_version(manifest_path=manifest_path)
+    versions = _get_remote_bedrock_versions()
+    rec = versions[0] if versions else None
     versions_dir = Path(settings.bedrock_versions_dir).resolve()
     installed = sorted([p.name for p in versions_dir.iterdir() if p.is_dir()]) if versions_dir.exists() else []
     return {"available": versions, "recommended": rec, "installed": installed}
+
+
+@router.get("/catalog/remote")
+def get_catalog_remote(user: User = Depends(get_current_user)) -> dict:
+    """Dedicated endpoint for UI to fetch live Bedrock versions."""
+    versions = _get_remote_bedrock_versions()
+    rec = versions[0] if versions else None
+    return {"available": versions, "recommended": rec, "installed": []}
 
 
 @router.get("/java-catalog")

@@ -16,7 +16,7 @@ from blockhost_backend.database.schema import (
     User,
 )
 from blockhost_backend.minecraft.java_compat import is_java_flavor, required_java_version
-from blockhost_backend.minecraft.binary_manager import ensure_binary_installed
+
 from blockhost_backend.orchestrator.resources import get_effective_server_resource_limits
 from blockhost_backend.runtime.interface import (
     LogEntry,

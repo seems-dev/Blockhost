@@ -443,11 +443,61 @@ def _compute_version_binary_hash(version_dir: Path) -> str | None:
 def _ensure_server_layout(server_id: str, version_name: str) -> Path:
     """Link static version assets into the per-server dir; preserve worlds/config."""
     version_dir = VERSIONS_ROOT_DIR / version_name
+    
     if not version_dir.is_dir():
-        raise HTTPException(
-            status_code=503,
-            detail=f"Version {version_name!r} not provisioned on this node",
-        )
+        # Download from MCJarFiles if not present
+        logger.info(f"Bedrock version {version_name} not found locally. Downloading from MCJarFiles...")
+        
+        url = f"https://mcjarfiles.com/api/get-jar/bedrock/latest/linux/{version_name}"
+        
+        VERSIONS_ROOT_DIR.mkdir(parents=True, exist_ok=True)
+        import tempfile, zipfile
+        
+        with tempfile.TemporaryDirectory(prefix="bedrock-agent-dl-") as td:
+            tmpdir = Path(td)
+            zip_path = tmpdir / "bedrock.zip"
+            
+            try:
+                with httpx.Client(follow_redirects=True, timeout=600.0) as client:
+                    with client.stream("GET", url) as resp:
+                        if resp.status_code != 200:
+                            raise HTTPException(
+                                status_code=502,
+                                detail=f"Failed to fetch Bedrock version {version_name} from MCJarFiles: HTTP {resp.status_code}"
+                            )
+                        with open(zip_path, "wb") as f:
+                            for chunk in resp.iter_bytes(1024*1024):
+                                f.write(chunk)
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Download failed: {e}")
+                
+            extract_dir = tmpdir / "extract"
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            
+            try:
+                with zipfile.ZipFile(zip_path) as zf:
+                    zf.extractall(extract_dir)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Invalid zip: {e}")
+                
+            has_binary = any((extract_dir / name).exists() for name in ("bedrock_server", "bedrock_server.exe"))
+            if not has_binary:
+                children = [p for p in extract_dir.iterdir() if p.is_dir()]
+                if len(children) == 1:
+                    inner = children[0]
+                    has_binary = any((inner / name).exists() for name in ("bedrock_server", "bedrock_server.exe"))
+                    if has_binary:
+                        extract_dir = inner
+            
+            if not has_binary:
+                raise HTTPException(status_code=500, detail="Downloaded ZIP does not contain bedrock_server binary")
+                
+            tmp_install = VERSIONS_ROOT_DIR / f".tmp-{version_name}"
+            if tmp_install.exists():
+                shutil.rmtree(tmp_install)
+            shutil.move(str(extract_dir), str(tmp_install))
+            tmp_install.rename(version_dir)
+            logger.info(f"Successfully installed Bedrock version {version_name}")
 
     server_dir = SERVERS_ROOT_DIR / server_id
     server_dir.mkdir(parents=True, exist_ok=True)
@@ -473,6 +523,20 @@ def _ensure_server_layout(server_id: str, version_name: str) -> Path:
             logger.warning("Failed to link/copy %s into server dir: %s", child.name, e)
 
     return server_dir
+
+
+@app.get("/agent/bedrock-versions")
+def list_bedrock_versions(_token: str = Depends(verify_token)) -> Any:
+    """List Bedrock versions locally cached on the agent."""
+    if not VERSIONS_ROOT_DIR.exists():
+        return {"versions": []}
+        
+    versions = []
+    for item in VERSIONS_ROOT_DIR.iterdir():
+        if item.is_dir() and not item.name.startswith("."):
+            versions.append(item.name)
+            
+    return {"versions": sorted(versions)}
 
 
 @app.get("/agent/versions/{version}")

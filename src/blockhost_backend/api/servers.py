@@ -41,7 +41,7 @@ from blockhost_backend.database.db import SessionLocal, get_db
 from blockhost_backend.database.schema import Ban, Server, ServerState, User, VMProvider
 from blockhost_backend.minecraft.bedrock_ping import bedrock_unconnected_ping, parse_bedrock_pong_payload
 from blockhost_backend.minecraft.bedrock_properties import BedrockServerProperties, write_server_properties
-from blockhost_backend.minecraft.bedrock_download import recommended_version
+from blockhost_backend.minecraft.bedrock_download import list_remote_versions
 from blockhost_backend.minecraft.port_alloc import PortRange, pick_free_udp_port, pick_free_tcp_port
 from blockhost_backend.minecraft.java_properties import (
     JavaServerProperties,
@@ -506,7 +506,8 @@ def _ensure_version_on_disk(*, versions_dir: Path, requested_version: str | None
         return
     rv = str(requested_version).strip()
     if rv.lower() in {"recommended", "default"}:
-        rv = recommended_version(manifest_path=Path(settings.bedrock_versions_manifest))
+        rvs = list_remote_versions()
+        rv = rvs[0] if rvs else "1.21"
     if rv.upper() in {"LATEST", "PREVIEW"}:
         installed_versions = [p.name for p in versions_dir.iterdir() if p.is_dir()] if versions_dir.exists() else []
         if not installed_versions:
@@ -537,7 +538,8 @@ def _normalize_requested_version(requested_version: str | None) -> str | None:
     rv = _sanitize_version(rv)
     settings = get_settings()
     if rv and rv.lower() in {"recommended", "default"}:
-        return recommended_version(manifest_path=Path(settings.bedrock_versions_manifest))
+        rvs = list_remote_versions()
+        return rvs[0] if rvs else "1.21"
     return rv
 
 
@@ -711,12 +713,7 @@ def _prepare_bedrock_server_for_start(*, server: Server, db: Session) -> Path:
         (server.mc_config or {}).get("bedrock_version")
     )
     
-    # We MUST ensure the binary is installed on the Control Plane and synced to the Agent
-    # because the Agent cannot download Bedrock binaries itself.
-    from blockhost_backend.minecraft.binary_manager import ensure_binary_installed
-    binary = ensure_binary_installed(db, ServerFlavor.BEDROCK, requested_version)
-    version_dir = Path(binary.executable_path).parent
-    version_name = binary.version
+    version_name = requested_version or "latest"
 
     _, servers_dir, _ = _server_dirs()
     server_dir = servers_dir / str(server.id)
@@ -728,12 +725,6 @@ def _prepare_bedrock_server_for_start(*, server: Server, db: Session) -> Path:
     server.mc_config = cfg
     if db:
         db.commit()
-
-    if server.node_id:
-        node = db.get(Node, server.node_id)
-        if node:
-            from blockhost_backend.services.node_provision import ensure_version_on_node
-            ensure_version_on_node(node=node, version_name=version_name, version_dir=version_dir)
 
     return server_dir
 
@@ -1250,8 +1241,6 @@ def start_server(
         _drop_server_stats_snapshot(str(server.id))
         raise HTTPException(status_code=402, detail={"error": e.code, "message": e.message})
     except Exception as e:
-        import traceback
-        logger.error("start_server FAILED for %s: %s\n%s", server_id, e, traceback.format_exc())
         server.state = ServerState.suspended
         _drop_server_stats_snapshot(str(server.id))
         label = "Java" if is_java else "Bedrock"
@@ -1333,8 +1322,6 @@ def toggle_server(
         except HTTPException:
             raise
         except Exception as e:
-            import traceback
-            logger.error("toggle_server FAILED for %s: %s\n%s", server_id, e, traceback.format_exc())
             server.state = ServerState.suspended
             _drop_server_stats_snapshot(str(server.id))
             label = "Java" if is_java else "Bedrock"

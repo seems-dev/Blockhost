@@ -33,7 +33,7 @@ class AgentRuntime:
         self._lock = threading.Lock()
 
     def _post(self, path: str, json_data: dict[str, Any] | None = None) -> httpx.Response:
-        resp = httpx.post(f"{self.agent_base_url}{path}", headers=self._headers, json=json_data, timeout=30.0)
+        resp = httpx.post(f"{self.agent_base_url}{path}", headers=self._headers, json=json_data, timeout=300.0)
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:

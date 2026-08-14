@@ -34,7 +34,11 @@ class AgentRuntime:
 
     def _post(self, path: str, json_data: dict[str, Any] | None = None) -> httpx.Response:
         resp = httpx.post(f"{self.agent_base_url}{path}", headers=self._headers, json=json_data, timeout=30.0)
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error from Agent: {resp.text}")
+            raise
         return resp
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> httpx.Response:

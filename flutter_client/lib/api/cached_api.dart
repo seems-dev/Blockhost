@@ -91,10 +91,10 @@ class CachedBlockHostApi extends BlockHostApi {
   // ─── Versions catalog (changes only on new Bedrock release) ──────────────
 
   @override
-  Future<Map<String, dynamic>> getVersionsCatalog() => _cache.get(
+  Future<Map<String, dynamic>> getBedrockVersions() => _cache.get(
         key: 'versions_catalog',
         ttl: ApiCache.versionCatalog,
-        fetch: super.getVersionsCatalog,
+        fetch: super.getBedrockVersions,
       );
 
   // ─── Backups ──────────────────────────────────────────────────────────────

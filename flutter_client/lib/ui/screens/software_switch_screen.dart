@@ -80,7 +80,7 @@ class _SoftwareSwitchScreenState extends State<SoftwareSwitchScreen> with Single
       final isJava = _selectedFlavor?.type == ServerFlavorType.java;
       final catalog = isJava
           ? await widget.state.api.getJavaVersionsCatalog()
-          : await widget.state.api.getVersionsCatalog();
+          : await widget.state.api.getBedrockVersions();
       final available = (catalog['available'] as List?)?.map((e) => e.toString()).toList() ?? [];
       final recommended = catalog['recommended']?.toString();
 

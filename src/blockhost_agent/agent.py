@@ -458,11 +458,21 @@ def _fetch_latest_bedrock_version() -> str:
 
 def _download_bedrock_version(version_name: str) -> Path:
     """Download and extract a Bedrock version into VERSIONS_ROOT_DIR. Returns the installed version dir."""
-    import tempfile, zipfile
+    import tempfile, zipfile, stat
 
     url = f"https://mcjarfiles.com/api/get-jar/bedrock/latest/linux/{version_name}"
     VERSIONS_ROOT_DIR.mkdir(parents=True, exist_ok=True)
     version_dir = VERSIONS_ROOT_DIR / version_name
+
+    # Mojang CDN requires a browser-like User-Agent to serve the file
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+    }
 
     with tempfile.TemporaryDirectory(prefix="bedrock-agent-dl-") as td:
         tmpdir = Path(td)
@@ -470,15 +480,23 @@ def _download_bedrock_version(version_name: str) -> Path:
 
         logger.info(f"Downloading Bedrock {version_name} from MCJarFiles...")
         try:
-            with httpx.Client(follow_redirects=True, timeout=600.0) as client:
+            with httpx.Client(follow_redirects=True, timeout=600.0, headers=headers) as client:
                 with client.stream("GET", url) as resp:
                     if resp.status_code == 404:
                         raise ValueError(f"Version {version_name!r} not found on MCJarFiles (HTTP 404)")
                     if resp.status_code != 200:
                         raise ValueError(f"MCJarFiles returned HTTP {resp.status_code} for {version_name!r}")
+                    total = int(resp.headers.get("content-length", 0))
+                    downloaded = 0
                     with open(zip_path, "wb") as f:
                         for chunk in resp.iter_bytes(1024 * 1024):
                             f.write(chunk)
+                            downloaded += len(chunk)
+                            if total:
+                                pct = downloaded * 100 // total
+                                if downloaded % (10 * 1024 * 1024) < 1024 * 1024:
+                                    logger.info(f"Bedrock {version_name}: {pct}% ({downloaded // (1024*1024)}MB / {total // (1024*1024)}MB)")
+                    logger.info(f"Download complete for Bedrock {version_name} ({downloaded // (1024*1024)}MB)")
         except ValueError:
             raise  # re-raise our descriptive errors
         except Exception as e:
@@ -487,12 +505,25 @@ def _download_bedrock_version(version_name: str) -> Path:
         extract_dir = tmpdir / "extract"
         extract_dir.mkdir(parents=True, exist_ok=True)
 
+        logger.info(f"Extracting Bedrock {version_name}...")
         try:
             with zipfile.ZipFile(zip_path) as zf:
-                zf.extractall(extract_dir)
+                for info in zf.infolist():
+                    # Extract the file
+                    extracted_path = extract_dir / info.filename
+                    zf.extract(info, extract_dir)
+                    # CRITICAL: Restore Unix permissions from the ZIP's external_attr
+                    # Python's extractall() silently drops them — bedrock_server would land as 0644 (not executable)
+                    unix_perms = (info.external_attr >> 16) & 0xFFFF
+                    if unix_perms:
+                        try:
+                            extracted_path.chmod(unix_perms & 0o7777)
+                        except OSError:
+                            pass
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Invalid zip for Bedrock {version_name}: {e}")
 
+        # Locate the bedrock_server binary (may be in a subdirectory)
         has_binary = any((extract_dir / name).exists() for name in ("bedrock_server", "bedrock_server.exe"))
         if not has_binary:
             children = [p for p in extract_dir.iterdir() if p.is_dir()]
@@ -505,12 +536,20 @@ def _download_bedrock_version(version_name: str) -> Path:
         if not has_binary:
             raise HTTPException(status_code=500, detail=f"Downloaded ZIP for {version_name} does not contain bedrock_server binary")
 
+        # Ensure bedrock_server is executable regardless of what was in the ZIP
+        for bin_name in ("bedrock_server", "bedrock_server.exe"):
+            bin_path = extract_dir / bin_name
+            if bin_path.exists():
+                current = bin_path.stat().st_mode
+                bin_path.chmod(current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                logger.info(f"Set executable bit on {bin_path}")
+
         tmp_install = VERSIONS_ROOT_DIR / f".tmp-{version_name}"
         if tmp_install.exists():
             shutil.rmtree(tmp_install)
         shutil.move(str(extract_dir), str(tmp_install))
         tmp_install.rename(version_dir)
-        logger.info(f"Successfully installed Bedrock version {version_name}")
+        logger.info(f"Successfully installed Bedrock version {version_name} to {version_dir}")
 
     return version_dir
 

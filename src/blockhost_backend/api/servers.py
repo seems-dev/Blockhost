@@ -1325,6 +1325,7 @@ def toggle_server(
             server.state = ServerState.suspended
             _drop_server_stats_snapshot(str(server.id))
             label = "Java" if is_java else "Bedrock"
+            logger.exception(f"Failed to start {label} process")
             raise HTTPException(
                 status_code=503, detail=f"Failed to start {label} process: {e}"
             )

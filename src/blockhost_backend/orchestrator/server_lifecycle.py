@@ -129,15 +129,18 @@ class ServerLifecycleOrchestrator:
             )
         )
 
-        # OPTIONAL VERSION CHECK (Bedrock only)
+        # If the agent used a different version than requested (e.g. fell back to latest
+        # because the stored version wasn't available on MCJarFiles), accept it and
+        # update mc_config so future starts also use the working version.
         requested = mc_config.get("template_version")
-        if not is_java and requested and result.actual_version:
-            if requested not in {"LATEST", "PREVIEW"}:
-                if not str(result.actual_version).startswith(str(requested)):
-                    self._runtime.stop_server(str(server.id))
-                    raise RuntimeError(
-                        f"Version mismatch (requested={requested}, actual={result.actual_version})"
-                    )
+        if not is_java and result.actual_version and requested and result.actual_version != requested:
+            logger.warning(
+                "Server %s: requested version %r but agent used %r — updating stored version.",
+                server.id, requested, result.actual_version,
+            )
+            updated_config = dict(server.mc_config or {})
+            updated_config["template_version"] = result.actual_version
+            server.mc_config = updated_config
 
         server.vm_id = result.runtime_id
         if server.node_id and server.vm_ipv4:

@@ -126,12 +126,18 @@ class SystemdRuntime:
         else:
             # --- BEDROCK STARTUP LOGIC ---
             exe_cmd = f"exec 3<> stdin.fifo; exec '{executable}' <&3"
+        import pwd
+        import grp
+        user_name = pwd.getpwuid(os.getuid()).pw_name
+        group_name = grp.getgrgid(os.getgid()).gr_name
 
         cmd = [
             "systemd-run",
             "--unit", unit,
             "--collect",
             "--property", f"WorkingDirectory={server_dir}",
+            "--property", f"User={user_name}",
+            "--property", f"Group={group_name}",
             "--property", f"MemoryMax={request.ram_mb + 512}M" if is_java else f"MemoryMax={request.ram_mb}M",
             "--property", f"CPUQuota={request.cpu_quota_pct}%",
             "--property", "TasksMax=512",

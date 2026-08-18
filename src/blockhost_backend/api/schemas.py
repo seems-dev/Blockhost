@@ -104,6 +104,22 @@ class ServerActionResponse(BaseModel):
     state: ServerState
 
 
+class ServerCollaboratorCreate(BaseModel):
+    email: EmailStr
+    permissions: list[str]
+
+
+class ServerCollaboratorOut(BaseModel):
+    id: uuid.UUID
+    server_id: uuid.UUID
+    user_id: uuid.UUID
+    nickname: str
+    email: EmailStr
+    permissions: list[str]
+    created_at: datetime
+    updated_at: datetime
+
+
 class BedrockServerStats(BaseModel):
     host: str
     port: int
@@ -143,14 +159,14 @@ class CommandRequest(BaseModel):
     grant: bool | None = None
     mode: str | None = None
     value: str | None = None
+    weather: str | None = None
+    message: str | None = None
 
 
 class PlayerInfo(BaseModel):
     """Player info with name and XUID"""
     name: str
     xuid: str | None = None  # May be None if XUID not yet extracted from logs
-    weather: str | None = None
-    message: str | None = None
 
 
 

@@ -214,9 +214,30 @@ class Server(Base):
 
     owner: Mapped[User] = relationship(back_populates="servers")
     bans: Mapped[list["Ban"]] = relationship(back_populates="server", cascade="all, delete-orphan")
+    collaborators: Mapped[list["ServerCollaborator"]] = relationship(back_populates="server", cascade="all, delete-orphan")
     flavor: Mapped[ServerFlavor] = mapped_column(Enum(ServerFlavor), default=ServerFlavor.BEDROCK)
     mc_version: Mapped[str | None] = mapped_column(String(32)) # e.g., "1.21.4"
     java_version: Mapped[int | None] = mapped_column(Integer, nullable=True) # e.g., 21
+
+
+class ServerCollaborator(Base):
+    __tablename__ = "server_collaborators"
+    __table_args__ = (
+        UniqueConstraint("server_id", "user_id", name="uq_server_collaborators_server_user"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    server_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
+    
+    # List of string permissions, e.g. ["start_stop", "console", "files", "config"]
+    permissions: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+    server: Mapped["Server"] = relationship(back_populates="collaborators")
+    user: Mapped["User"] = relationship()
 
 
 class BillingPlan(Base):

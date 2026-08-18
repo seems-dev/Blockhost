@@ -1,6 +1,5 @@
-
 from __future__ import annotations
-
+from blockhost_backend.database.schema import ServerCollaborator
 from uvicorn import server
 from blockhost_backend.database.schema import Node, ServerFlavor
 import logging
@@ -28,6 +27,8 @@ from blockhost_backend.api.schemas import (
     CreateServerRequest,
     PlayerInfo,
     ServerActionResponse,
+    ServerCollaboratorCreate,
+    ServerCollaboratorOut,
     ServerConfigOut,
     ServerConfigUpdateRequest,
     SoftwareSwitchRequest,
@@ -114,6 +115,37 @@ def _invalidate_server_read_cache(user_id: uuid.UUID, server_id: uuid.UUID | str
 
 
 
+
+
+def _get_server_for_user(server_id: str, user: User, db: Session, required_permission: str | None = None) -> Server:
+    try:
+        server_uuid = uuid.UUID(server_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Server not found")
+    server = db.get(Server, server_uuid)
+    if not server:
+        raise HTTPException(status_code=404, detail="Server not found")
+        
+    if server.owner_id == user.id:
+        return server
+        
+    # Check collaborators
+    from blockhost_backend.database.schema import ServerCollaborator
+    from sqlalchemy import select
+    collab = db.execute(
+        select(ServerCollaborator).where(
+            ServerCollaborator.server_id == server.id,
+            ServerCollaborator.user_id == user.id
+        )
+    ).scalars().first()
+    
+    if not collab:
+        raise HTTPException(status_code=404, detail="Server not found")
+        
+    if required_permission and required_permission not in collab.permissions:
+        raise HTTPException(status_code=403, detail=f"Missing required permission: {required_permission}")
+        
+    return server
 
 def _guard_disk_for_operation(operation: str) -> None:
     try:
@@ -918,13 +950,7 @@ def reprovision_java_server(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerActionResponse:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="start_stop")
     if not is_java_flavor(server.flavor):
         raise HTTPException(status_code=400, detail="Only Java servers can be reprovisioned")
     if not server.mc_version:
@@ -969,13 +995,7 @@ def switch_server_software(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerActionResponse:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="config")
 
     is_currently_java = is_java_flavor(server.flavor)
     target_is_java = is_java_flavor(payload.target_flavor)
@@ -1147,13 +1167,7 @@ def get_server(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerStateSnapshot:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db)
     cache = get_api_cache()
     cache_key = _server_detail_cache_key(user.id, server.id)
     cached_detail = cache.get_json(cache_key)
@@ -1193,13 +1207,7 @@ def start_server(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerActionResponse:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="start_stop")
 
     is_actually_running = False
     if server.state == ServerState.running:
@@ -1258,13 +1266,7 @@ def stop_server(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerActionResponse:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="start_stop")
 
     _stop_server_process(server)
     db.commit()
@@ -1279,13 +1281,7 @@ def toggle_server(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerActionResponse:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="start_stop")
 
     is_actually_running = False
     if server.state == ServerState.running:
@@ -1342,13 +1338,7 @@ def get_server_config(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerConfigOut:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="config")
     cache = get_api_cache()
     cache_key = _server_config_cache_key(user.id, server.id)
     cached = cache.get_json(cache_key)
@@ -1366,13 +1356,7 @@ def update_server_config(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerConfigOut:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="config")
 
     current = dict(server.mc_config or {})
     update = payload.config.model_dump(exclude_none=True)
@@ -1419,13 +1403,7 @@ def get_server_stats(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> BedrockServerStats:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db)
     return _get_server_stats_snapshot(server, db, background_tasks)
 
 
@@ -1437,13 +1415,7 @@ def get_server_logs(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[str]:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="console")
 
     # Clamp tail to prevent memory DoS from huge values
     tail = max(1, min(tail, _MAX_LOG_TAIL))
@@ -1545,13 +1517,7 @@ async def console_websocket(
 
 
 def _require_server(server_id: str, user: User, db: Session) -> Server:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="console")
     return server
 
 def _send_cmd(server_id: str, cmd: str) -> dict:
@@ -1729,3 +1695,125 @@ def get_blocklist(server_id: str, user: User = Depends(get_current_user), db: Se
     _require_server(server_id, user, db)
     # Mocking blocklist for now, since vanilla BDS doesn't track this neatly via command
     return {"players": []}
+
+
+@router.post("/{server_id}/collaborators", response_model=ServerCollaboratorOut)
+def invite_collaborator(
+    server_id: str,
+    payload: ServerCollaboratorCreate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        server_uuid = uuid.UUID(server_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Server not found")
+        
+    server = db.get(Server, server_uuid)
+    if not server or server.owner_id != user.id:
+        raise HTTPException(status_code=403, detail="Only the server owner can manage collaborators")
+        
+    target_user = db.execute(select(User).where(User.email == payload.email)).scalars().first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User with this email not found")
+        
+    if target_user.id == user.id:
+        raise HTTPException(status_code=400, detail="Cannot invite yourself")
+        
+    collab = db.execute(
+        select(ServerCollaborator).where(
+            ServerCollaborator.server_id == server.id,
+            ServerCollaborator.user_id == target_user.id
+        )
+    ).scalars().first()
+    
+    if collab:
+        # Update existing
+        collab.permissions = payload.permissions
+    else:
+        collab = ServerCollaborator(
+            server_id=server.id,
+            user_id=target_user.id,
+            permissions=payload.permissions
+        )
+        db.add(collab)
+        
+    db.commit()
+    db.refresh(collab)
+    
+    return ServerCollaboratorOut(
+        id=collab.id,
+        server_id=collab.server_id,
+        user_id=collab.user_id,
+        nickname=target_user.nickname,
+        email=target_user.email,
+        permissions=collab.permissions,
+        created_at=collab.created_at,
+        updated_at=collab.updated_at
+    )
+
+@router.get("/{server_id}/collaborators", response_model=list[ServerCollaboratorOut])
+def list_collaborators(
+    server_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        server_uuid = uuid.UUID(server_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Server not found")
+        
+    server = db.get(Server, server_uuid)
+    if not server or server.owner_id != user.id:
+        raise HTTPException(status_code=403, detail="Only the server owner can view collaborators")
+        
+    collabs = db.execute(
+        select(ServerCollaborator).where(ServerCollaborator.server_id == server.id)
+    ).scalars().all()
+    
+    results = []
+    for c in collabs:
+        # We need the user info, we can access c.user since we have relationship configured
+        results.append(
+            ServerCollaboratorOut(
+                id=c.id,
+                server_id=c.server_id,
+                user_id=c.user_id,
+                nickname=c.user.nickname,
+                email=c.user.email,
+                permissions=c.permissions,
+                created_at=c.created_at,
+                updated_at=c.updated_at
+            )
+        )
+    return results
+
+@router.delete("/{server_id}/collaborators/{user_id}", status_code=204)
+def remove_collaborator(
+    server_id: str,
+    user_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        server_uuid = uuid.UUID(server_id)
+        target_user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Not found")
+        
+    server = db.get(Server, server_uuid)
+    if not server or server.owner_id != user.id:
+        raise HTTPException(status_code=403, detail="Only the server owner can manage collaborators")
+        
+    collab = db.execute(
+        select(ServerCollaborator).where(
+            ServerCollaborator.server_id == server.id,
+            ServerCollaborator.user_id == target_user_uuid
+        )
+    ).scalars().first()
+    
+    if collab:
+        db.delete(collab)
+        db.commit()
+    return None
+

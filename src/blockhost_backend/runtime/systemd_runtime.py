@@ -26,15 +26,23 @@ _UNIT_RE = re.compile(r"[^A-Za-z0-9_.@-]+")
 
 import threading
 
-# Matches: Bedrock: "Player connected: Name, xuid: ..." or Java: "]: Name joined the game"
+# Matches Bedrock connect events:
+#   "Player connected: Name, xuid: 12345"   (comma-separated)
+#   "Player Spawned: Name xuid: 12345"       (space-separated, newer BDS)
+# Also matches Java: "]: Name joined the game"
 _PLAYER_CONNECTED_RE = re.compile(
-    r"(?:Player (?:connected|Spawned):\s*([^,]+)(?:,\s*xuid:\s*(\d+))?)|(?:\]:\s*([A-Za-z0-9_]+)\s+joined the game)",
-    re.IGNORECASE
+    r"(?:Player (?:connected|Spawned):\s*(.+?)(?:[,\s]+xuid:\s*(\d+))?(?:\s*$|,))"
+    r"|(?:\]:\s*([A-Za-z0-9_]+)\s+joined the game)",
+    re.IGNORECASE,
 )
-# Matches: Bedrock: "Player disconnected: Name" or Java: "]: Name left the game"
+# Matches Bedrock disconnect:
+#   "Player disconnected: Name, xuid: 12345"
+#   "Player disconnected: Name, xuid: 12345, pfid: ..."
+# Also matches Java: "]: Name left the game"
 _PLAYER_DISCONNECTED_RE = re.compile(
-    r"(?:Player disconnected:\s*([^,]+))|(?:\]:\s*([A-Za-z0-9_]+)\s+left the game)", 
-    re.IGNORECASE
+    r"(?:Player disconnected:\s*(.+?)(?:[,\s]+xuid:\s*(\d+))?(?:\s*$|,))"
+    r"|(?:\]:\s*([A-Za-z0-9_]+)\s+left the game)",
+    re.IGNORECASE,
 )
 
 class SystemdRuntime:
@@ -399,10 +407,10 @@ class SystemdRuntime:
                     with self._lock:
                         if m_conn:
                             player_name = (m_conn.group(1) or m_conn.group(3)).strip()
-                            xuid = m_conn.group(2) if m_conn.lastindex >= 2 and m_conn.group(2) else None
+                            xuid = m_conn.group(2) if m_conn.group(2) else None
                             self._online_players.setdefault(server_id, {})[player_name] = xuid
                         elif m_disc:
-                            player_name = (m_disc.group(1) or m_disc.group(2)).strip()
+                            player_name = (m_disc.group(1) or m_disc.group(3)).strip()
                             self._online_players.setdefault(server_id, {}).pop(player_name, None)
                         listeners = list(self._listeners.get(server_id, []))
 

@@ -146,15 +146,35 @@ def _agent_policy_params(policy: FileAccessPolicy, extra: dict | None = None) ->
     return params
 
 
-def _get_server(server_id: str, user: User, db: Session) -> Server:
+def _get_server(server_id: str, user: User, db: Session, required_permission: str = "files") -> Server:
     try:
         server_uuid = uuid.UUID(server_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Server not found")
 
     server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
+    if not server:
         raise HTTPException(status_code=404, detail="Server not found")
+        
+    if server.owner_id == user.id:
+        return server
+        
+    from sqlalchemy import select
+    from blockhost_backend.database.schema import ServerCollaborator
+    
+    collab = db.execute(
+        select(ServerCollaborator).where(
+            ServerCollaborator.server_id == server.id,
+            ServerCollaborator.user_id == user.id
+        )
+    ).scalars().first()
+    
+    if not collab:
+        raise HTTPException(status_code=404, detail="Server not found")
+        
+    if required_permission not in collab.permissions:
+        raise HTTPException(status_code=403, detail=f"Missing required permission: {required_permission}")
+        
     return server
 
 

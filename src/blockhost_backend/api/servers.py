@@ -354,13 +354,34 @@ def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
         is_bedrock = server.flavor == ServerFlavor.BEDROCK
         
         if is_bedrock:
-            pong = bedrock_unconnected_ping(
-                host=("127.0.0.1" if not server.node_id else host),
-                port=port,
-                timeout_seconds=1.0,
-            )
-            parsed = parse_bedrock_pong_payload(pong.payload)
-            # Convert online players dict to PlayerInfo list
+            # For remote nodes, proxy the Bedrock UDP ping through the agent
+            # (the control plane can't reliably send UDP across Docker NAT / AWS SGs).
+            # For local nodes, ping directly.
+            parsed: dict[str, object] = {}
+            ping_latency: int | None = None
+            ping_reachable = False
+
+            if server.node_id:
+                # Remote node: ask the agent to ping locally
+                pong_data = _ORCHESTRATOR.ping_server(str(server.id))
+                if pong_data and pong_data.get("reachable"):
+                    ping_reachable = True
+                    ping_latency = pong_data.get("latency_ms")
+                    parsed = pong_data
+            else:
+                # Local node: ping directly
+                try:
+                    pong = bedrock_unconnected_ping(
+                        host="127.0.0.1", port=port, timeout_seconds=1.0,
+                    )
+                    parsed = parse_bedrock_pong_payload(pong.payload)
+                    ping_latency = pong.latency_ms
+                    ping_reachable = True
+                except Exception:
+                    pass  # ping failed — still return base stats below
+
+            # Always try to get the player list from the runtime (agent HTTP),
+            # independent of whether the UDP ping succeeded.
             players_with_xuid = runtime_status.runtime_id and _ORCHESTRATOR.get_online_players_with_xuid(str(server.id))
             player_info_list = [
                 PlayerInfo(name=name, xuid=xuid)
@@ -368,8 +389,8 @@ def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
             ]
             return BedrockServerStats(
                 **base_stats,
-                reachable=True,
-                latency_ms=pong.latency_ms,
+                reachable=ping_reachable,
+                latency_ms=ping_latency,
                 edition=parsed.get("edition"),
                 motd=parsed.get("motd"),
                 motd2=parsed.get("motd2"),
@@ -386,8 +407,9 @@ def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
             import time
             start = time.monotonic()
             protocol = get_protocol_version(server.mc_version) if server.mc_version else None
+            ping_host = "127.0.0.1" if not server.node_id else host
             java_pong = java_server_ping(
-                host=("127.0.0.1" if not server.node_id else host),
+                host=ping_host,
                 port=port,
                 timeout_seconds=1.0,
                 protocol_version=protocol,

@@ -332,6 +332,53 @@ def send_command(
     return {"status": "ok"}
 
 
+@app.get("/agent/servers/{server_id}/ping")
+def ping_server(
+    server_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Perform a local Bedrock UDP ping (RakNet) on behalf of the control plane.
+
+    The control plane cannot reliably send UDP across Docker NAT / AWS
+    security groups, so we ping 127.0.0.1 here on the agent node and
+    return the parsed pong payload.
+    """
+    _validate_server_id(server_id)
+    status = runtime.get_status(server_id)
+    if not status.running:
+        return {"reachable": False}
+
+    from blockhost_backend.minecraft.bedrock_ping import (
+        bedrock_unconnected_ping,
+        parse_bedrock_pong_payload,
+    )
+
+    # Determine the port from server.properties (fall back to 19132)
+    server_dir = SERVERS_ROOT_DIR / server_id
+    port = 19132
+    props_path = server_dir / "server.properties"
+    if props_path.is_file():
+        for line in props_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("server-port="):
+                try:
+                    port = int(line.split("=", 1)[1].strip())
+                except ValueError:
+                    pass
+                break
+
+    try:
+        pong = bedrock_unconnected_ping(host="127.0.0.1", port=port, timeout_seconds=2.0)
+        parsed = parse_bedrock_pong_payload(pong.payload)
+        return {
+            "reachable": True,
+            "latency_ms": pong.latency_ms,
+            **parsed,
+        }
+    except Exception as e:
+        logger.warning("Bedrock ping failed for server %s on port %d: %s", server_id, port, e)
+        return {"reachable": False}
+
+
 # ---------------------------------------------------------------------------
 # Log Streaming (WebSocket)
 # ---------------------------------------------------------------------------

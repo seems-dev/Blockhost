@@ -53,6 +53,12 @@ class ServerLifecycleOrchestrator:
     def get_online_players_with_xuid(self, server_id: str) -> dict[str, str | None]:
         return self._runtime.get_online_players_with_xuid(server_id)
 
+    def ping_server(self, server_id: str) -> dict[str, object] | None:
+        """Proxy Bedrock ping through the agent for remote nodes."""
+        if hasattr(self._runtime, "ping_server"):
+            return self._runtime.ping_server(server_id)
+        return None
+
     # ---------------- START ----------------
     def start_server(
         self,

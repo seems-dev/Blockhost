@@ -110,6 +110,17 @@ class AgentRuntime:
         except Exception:
             return {}
 
+    def ping_server(self, server_id: str) -> dict[str, object] | None:
+        """Ask the agent to perform a local Bedrock UDP ping and return parsed results."""
+        try:
+            resp = self._get(f"/agent/servers/{server_id}/ping")
+            data = resp.json()
+            if data.get("reachable"):
+                return data
+            return None
+        except Exception:
+            return None
+
     def read_logs(self, server_id: str, *, tail: int = 200) -> list[LogEntry]:
         try:
             resp = self._get(f"/agent/servers/{server_id}/logs", params={"tail": tail})

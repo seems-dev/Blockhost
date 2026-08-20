@@ -46,6 +46,15 @@ class AgentRuntime:
         resp.raise_for_status()
         return resp
 
+    def _put(self, path: str, json_data: dict[str, Any] | None = None) -> httpx.Response:
+        resp = httpx.put(f"{self.agent_base_url}{path}", headers=self._headers, json=json_data, timeout=300.0)
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error from Agent: {resp.text}")
+            raise
+        return resp
+
     def start_server(self, request: RuntimeStartRequest) -> RuntimeStartResult:
         payload = {
             "server_dir_rel": request.server_id,

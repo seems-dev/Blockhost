@@ -221,7 +221,6 @@ class _ServerControlScreenState extends State<ServerControlScreen> {
                                   builder: (_) => ServerPropertiesScreen(
                                     state: widget.state,
                                     serverId: widget.serverId,
-                                    flavor: widget.flavor,
                                   ),
                                 ),
                               ),
@@ -1069,7 +1068,8 @@ class _ModsButton extends StatelessWidget {
               ),
             ],
           ),
-    );
+        ),
+      );
 }
 
 class _PropertiesButton extends StatelessWidget {

@@ -10,12 +10,10 @@ class ServerPropertiesScreen extends StatefulWidget {
     super.key,
     required this.state,
     required this.serverId,
-    required this.flavor,
   });
 
   final AppState state;
   final String serverId;
-  final String flavor;
 
   @override
   State<ServerPropertiesScreen> createState() => _ServerPropertiesScreenState();
@@ -366,7 +364,6 @@ class _ServerPropertiesScreenState extends State<ServerPropertiesScreen> {
                                 _buildField('server-name', 'Server Name', 'Name displayed in the server list (Bedrock).', null),
                                 _buildField('motd', 'Message of the Day', 'Message displayed in the server list (Java).', null),
                                 _buildField('online-mode', 'Online Mode', 'Verify players with Xbox Live / Mojang.', null),
-                                _buildField('server-port', 'Port', 'The port the server listens on.', null),
                               ]),
                             ],
                           ),

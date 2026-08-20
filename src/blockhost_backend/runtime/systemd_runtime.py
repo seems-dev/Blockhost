@@ -148,6 +148,8 @@ class SystemdRuntime:
             "--property", f"Group={group_name}",
             "--property", f"MemoryMax={request.ram_mb + 512}M" if is_java else f"MemoryMax={request.ram_mb}M",
             "--property", f"CPUQuota={request.cpu_quota_pct}%",
+            "--property", "MemoryAccounting=yes",
+            "--property", "CPUAccounting=yes",
             "--property", "TasksMax=512",
             "/bin/bash", "-c", exe_cmd,
         ]
@@ -408,7 +410,7 @@ class SystemdRuntime:
         proc = subprocess.Popen(
             ["journalctl", "-u", unit, "-f", "-n", "0", "--no-pager"],
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
         )
         self._log_procs[server_id] = proc

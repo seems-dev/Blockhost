@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-
+#file_name = java_properties.py 
 @dataclass(frozen=True)
 class JavaServerProperties:
     server_port: int = 25565

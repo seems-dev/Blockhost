@@ -1,4 +1,5 @@
 from __future__ import annotations
+#file_name = api/server.py
 from blockhost_backend.database.schema import ServerCollaborator
 from uvicorn import server
 from blockhost_backend.database.schema import Node, ServerFlavor
@@ -1457,6 +1458,12 @@ def update_server_properties(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
+    # Properties that must never be changed from the UI
+    BLOCKED_KEYS = {"server-port", "server-portv6"}
+    blocked = BLOCKED_KEYS & props.keys()
+    if blocked:
+        raise HTTPException(status_code=400, detail=f"Cannot modify protected properties: {', '.join(sorted(blocked))}")
+
     server = _get_server_for_user(server_id, user, db, required_permission="config")
     
     try:

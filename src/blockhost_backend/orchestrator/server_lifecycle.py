@@ -170,6 +170,12 @@ class ServerLifecycleOrchestrator:
     def read_logs(self, server_id: str, *, tail: int = 200) -> list[LogEntry]:
         return self._runtime.read_logs(server_id, tail=tail)
 
+    def get_properties(self, server_id: str) -> dict[str, str | bool | int]:
+        return self._runtime.get_properties(server_id)
+
+    def update_properties(self, server_id: str, props: dict[str, str | bool | int]) -> None:
+        self._runtime.update_properties(server_id, props)
+
     # ---------------- COMMANDS ----------------
     def send_command(self, server_id: str, command: str) -> None:
         status = self._runtime.get_status(server_id)

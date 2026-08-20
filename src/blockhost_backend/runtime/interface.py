@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol,abstractmethod
 
 
 # -------------------------
@@ -90,6 +90,16 @@ class Runtime(Protocol):
         ...
 
     def read_logs(self, server_id: str, *, tail: int = 200) -> list[LogEntry]:
+        ...
+
+    @abstractmethod
+    def get_properties(self, server_id: str) -> dict[str, str | bool | int]:
+        """Read the server.properties file."""
+        ...
+
+    @abstractmethod
+    def update_properties(self, server_id: str, props: dict[str, str | bool | int]) -> None:
+        """Update properties in server.properties file in-place."""
         ...
 
     def send_command(self, server_id: str, command: str) -> None:

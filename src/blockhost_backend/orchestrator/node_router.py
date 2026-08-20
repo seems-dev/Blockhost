@@ -93,6 +93,12 @@ class NodeRouter(Runtime):
     def read_logs(self, server_id: str, *, tail: int = 200) -> list[LogEntry]:
         return self._get_runtime(server_id).read_logs(server_id, tail=tail)
 
+    def get_properties(self, server_id: str) -> dict[str, str | bool | int]:
+        return self._get_runtime(server_id).get_properties(server_id)
+
+    def update_properties(self, server_id: str, props: dict[str, str | bool | int]) -> None:
+        self._get_runtime(server_id).update_properties(server_id, props)
+
     def send_command(self, server_id: str, command: str) -> None:
         return self._get_runtime(server_id).send_command(server_id, command)
 

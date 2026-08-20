@@ -313,8 +313,28 @@ class SystemdRuntime:
             ram_usage_mb=ram_usage_mb,
         )
 
+    def get_properties(self, server_id: str) -> dict[str, str | bool | int]:
+        server_dir = self._servers_dir / server_id
+        props_path = server_dir / "server.properties"
+        from blockhost_backend.minecraft.java_properties import read_properties
+        return read_properties(props_path)
+
+    def update_properties(self, server_id: str, props: dict[str, str | bool | int]) -> None:
+        server_dir = self._servers_dir / server_id
+        props_path = server_dir / "server.properties"
+        is_bedrock = (server_dir / "bedrock_server").exists()
+        
+        if is_bedrock:
+            from blockhost_backend.minecraft.bedrock_properties import set_bedrock_server_property
+            for k, v in props.items():
+                set_bedrock_server_property(props_path, k, v)
+        else:
+            from blockhost_backend.minecraft.java_properties import set_java_server_property
+            for k, v in props.items():
+                set_java_server_property(props_path, k, v)
+
     # ---------------- LOGS ----------------
-    def read_logs(self, server_id: str, tail: int = 200) -> list[LogEntry]:
+    def read_logs(self, server_id: str, *, tail: int = 200) -> list[LogEntry]:
         if shutil.which("journalctl") is None:
             return []
 

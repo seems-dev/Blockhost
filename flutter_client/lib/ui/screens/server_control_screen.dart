@@ -10,6 +10,8 @@ import 'bans_screen.dart';
 import 'mod_screen.dart';
 import 'server_console_screen.dart';
 import 'server_files_screen.dart';
+import 'server_properties_screen.dart';
+import 'software_switch_screen.dart';
 
 // ─── Design tokens (using actual TranquilTheme properties) ─────────────────────
 const _mono = 'monospace';
@@ -209,6 +211,23 @@ class _ServerControlScreenState extends State<ServerControlScreen> {
                                 ),
                               ),
                             )),
+                          ]),
+                          const SizedBox(height: 12),
+                          Row(children: [
+                            Expanded(child: _PropertiesButton(
+                              onTap: () => Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => ServerPropertiesScreen(
+                                    state: widget.state,
+                                    serverId: widget.serverId,
+                                    flavor: widget.flavor,
+                                  ),
+                                ),
+                              ),
+                            )),
+                            const SizedBox(width: 12),
+                            Expanded(child: const SizedBox.shrink()), // Empty placeholder for symmetry
                           ]),
                         ]),
                         const SizedBox(height: 20),
@@ -1041,6 +1060,39 @@ class _ModsButton extends StatelessWidget {
               const SizedBox(width: 10),
               Text(
                 'Manage Mods',
+                style: TextStyle(
+                  color: TranquilTheme.glowCyan,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  fontFamily: _mono,
+                ),
+              ),
+            ],
+          ),
+    );
+}
+
+class _PropertiesButton extends StatelessWidget {
+  const _PropertiesButton({required this.onTap});
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => GestureDetector(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 14),
+          decoration: BoxDecoration(
+            color: TranquilTheme.glowCyan.withOpacity(0.07),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: TranquilTheme.glowCyan.withOpacity(0.4)),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.tune_rounded, size: 18, color: TranquilTheme.glowCyan),
+              const SizedBox(width: 10),
+              Text(
+                'Properties',
                 style: TextStyle(
                   color: TranquilTheme.glowCyan,
                   fontSize: 13,

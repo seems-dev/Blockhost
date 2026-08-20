@@ -96,3 +96,30 @@ def write_java_server_properties(path: Path, props: JavaServerProperties) -> Non
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def read_properties(path: Path) -> dict[str, str | bool | int]:
+    """Parse a properties file into a dictionary."""
+    if not path.exists():
+        return {}
+
+    props = {}
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if "=" in line:
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            
+            # Simple type coercion
+            if val.lower() == "true":
+                props[key] = True
+            elif val.lower() == "false":
+                props[key] = False
+            elif val.isdigit():
+                props[key] = int(val)
+            else:
+                props[key] = val
+    return props

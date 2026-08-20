@@ -178,6 +178,22 @@ class CachedBlockHostApi extends BlockHostApi {
   }
 
   @override
+  Future<Map<String, dynamic>> getServerProperties(String serverId) => _cache.get(
+        key: ApiCache.serverProperties(serverId),
+        ttl: ApiCache.serverConfig, // Same TTL as config
+        fetch: () => super.getServerProperties(serverId),
+      );
+
+  @override
+  Future<void> updateServerProperties(String serverId, Map<String, dynamic> props) async {
+    await super.updateServerProperties(serverId, props);
+    _cache.invalidate(ApiCache.serverProperties(serverId));
+    // Also invalidate config and snapshot since they might contain some mirrored properties
+    _cache.invalidate(ApiCache.serverConfig_(serverId));
+    _cache.invalidate(ApiCache.server(serverId));
+  }
+
+  @override
   Future<BackupJob> createBackup(String serverId,
       {String? name, String? description}) async {
     final result = await super.createBackup(serverId,

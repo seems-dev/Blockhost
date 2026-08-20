@@ -379,6 +379,46 @@ def ping_server(
         return {"reachable": False}
 
 
+@app.get("/agent/servers/{server_id}/properties")
+def get_server_properties(
+    server_id: str,
+    _token: str = Depends(verify_token),
+) -> dict[str, str | bool | int]:
+    _validate_server_id(server_id)
+    server_dir = SERVERS_ROOT_DIR / server_id
+    props_path = server_dir / "server.properties"
+    
+    # We can use either bedrock or java read_properties since they are identical
+    from blockhost_backend.minecraft.java_properties import read_properties
+    return read_properties(props_path)
+
+
+@app.put("/agent/servers/{server_id}/properties")
+def update_server_properties(
+    server_id: str,
+    props: dict[str, str | bool | int],
+    _token: str = Depends(verify_token),
+) -> dict[str, str]:
+    _validate_server_id(server_id)
+    server_dir = SERVERS_ROOT_DIR / server_id
+    props_path = server_dir / "server.properties"
+    
+    # Determine flavor by checking if it's a bedrock server directory structure
+    # (simplest way on the agent is checking if bedrock_server binary exists)
+    is_bedrock = (server_dir / "bedrock_server").exists()
+    
+    if is_bedrock:
+        from blockhost_backend.minecraft.bedrock_properties import set_bedrock_server_property
+        for k, v in props.items():
+            set_bedrock_server_property(props_path, k, v)
+    else:
+        from blockhost_backend.minecraft.java_properties import set_java_server_property
+        for k, v in props.items():
+            set_java_server_property(props_path, k, v)
+            
+    return {"status": "ok"}
+
+
 # ---------------------------------------------------------------------------
 # Log Streaming (WebSocket)
 # ---------------------------------------------------------------------------

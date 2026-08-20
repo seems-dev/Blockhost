@@ -128,6 +128,16 @@ class AgentRuntime:
         except Exception:
             return []
 
+    def get_properties(self, server_id: str) -> dict[str, str | bool | int]:
+        try:
+            resp = self._get(f"/agent/servers/{server_id}/properties")
+            return resp.json()
+        except Exception:
+            return {}
+
+    def update_properties(self, server_id: str, props: dict[str, str | bool | int]) -> None:
+        self._put(f"/agent/servers/{server_id}/properties", json_data=props)
+
     def send_command(self, server_id: str, command: str) -> None:
         self._post(f"/agent/servers/{server_id}/command", json_data={"command": command})
 

@@ -1397,25 +1397,73 @@ def update_server_config(
     current.update(update)
     server.mc_config = current
 
-    if server.state == ServerState.running and (server.mc_config or {}).get("server_dir"):
+    if server.state == ServerState.running:
         try:
-            _, servers_dir, _ = _server_dirs()
-            server_dir = _validate_server_dir(
-                Path(server.mc_config["server_dir"]), servers_dir
-            )
-            write_server_properties(
-                server_dir / "server.properties",
-                _server_props_from_config(server=server, port=server.vm_port),
-            )
+            port = server.vm_port
+            props_dict: dict[str, object] = {}
+            if server.flavor == ServerFlavor.BEDROCK:
+                props_dict = {
+                    "server-name": update.get("server_name") or server.world_name,
+                    "gamemode": update.get("gamemode"),
+                    "difficulty": update.get("difficulty"),
+                    "max-players": update.get("max_players"),
+                    "allow-cheats": update.get("allow_cheats"),
+                    "level-name": update.get("level_name") or server.world_name,
+                    "level-seed": update.get("level_seed"),
+                }
+            else:
+                props_dict = {
+                    "motd": update.get("motd") or server.world_name,
+                    "max-players": update.get("max_players") or 20,
+                    "gamemode": update.get("gamemode") or "survival",
+                    "difficulty": update.get("difficulty") or "normal",
+                    "level-name": update.get("level_name") or server.world_name,
+                    "level-seed": update.get("level_seed") or "",
+                }
+            # Remove None values
+            props_dict = {k: v for k, v in props_dict.items() if v is not None}
+            if props_dict:
+                _ORCHESTRATOR.update_properties(str(server.id), props_dict)
         except Exception as e:
             raise HTTPException(
-                status_code=503, detail=f"Failed to update server.properties: {e}"
+                status_code=503, detail=f"Failed to update server properties: {e}"
             )
 
     db.commit()
     db.refresh(server)
     _invalidate_server_read_cache(user.id, server.id)
     return ServerConfigOut(id=server.id, mc_config=server.mc_config or {})
+
+
+@router.get("/{server_id}/properties")
+def get_server_properties(
+    server_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, str | bool | int]:
+    server = _get_server_for_user(server_id, user, db, required_permission="config")
+    
+    # We must try to reach the node. If offline, this will fail.
+    try:
+        return _ORCHESTRATOR.get_properties(str(server.id))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Failed to fetch properties from server node: {e}")
+
+
+@router.put("/{server_id}/properties")
+def update_server_properties(
+    server_id: str,
+    props: dict[str, str | bool | int],
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    server = _get_server_for_user(server_id, user, db, required_permission="config")
+    
+    try:
+        _ORCHESTRATOR.update_properties(str(server.id), props)
+        return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Failed to update properties on server node: {e}")
 
 
 @router.get("/{server_id}/stats", response_model=BedrockServerStats)

@@ -763,6 +763,30 @@ class BlockHostApi {
     return 'Request failed ($status)';
   }
 
+  // ─── Server properties endpoints ───────────────────────────────────────────
+
+  Future<Map<String, dynamic>> getServerProperties(String serverId) async {
+    final res = await http.get(
+      _u('/api/servers/$serverId/properties'),
+      headers: _headers(json: false, auth: true),
+    );
+    final decoded = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(decoded, res.statusCode));
+    return decoded as Map<String, dynamic>;
+  }
+
+  Future<void> updateServerProperties(String serverId, Map<String, dynamic> props) async {
+    final res = await http.put(
+      _u('/api/servers/$serverId/properties'),
+      headers: _headers(auth: true),
+      body: jsonEncode(props),
+    );
+    if (res.statusCode != 200) {
+      final decoded = _decodeJson(res.body);
+      throw ApiException(_err(decoded, res.statusCode));
+    }
+  }
+
 
   // ─── File management endpoints ─────────────────────────────────────────────
 

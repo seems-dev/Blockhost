@@ -114,4 +114,5 @@ class ApiCache {
   static String serverBackupSchedule(String id)=> 'backup_schedule:$id';
   static String serverBlocklist(String id)     => 'blocklist:$id';
   static String serverSubscription(String id)  => 'subscription:$id';
+  static String serverProperties(String id)    => 'properties:$id';
 }

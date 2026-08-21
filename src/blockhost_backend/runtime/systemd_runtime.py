@@ -32,7 +32,7 @@ import threading
 # Also matches Java: "]: Name joined the game"
 _PLAYER_CONNECTED_RE = re.compile(
     r"(?:Player (?:connected|Spawned):\s*(.+?)(?:[,\s]+xuid:\s*(\d+))?(?:\s*$|,))"
-    r"|(?:\]:\s*([A-Za-z0-9_]+)\s+joined the game)",
+    r"|(?:(?:^|\]:\s*)([A-Za-z0-9_]{1,16})\s+joined the game)",
     re.IGNORECASE,
 )
 # Matches Bedrock disconnect:
@@ -41,7 +41,7 @@ _PLAYER_CONNECTED_RE = re.compile(
 # Also matches Java: "]: Name left the game"
 _PLAYER_DISCONNECTED_RE = re.compile(
     r"(?:Player disconnected:\s*(.+?)(?:[,\s]+xuid:\s*(\d+))?(?:\s*$|,))"
-    r"|(?:\]:\s*([A-Za-z0-9_]+)\s+left the game)",
+    r"|(?:(?:^|\]:\s*)([A-Za-z0-9_]{1,16})\s+left the game)",
     re.IGNORECASE,
 )
 
@@ -289,7 +289,9 @@ class SystemdRuntime:
                     logger = logging.getLogger(__name__)
                     logger.warning(f"RCON /list failed for Java server {server_id}: {e}")
 
-        # Fallback to log parsing
+        # Fallback to log parsing. Rebuild from journal on demand so player
+        # state survives agent restarts and missed live log-stream windows.
+        self._rebuild_online_players_from_journal(server_id)
         with self._lock:
             return dict(self._online_players.get(server_id, {}))
     # ---------------- STATS (BASIC) ----------------
@@ -318,7 +320,7 @@ class SystemdRuntime:
 
         # Get all PIDs in the unit cgroup
         pids_result = subprocess.run(
-            ["systemctl",  "show", unit, "-p", "MainPID,ControlGroup"],
+            ["systemctl", "show", unit, "-p", "MainPID", "-p", "ControlGroup"],
             capture_output=True,
             text=True,
         )
@@ -436,6 +438,67 @@ class SystemdRuntime:
             for line in result.stdout.splitlines()
         ]
 
+    def _unit_active_since(self, server_id: str) -> str | None:
+        if not self._systemctl_available():
+            return None
+
+        result = subprocess.run(
+            ["systemctl", "show", self._unit_name(server_id), "-p", "ActiveEnterTimestamp"],
+            capture_output=True,
+            text=True,
+        )
+        for line in result.stdout.splitlines():
+            if not line.startswith("ActiveEnterTimestamp="):
+                continue
+            value = line.split("=", 1)[1].strip()
+            if value and value not in {"n/a", "0"}:
+                return value
+        return None
+
+    def _journal_lines_for_player_state(self, server_id: str, *, tail: int = 5000) -> list[str]:
+        if shutil.which("journalctl") is None:
+            return []
+
+        cmd = ["journalctl", "-u", self._unit_name(server_id), "-n", str(tail), "--no-pager", "-o", "cat"]
+        active_since = self._unit_active_since(server_id)
+        if active_since:
+            cmd.extend(["--since", active_since])
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return result.stdout.splitlines()
+
+    def _apply_player_log_line(self, players: dict[str, str | None], line: str) -> None:
+        m_conn = _PLAYER_CONNECTED_RE.search(line)
+        if m_conn:
+            player_name = (m_conn.group(1) or m_conn.group(3)).strip()
+            xuid = m_conn.group(2) if m_conn.group(2) else None
+            players[player_name] = xuid
+            return
+
+        m_disc = _PLAYER_DISCONNECTED_RE.search(line)
+        if m_disc:
+            player_name = (m_disc.group(1) or m_disc.group(3)).strip()
+            players.pop(player_name, None)
+
+    def _rebuild_online_players_from_journal(self, server_id: str) -> None:
+        try:
+            lines = self._journal_lines_for_player_state(server_id)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning("Failed to rebuild player state from journal for %s: %s", server_id, e)
+            return
+
+        players: dict[str, str | None] = {}
+        for line in lines:
+            self._apply_player_log_line(players, line)
+
+        if not lines:
+            return
+
+        with self._lock:
+            self._online_players[server_id] = players
+
     # ---------------- COMMAND ----------------
     def send_command(self, server_id: str, command: str) -> None:
         server_dir = self._server_dirs.get(server_id)
@@ -527,17 +590,9 @@ class SystemdRuntime:
                     stripped = line.strip("\n")
                     entry = LogEntry(ts=None, line=stripped)
 
-                    # Parse player connect/disconnect events
-                    m_conn = _PLAYER_CONNECTED_RE.search(stripped)
-                    m_disc = _PLAYER_DISCONNECTED_RE.search(stripped)
                     with self._lock:
-                        if m_conn:
-                            player_name = (m_conn.group(1) or m_conn.group(3)).strip()
-                            xuid = m_conn.group(2) if m_conn.group(2) else None
-                            self._online_players.setdefault(server_id, {})[player_name] = xuid
-                        elif m_disc:
-                            player_name = (m_disc.group(1) or m_disc.group(3)).strip()
-                            self._online_players.setdefault(server_id, {}).pop(player_name, None)
+                        players = self._online_players.setdefault(server_id, {})
+                        self._apply_player_log_line(players, stripped)
                         listeners = list(self._listeners.get(server_id, []))
 
                     # Harden listener execution: catch exceptions to prevent stream crash

@@ -54,8 +54,17 @@ def write_server_properties(path: Path, props: BedrockServerProperties) -> None:
     put("server-port", ipv4_port)
     put("server-portv6", ipv6_port)
     put("enable-lan-visibility", props.enable_lan_visibility)
+    import shutil
+    import os
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if path.exists():
+        backup_path = path.with_suffix(".properties.bak")
+        shutil.copy2(path, backup_path)
+
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(tmp_path, path)
 
 
 def read_properties(path: Path) -> dict[str, str | bool | int]:
@@ -114,4 +123,13 @@ def set_bedrock_server_property(path: Path, key: str, value: object) -> None:
         else:
             new_lines.append(f"{key}={value}")
 
-    path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    import shutil
+    import os
+
+    if path.exists():
+        backup_path = path.with_suffix(".properties.bak")
+        shutil.copy2(path, backup_path)
+
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    os.replace(tmp_path, path)

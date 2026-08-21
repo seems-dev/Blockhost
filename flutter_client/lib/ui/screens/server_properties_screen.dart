@@ -116,7 +116,7 @@ class _ServerPropertiesScreenState extends State<ServerPropertiesScreen> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           backgroundColor: TranquilTheme.glowCyan,
-          content: const Text('Properties updated successfully.',
+          content: const Text('Properties saved. Restart server for changes to take effect.',
               style: TextStyle(color: Colors.black87, fontFamily: 'monospace', fontSize: 12)),
         ));
         Navigator.pop(context, true); // Signal success

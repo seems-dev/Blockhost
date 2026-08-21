@@ -728,6 +728,8 @@ def _java_server_properties_from_config(*, server: Server, port: int) -> JavaSer
     if online_mode is None:
         online_mode = False
 
+    import uuid
+
     return JavaServerProperties(
         server_port=port,
         motd=cfg.get("motd") or server.world_name,
@@ -737,6 +739,9 @@ def _java_server_properties_from_config(*, server: Server, port: int) -> JavaSer
         online_mode=False,  # Enforced via JVM flag; property rewritten by server anyway
         level_name=cfg.get("level_name") or server.world_name,
         level_seed=cfg.get("level_seed") or "",
+        enable_rcon=True,
+        rcon_port=25575,  # We can just use 25575 since it only binds to localhost
+        rcon_password=uuid.uuid4().hex,
     )
 
 
@@ -1465,7 +1470,7 @@ def update_server_properties(
     props: dict[str, str | bool | int],
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> dict[str, str]:
+) -> dict[str, str | bool]:
     # Properties that must never be changed from the UI
     BLOCKED_KEYS = {"server-port", "server-portv6"}
     blocked = BLOCKED_KEYS & props.keys()
@@ -1476,7 +1481,7 @@ def update_server_properties(
     
     try:
         _ORCHESTRATOR.update_properties(str(server.id), props)
-        return {"status": "ok"}
+        return {"status": "ok", "restart_required": True}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Failed to update properties on server node: {e}")
 

@@ -251,6 +251,45 @@ class SystemdRuntime:
         )
     # Get players with their XUIDs (dict format: {name: xuid_or_none})
     def get_online_players_with_xuid(self, server_id: str) -> dict[str, str | None]:
+        # Try RCON for Java servers first
+        server_dir = self._server_dirs.get(server_id)
+        if server_dir is None:
+            from blockhost_backend.config.config_manager import get_settings
+            root = self._servers_root or Path(get_settings().bedrock_servers_dir)
+            server_dir = (root / server_id).resolve()
+        
+        is_java = not (server_dir / "bedrock_server").exists()
+        if is_java:
+            props = self.get_properties(server_id)
+            if props.get("enable-rcon") is True:
+                rcon_port = props.get("rcon.port", 25575)
+                rcon_password = props.get("rcon.password", "")
+                try:
+                    from blockhost_backend.minecraft.rcon_client import RconClient
+                    with RconClient("127.0.0.1", int(rcon_port), str(rcon_password)) as rcon:
+                        resp = rcon.command("/list")
+                        # Java /list response: "There are X of a max of Y players online: player1, player2"
+                        # Or simply "player1, player2" in some variants.
+                        import re
+                        m = re.search(r"online:\s*(.*)", resp, re.IGNORECASE)
+                        if m:
+                            players_str = m.group(1).strip()
+                        else:
+                            players_str = resp.strip()
+                        
+                        players = {}
+                        if players_str:
+                            for name in players_str.split(","):
+                                name = name.strip()
+                                if name:
+                                    players[name] = None
+                        return players
+                except Exception as e:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"RCON /list failed for Java server {server_id}: {e}")
+
+        # Fallback to log parsing
         with self._lock:
             return dict(self._online_players.get(server_id, {}))
     # ---------------- STATS (BASIC) ----------------
@@ -271,7 +310,9 @@ class SystemdRuntime:
         for line in show_result.stdout.splitlines():
             if line.startswith("MemoryCurrent="):
                 try:
-                    mem_bytes = int(line.split("=", 1)[1])
+                    val = line.split("=", 1)[1]
+                    if val not in ("[not set]", "infinity"):
+                        mem_bytes = int(val)
                 except ValueError:
                     pass
 
@@ -310,6 +351,18 @@ class SystemdRuntime:
         # Fallback to main PID if cgroup read failed
         if not all_pids and main_pid and main_pid > 0:
             all_pids = [main_pid]
+
+        # Fallback for memory if MemoryCurrent was [not set]
+        if mem_bytes is None and all_pids:
+            try:
+                with open(f"/proc/{all_pids[0]}/status") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            mem_kb = int(line.split()[1])
+                            mem_bytes = mem_kb * 1024
+                            break
+            except (OSError, ValueError, IndexError):
+                pass
 
         cpu_usage = None
         if all_pids:
@@ -396,8 +449,29 @@ class SystemdRuntime:
         if not status.running:
             raise RuntimeError("Server is not running")
 
+        is_java = not (server_dir / "bedrock_server").exists()
+        if is_java:
+            props = self.get_properties(server_id)
+            if props.get("enable-rcon") is True:
+                rcon_port = props.get("rcon.port", 25575)
+                rcon_password = props.get("rcon.password", "")
+                try:
+                    from blockhost_backend.minecraft.rcon_client import RconClient
+                    with RconClient("127.0.0.1", int(rcon_port), str(rcon_password)) as rcon:
+                        rcon.command(command)
+                        return
+                except Exception as e:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"RCON command failed for Java server {server_id}: {e}. Falling back to stdin FIFO.")
+
         if not fifo_path.exists():
-            raise RuntimeError("Server stdin FIFO not found. Try restarting the server.")
+            import os
+            os.mkfifo(fifo_path)
+            # Make sure it's accessible by the user/group that systemd runs as
+            # By default it inherits from the python process (root/ubuntu), but systemd-run uses User/Group.
+            # But we can at least try creating it.
+            # actually if we are the agent, we own the directory so it's fine.
 
         with open(fifo_path, "w") as f:
             f.write(command + "\n")
@@ -438,7 +512,7 @@ class SystemdRuntime:
 
         unit = self._unit_name(server_id)
         proc = subprocess.Popen(
-            ["journalctl", "-u", unit, "-f", "-n", "0", "--no-pager"],
+            ["journalctl", "-u", unit, "-f", "-n", "200", "--no-pager"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

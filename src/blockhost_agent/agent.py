@@ -198,13 +198,23 @@ def start_server(
 
     if payload.server_properties_dict is not None:
         props_path = server_dir / "server.properties"
-        lines = []
-        for k, v in payload.server_properties_dict.items():
-            # Replace underscores with hyphens for Java compatibility (e.g. server_port -> server-port)
-            safe_k = k.replace("_", "-")
-            v_str = "true" if v is True else "false" if v is False else str(v)
-            lines.append(f"{safe_k}={v_str}")
-        props_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if not props_path.exists():
+            lines = []
+            for k, v in payload.server_properties_dict.items():
+                # Replace underscores with hyphens for Java compatibility (e.g. server_port -> server-port)
+                safe_k = k.replace("_", "-")
+                v_str = "true" if v is True else "false" if v is False else str(v)
+                lines.append(f"{safe_k}={v_str}")
+            props_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        else:
+            # File exists. Preserve user changes, only enforce the port.
+            if is_java:
+                from blockhost_backend.minecraft.java_properties import set_java_server_property
+                set_java_server_property(props_path, "server-port", payload.port)
+            else:
+                from blockhost_backend.minecraft.bedrock_properties import set_bedrock_server_property
+                set_bedrock_server_property(props_path, "server-port", payload.port)
+                set_bedrock_server_property(props_path, "server-portv6", payload.port + 1)
 
     actual_version = payload.requested_version  # may be updated by Bedrock fallback
 

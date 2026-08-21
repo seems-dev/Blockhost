@@ -132,6 +132,24 @@ class _DashboardScreenState extends State<DashboardScreen>
           ? await api.refreshServers()
           : await api.listServers();
       _listStats.clear();
+      
+      // Fetch stats for running servers to populate the list cards
+      if (mounted) {
+        for (final server in servers) {
+          if (server is Map<String, dynamic> && server['state'] == 'running') {
+            final id = server['id']?.toString();
+            if (id != null) {
+              api.getServerStats(id).then((statsData) {
+                if (mounted) {
+                  setState(() {
+                    _listStats[id] = statsData;
+                  });
+                }
+              }).catchError((_) {});
+            }
+          }
+        }
+      }
     } on ApiException catch (e) {
       setState(() => status = e.message);
     } catch (e) {

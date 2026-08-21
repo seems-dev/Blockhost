@@ -416,6 +416,14 @@ def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
                 protocol_version=protocol,
             )
             latency = int((time.monotonic() - start) * 1000)
+
+            # Get player list from runtime (journal log stream parsing)
+            players_with_xuid = runtime_status.runtime_id and _ORCHESTRATOR.get_online_players_with_xuid(str(server.id))
+            player_info_list = [
+                PlayerInfo(name=name, xuid=xuid)
+                for name, xuid in (players_with_xuid or {}).items()
+            ]
+
             if java_pong:
                 players_node = java_pong.get("players", {})
                 version_node = java_pong.get("version", {})
@@ -433,13 +441,13 @@ def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
                     version=version_node.get("name"),
                     players_online=players_node.get("online"),
                     players_max=players_node.get("max"),
-                    online_players_list=[],
+                    online_players_list=player_info_list,
                 )
             else:
                 return BedrockServerStats(
                     **base_stats,
                     reachable=False,
-                    online_players_list=[],
+                    online_players_list=player_info_list,
                 )
     except Exception:
         return BedrockServerStats(

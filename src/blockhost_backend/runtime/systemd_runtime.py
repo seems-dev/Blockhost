@@ -213,11 +213,32 @@ class SystemdRuntime:
         )
 
         running = result.stdout.strip() == "active"
+        uptime_seconds = None
+
+        if running:
+            show_result = subprocess.run(
+                ["systemctl", "show", unit, "-p", "ActiveEnterTimestampMonotonic"],
+                capture_output=True,
+                text=True,
+            )
+            for line in show_result.stdout.splitlines():
+                if line.startswith("ActiveEnterTimestampMonotonic="):
+                    try:
+                        active_enter_us = int(line.split("=", 1)[1])
+                        if active_enter_us > 0:
+                            with open("/proc/uptime", "r") as f:
+                                current_uptime_s = float(f.read().split()[0])
+                                uptime_seconds = int(current_uptime_s - (active_enter_us / 1000000.0))
+                    except (ValueError, FileNotFoundError, IndexError):
+                        pass
 
         with self._lock:
             if not running:
                 self._stop_log_stream(server_id)
                 self._listeners.pop(server_id, None)
+            else:
+                if server_id not in self._log_procs:
+                    self._start_log_stream(server_id)
             # Convert {player_name: xuid} dict to list of player names
             players_dict = self._online_players.get(server_id, {})
             players = list(players_dict.keys()) if players_dict else []
@@ -225,6 +246,7 @@ class SystemdRuntime:
         return RuntimeStatus(
             running=running,
             runtime_id=unit if running else None,
+            uptime_seconds=uptime_seconds,
             online_players=players if running else None,
         )
     # Get players with their XUIDs (dict format: {name: xuid_or_none})
@@ -316,13 +338,21 @@ class SystemdRuntime:
         )
 
     def get_properties(self, server_id: str) -> dict[str, str | bool | int]:
-        server_dir = self._servers_dir / server_id
+        server_dir = self._server_dirs.get(server_id)
+        if server_dir is None:
+            from blockhost_backend.config.config_manager import get_settings
+            root = self._servers_root or Path(get_settings().bedrock_servers_dir)
+            server_dir = (root / server_id).resolve()
         props_path = server_dir / "server.properties"
         from blockhost_backend.minecraft.java_properties import read_properties
         return read_properties(props_path)
 
     def update_properties(self, server_id: str, props: dict[str, str | bool | int]) -> None:
-        server_dir = self._servers_dir / server_id
+        server_dir = self._server_dirs.get(server_id)
+        if server_dir is None:
+            from blockhost_backend.config.config_manager import get_settings
+            root = self._servers_root or Path(get_settings().bedrock_servers_dir)
+            server_dir = (root / server_id).resolve()
         props_path = server_dir / "server.properties"
         is_bedrock = (server_dir / "bedrock_server").exists()
         

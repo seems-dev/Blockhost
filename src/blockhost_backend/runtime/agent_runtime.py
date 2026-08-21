@@ -56,6 +56,11 @@ class AgentRuntime:
         return resp
 
     def start_server(self, request: RuntimeStartRequest) -> RuntimeStartResult:
+        # Filter out None values so Pydantic on the Agent doesn't reject the payload
+        clean_props = {}
+        if request.server_properties_dict:
+            clean_props = {k: v for k, v in request.server_properties_dict.items() if v is not None}
+
         payload = {
             "server_dir_rel": request.server_id,
             "port": request.port,
@@ -64,7 +69,7 @@ class AgentRuntime:
             "ram_mb": request.ram_mb,
             "cpu_quota_pct": request.cpu_quota_pct,
             "jdk_path": str(request.jdk_path) if request.jdk_path else None,
-            "server_properties_dict": request.server_properties_dict,
+            "server_properties_dict": clean_props,
             "jar_download_url": request.jar_download_url,
         }
         resp = self._post(f"/agent/servers/{request.server_id}/start", json_data=payload)
@@ -98,7 +103,8 @@ class AgentRuntime:
                 uptime_seconds=data.get("uptime_seconds"),
                 online_players=data.get("online_players"),
             )
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to get status for %s: %s", server_id, e)
             return RuntimeStatus(running=False)
 
     def get_stats(self, server_id: str) -> RuntimeResourceStats:
@@ -109,14 +115,16 @@ class AgentRuntime:
                 cpu_usage=data.get("cpu_usage"),
                 ram_usage_mb=data.get("ram_usage_mb"),
             )
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to get stats for %s: %s", server_id, e)
             return RuntimeResourceStats(cpu_usage=None, ram_usage_mb=None)
 
     def get_online_players_with_xuid(self, server_id: str) -> dict[str, str | None]:
         try:
             resp = self._get(f"/agent/servers/{server_id}/online_players")
             return resp.json()
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to get online players for %s: %s", server_id, e)
             return {}
 
     def ping_server(self, server_id: str) -> dict[str, object] | None:

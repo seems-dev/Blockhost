@@ -163,19 +163,31 @@ def signup(
     )
 
 
-@router.post("/login", response_model=AuthResponse)
+@router.post("/login")
 def login(
     payload: LoginRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     _: None = Depends(auth_rate_limit()),
-) -> AuthResponse:
+) -> AuthResponse | EmailVerificationRequiredResponse:
     user = db.execute(select(User).where(User.email == str(payload.email).lower())).scalar_one_or_none()
     if not user or user.deleted_at is not None:
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not verify_password(payload.password, user.auth_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if user.auth_provider == "local" and user.email_verified_at is None:
-        raise HTTPException(status_code=403, detail="Email not verified")
+        # Instead of a dead-end 403, re-send the OTP and tell the client
+        # to show the verification screen so the user can complete signup.
+        _issue_email_verification(user, background_tasks)
+        db.commit()
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "status": "verification_required",
+                "email": user.email,
+                "message": "Email not verified. A new verification code has been sent to your email.",
+            },
+        )
 
     response = _issue_auth_response(db=db, user=user)
     db.commit()

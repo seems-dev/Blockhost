@@ -14,6 +14,17 @@ class ApiException implements Exception {
   String toString() => message;
 }
 
+/// Thrown when a login attempt fails because the email has not been verified.
+/// The backend auto-resends the OTP, so the UI should show the verification flow.
+class EmailNotVerifiedException implements Exception {
+  EmailNotVerifiedException(this.email, this.message);
+  final String email;
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
 class BlockHostApi {
   BlockHostApi({required this.baseUrl, required this.accessToken});
 
@@ -93,6 +104,17 @@ class BlockHostApi {
       body: jsonEncode({'email': email, 'password': password}),
     );
     final body = _decodeJson(res.body);
+    // Detect the "verification_required" 403 and throw a specific exception
+    // so the UI can redirect to the OTP screen instead of showing a dead-end.
+    if (res.statusCode == 403) {
+      final detail = body['detail'];
+      if (detail is Map && detail['status'] == 'verification_required') {
+        throw EmailNotVerifiedException(
+          detail['email']?.toString() ?? email,
+          detail['message']?.toString() ?? 'Email not verified',
+        );
+      }
+    }
     if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
     return body;
   }

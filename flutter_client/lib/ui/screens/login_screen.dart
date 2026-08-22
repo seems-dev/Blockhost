@@ -37,6 +37,7 @@ class _LoginScreenState extends State<LoginScreen> {
   final email    = TextEditingController(text: 'test1@example.com');
   final password = TextEditingController(text: 'supersecret123');
   final nickname = TextEditingController(text: 'Tester');
+  final otpCtrl  = TextEditingController();
 
   // Ensure we request `openid` so Google returns an ID token.
   // Use the provided OAuth client ID for web and as the serverClientId for
@@ -50,12 +51,17 @@ class _LoginScreenState extends State<LoginScreen> {
   String status = '';
   bool busy = false;
   bool _obscure = true;
+  
+  /// When non-null, the login screen shows the OTP verification overlay
+  /// for this email address (triggered by an unverified-email login attempt).
+  String? _pendingVerificationEmail;
 
   @override
   void dispose() {
     email.dispose();
     password.dispose();
     nickname.dispose();
+    otpCtrl.dispose();
     super.dispose();
   }
 
@@ -71,6 +77,36 @@ class _LoginScreenState extends State<LoginScreen> {
         widget.onLoggedIn();
       }
       setState(() => status = 'OK');
+    } on EmailNotVerifiedException catch (e) {
+      // Backend has already re-sent the OTP — show verification screen
+      setState(() {
+        _pendingVerificationEmail = e.email;
+        status = e.message;
+      });
+    } on ApiException catch (e) {
+      setState(() => status = e.message);
+    } catch (e) {
+      setState(() => status = e.toString());
+    } finally {
+      setState(() => busy = false);
+    }
+  }
+
+  Future<void> _submitOtp() async {
+    final verifyEmail = _pendingVerificationEmail;
+    if (verifyEmail == null) return;
+    final otp = otpCtrl.text.trim();
+    if (otp.isEmpty) return;
+    await _run(() => widget.state.api.verifyEmail(email: verifyEmail, otp: otp));
+  }
+
+  Future<void> _resendOtp() async {
+    final verifyEmail = _pendingVerificationEmail;
+    if (verifyEmail == null) return;
+    setState(() { busy = true; status = ''; });
+    try {
+      await widget.state.api.resendVerification(email: verifyEmail);
+      setState(() => status = 'New verification code sent!');
     } on ApiException catch (e) {
       setState(() => status = e.message);
     } catch (e) {
@@ -97,6 +133,87 @@ class _LoginScreenState extends State<LoginScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // ── OTP Verification overlay ──────────────────────────────────────────
+    if (_pendingVerificationEmail != null) {
+      return Scaffold(
+        backgroundColor: Colors.transparent,
+        body: SafeArea(
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+              child: Column(
+                children: [
+                  const SizedBox(height: 16),
+                  const Icon(Icons.mark_email_read_rounded, color: TranquilTheme.glowCyan, size: 60),
+                  const SizedBox(height: 20),
+                  const Text(
+                    'Verify Your Email',
+                    style: TextStyle(color: _text, fontSize: 22, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'A 6-digit code was sent to\n${_pendingVerificationEmail}',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: _muted, fontSize: 13, fontFamily: _mono),
+                  ),
+                  const SizedBox(height: 28),
+                  GlassCard(
+                    child: Column(
+                      children: [
+                        _TermField(
+                          controller: otpCtrl,
+                          hint: '000000',
+                          prefixIcon: Icons.pin_rounded,
+                          keyboardType: TextInputType.number,
+                        ),
+                        const SizedBox(height: 16),
+                        GlowingButton(
+                          label: 'Verify  →',
+                          busy: busy,
+                          onTap: _submitOtp,
+                        ),
+                        const SizedBox(height: 16),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            GestureDetector(
+                              onTap: () => setState(() {
+                                _pendingVerificationEmail = null;
+                                otpCtrl.clear();
+                                status = '';
+                              }),
+                              child: const Text('← Back to Login', style: TextStyle(color: TranquilTheme.glowCyan, fontSize: 12, fontFamily: _mono)),
+                            ),
+                            GestureDetector(
+                              onTap: busy ? null : _resendOtp,
+                              child: const Text('Resend Code', style: TextStyle(color: TranquilTheme.glowCyan, fontSize: 12, fontFamily: _mono)),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (status.isNotEmpty) ...[
+                    const SizedBox(height: 16),
+                    Text(
+                      status,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: status.contains('sent') ? _green : Colors.redAccent,
+                        fontSize: 12,
+                        fontFamily: _mono,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    // ── Normal Login screen ──────────────────────────────────────────────
     return Scaffold(
       resizeToAvoidBottomInset: true,
       backgroundColor: Colors.transparent,

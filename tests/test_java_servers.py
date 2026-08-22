@@ -270,3 +270,29 @@ def test_systemd_runtime_get_stats_queries_systemd_properties_separately():
         "-p",
         "ControlGroup",
     ]
+
+
+def test_get_server_stats_snapshot_computes_real_stats_on_cold_cache():
+    from blockhost_backend.api.schemas import BedrockServerStats
+    from blockhost_backend.api.servers import _get_server_stats_snapshot
+
+    server = Mock()
+    server.id = uuid.uuid4()
+    db = Mock()
+    real_stats = BedrockServerStats(
+        host="127.0.0.1",
+        port=19132,
+        reachable=True,
+        players_online=1,
+        cpu_usage=12.5,
+        ram_usage_mb=128.0,
+    )
+
+    with patch("blockhost_backend.api.servers._cached_server_stats_snapshot", return_value=None), \
+         patch("blockhost_backend.api.servers._compute_server_stats", return_value=real_stats) as compute, \
+         patch("blockhost_backend.api.servers._store_server_stats_snapshot") as store:
+        stats = _get_server_stats_snapshot(server, db, BackgroundTasks())
+
+    assert stats is real_stats
+    compute.assert_called_once_with(server, db)
+    store.assert_called_once_with(str(server.id), real_stats)

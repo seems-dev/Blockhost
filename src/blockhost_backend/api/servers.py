@@ -516,40 +516,12 @@ def _get_server_stats_snapshot(
     if cached_stats is not None:
         return cached_stats
 
-    if background_tasks is None:
-        stats = _compute_server_stats(server, db)
-        _store_server_stats_snapshot(server_id, stats)
-        return stats
-
-    # Cold start (cache is empty):
-    # Return placeholder stats immediately and trigger background refresh task.
-    limits = get_effective_server_resource_limits(db=db, server=server)
-    is_running = server.state == ServerState.running
-
-    placeholder_stats = BedrockServerStats(
-        host=server.vm_ipv4 or get_settings().minecraft_public_host,
-        port=server.vm_port or get_settings().bedrock_port_range_start,
-        allocated_ram_mb=limits["ram_mb"],
-        allocated_cpu_cores=limits["cpu_quota_pct"] / 100.0,
-        process_running=is_running,
-        uptime_seconds=0,
-        cpu_usage=0.0,
-        ram_usage_mb=0.0,
-        cpu_usage_percent=0.0,
-        ram_usage_percent=0.0,
-        reachable=False,
-        online_players_list=[],
-    )
-
-    get_api_cache().set_json(
-        _server_stats_cache_key(server_id),
-        placeholder_stats.model_dump(mode="json"),
-        _STATS_REDIS_TTL_SECONDS,
-    )
-
-    background_tasks.add_task(_refresh_server_stats_snapshot, server_id)
-
-    return placeholder_stats
+    # Cold cache must compute real stats. Caching a placeholder here causes the
+    # panel to show data briefly, then replace it with empty values for the
+    # 5-second stats TTL.
+    stats = _compute_server_stats(server, db)
+    _store_server_stats_snapshot(server_id, stats)
+    return stats
 
 
 def _server_dirs() -> tuple[Path, Path, Path]:
@@ -1906,4 +1878,3 @@ def remove_collaborator(
         db.delete(collab)
         db.commit()
     return None
-

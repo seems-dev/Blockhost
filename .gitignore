@@ -122,7 +122,8 @@ runtime_binaries/
 # Frontend
 blockhost-admin/node_modules
 blockhost-admin/dist
-
+blockhost-website/
+blockhost-website/
 flutter_client/build
 flutter_client/.dart_tool
 

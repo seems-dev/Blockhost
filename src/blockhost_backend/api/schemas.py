@@ -34,6 +34,21 @@ class SignupRequest(BaseModel):
     referrer_code: str | None = None
 
 
+class EmailVerificationRequiredResponse(BaseModel):
+    status: str
+    email: EmailStr
+    message: str
+
+
+class VerifyEmailRequest(BaseModel):
+    email: EmailStr
+    otp: str = Field(min_length=6, max_length=6, pattern=r"^[0-9]{6}$")
+
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
+
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
@@ -49,6 +64,7 @@ class UserOut(BaseModel):
     nickname: str
     referrer_code: str
     blockcoin_balance: int
+    email_verified: bool = False
     
 
 

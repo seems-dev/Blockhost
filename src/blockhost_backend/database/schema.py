@@ -150,6 +150,9 @@ class User(Base):
     # --- OAuth fields ---
     google_sub: Mapped[str | None] = mapped_column(String(128), unique=True, index=True, nullable=True)
     auth_provider: Mapped[str] = mapped_column(String(32), nullable=False, default="local")
+    email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    email_verification_otp_hash: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    email_verification_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)

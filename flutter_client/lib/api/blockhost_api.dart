@@ -58,6 +58,33 @@ class BlockHostApi {
     return body;
   }
 
+  Future<Map<String, dynamic>> verifyEmail({
+    required String email,
+    required String otp,
+  }) async {
+    final res = await http.post(
+      _u('/api/auth/verify-email'),
+      headers: _headers(),
+      body: jsonEncode({'email': email, 'otp': otp}),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+    return body;
+  }
+
+  Future<Map<String, dynamic>> resendVerification({
+    required String email,
+  }) async {
+    final res = await http.post(
+      _u('/api/auth/resend-verification'),
+      headers: _headers(),
+      body: jsonEncode({'email': email}),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+    return body;
+  }
+
   Future<Map<String, dynamic>> login(
       {required String email, required String password}) async {
     final res = await http.post(

@@ -34,9 +34,9 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  final email    = TextEditingController(text: 'test1@example.com');
-  final password = TextEditingController(text: 'supersecret123');
-  final nickname = TextEditingController(text: 'Tester');
+  final email    = TextEditingController();
+  final password = TextEditingController();
+  final nickname = TextEditingController();
   final otpCtrl  = TextEditingController();
 
   // Ensure we request `openid` so Google returns an ID token.
@@ -326,14 +326,8 @@ class _LoginScreenState extends State<LoginScreen> {
                     Row(children: [
                       Expanded(child: _SocialBtn(
                         icon: const FaIcon(FontAwesomeIcons.google, size: 14),
-                        label: 'Google',
+                        label: 'Continue with Google',
                         onTap: _handleGoogleSignIn,
-                      )),
-                      const SizedBox(width: 12),
-                      Expanded(child: _SocialBtn(
-                        icon: const FaIcon(FontAwesomeIcons.discord, size: 14),
-                        label: 'Discord',
-                        onTap: () {},
                       )),
                     ]),
                   ],

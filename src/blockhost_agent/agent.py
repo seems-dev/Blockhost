@@ -201,13 +201,11 @@ def start_server(
         if not props_path.exists():
             lines = []
             for k, v in payload.server_properties_dict.items():
-                # Replace underscores with hyphens for Java compatibility (e.g. server_port -> server-port)
                 safe_k = k.replace("_", "-")
                 v_str = "true" if v is True else "false" if v is False else str(v)
                 lines.append(f"{safe_k}={v_str}")
             props_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         else:
-            # File exists. Preserve user changes, only enforce the port.
             if is_java:
                 from blockhost_backend.minecraft.java_properties import set_java_server_property
                 set_java_server_property(props_path, "server-port", payload.port)
@@ -216,27 +214,48 @@ def start_server(
                 set_bedrock_server_property(props_path, "server-port", payload.port)
                 set_bedrock_server_property(props_path, "server-portv6", payload.port + 1)
 
-    actual_version = payload.requested_version  # may be updated by Bedrock fallback
+    actual_version = payload.requested_version
 
     if is_java:
         (server_dir / "eula.txt").write_text("eula=true\n", encoding="utf-8")
         if payload.jar_download_url:
             version_str = payload.requested_version or "latest"
-            jar_path = server_dir / f"server-{version_str}.jar"
-            if not jar_path.exists():
-                logger.info(f"Downloading Java jar from {payload.jar_download_url} to {jar_path}")
+            
+            # 1. Define a global cache directory for Java JARs
+            java_jar_cache_dir = VERSIONS_ROOT_DIR / "java-jars"
+            java_jar_cache_dir.mkdir(parents=True, exist_ok=True)
+            cached_jar_path = java_jar_cache_dir / f"{version_str}.jar"
+            
+            server_jar_path = server_dir / f"server-{version_str}.jar"
+
+            # 2. Download ONLY if it doesn't exist in the global cache
+            if not cached_jar_path.exists():
+                logger.info(f"Downloading Java jar from {payload.jar_download_url} to global cache {cached_jar_path}")
                 try:
                     with httpx.Client(follow_redirects=True, timeout=300.0) as client:
                         with client.stream("GET", payload.jar_download_url) as resp:
                             resp.raise_for_status()
-                            with open(jar_path, "wb") as f:
+                            with open(cached_jar_path, "wb") as f:
                                 for chunk in resp.iter_bytes(1024*1024):
                                     f.write(chunk)
                 except Exception as e:
-                    if jar_path.exists():
-                        jar_path.unlink()
+                    if cached_jar_path.exists():
+                        cached_jar_path.unlink()
                     raise HTTPException(status_code=500, detail=f"Failed to download jar: {e}")
-            executable_path = jar_path
+            
+            # 3. Clean up any old jar symlinks/files in the server directory to prevent version conflicts
+            for item in server_dir.glob("server-*.jar"):
+                try:
+                    item.unlink()
+                except OSError:
+                    pass
+
+            # 4. Create a relative symlink in the server folder pointing to the cached JAR
+            if not server_jar_path.exists():
+                rel_path = os.path.relpath(cached_jar_path, start=server_dir)
+                os.symlink(rel_path, server_jar_path)
+                
+            executable_path = server_jar_path
         else:
             executable_path = Path(payload.executable_path) if payload.executable_path else None
             if not executable_path or not executable_path.is_file():
@@ -271,7 +290,25 @@ def start_server(
         "actual_version": result.actual_version,
     }
 
-
+@app.post("/agent/servers/{server_id}/clear-jars")
+def clear_jars(
+    server_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Deletes all server-*.jar files/symlinks in the server directory."""
+    _validate_server_id(server_id)
+    server_dir = SERVERS_ROOT_DIR / server_id
+    if not server_dir.exists():
+        return {"status": "ok", "deleted": 0}
+    
+    deleted = 0
+    for item in server_dir.glob("server-*.jar"):
+        try:
+            item.unlink()
+            deleted += 1
+        except OSError:
+            pass
+    return {"status": "ok", "deleted": deleted}
 @app.post("/agent/servers/{server_id}/stop")
 def stop_server(
     server_id: str,

@@ -1011,39 +1011,34 @@ def switch_server_software(
     if is_currently_java != target_is_java:
         raise HTTPException(status_code=400, detail="Cross-platform switching (Java <-> Bedrock) is not supported.")
 
+    # Stop the server if it's currently running
+    if server.state == ServerState.running:
+        _stop_server_process(server)
+
     server.flavor = payload.target_flavor
     
     if target_is_java:
         server.mc_version = payload.target_mc_version
         
-        _, servers_dir, _ = _server_dirs()
-        server_dir = servers_dir / str(server.id)
-        server_dir.mkdir(parents=True, exist_ok=True)
-        jar_path = server_dir / "server.jar"
-
-        from blockhost_backend.minecraft.software_provider import resolve_jar_url
-
-        try:
-            jar_url = resolve_jar_url(server.flavor, server.mc_version)
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"Failed to resolve JAR URL: {e}")
+        # Tell the Agent to delete any existing JARs so the new version starts fresh
+        if server.node_id:
+            try:
+                node = db.get(Node, server.node_id)
+                if node:
+                    settings = get_settings()
+                    base = f"http://{node.ip_address}:{node.agent_port}"
+                    headers = {"Authorization": f"Bearer {settings.worker_agent_token}"}
+                    import httpx
+                    httpx.post(f"{base}/agent/servers/{server.id}/clear-jars", headers=headers, timeout=10.0)
+            except Exception as e:
+                logger.warning(f"Failed to clear old jars on agent for server {server.id}: {e}")
 
         cfg = dict(server.mc_config or {})
-        cfg["server_dir"] = str(server_dir)
-        cfg["executable_name"] = "server.jar"
         cfg.pop("provision_error", None)
         server.mc_config = cfg
-        server.state = ServerState.provisioning
+        server.state = ServerState.suspended
         db.commit()
 
-        background_tasks.add_task(
-            _provision_java_server,
-            str(server.id),
-            jar_url,
-            str(jar_path),
-            str(server_dir),
-            server.vm_port or 25565,
-        )
     else:
         # Bedrock
         cfg = dict(server.mc_config or {})
@@ -1053,6 +1048,7 @@ def switch_server_software(
             raise HTTPException(status_code=422, detail=str(e))
         
         server.mc_config = cfg
+        server.state = ServerState.suspended
         db.commit()
 
     _invalidate_server_read_cache(user.id, server.id)
@@ -1225,6 +1221,16 @@ def start_server(
         return ServerActionResponse(id=server.id, state=server.state)
 
     settings = get_settings()
+
+    # Automatic Failover: if assigned node is offline, detach the server
+    if server.node_id:
+        node = db.get(Node, server.node_id)
+        if not node or node.status == "offline":
+            server.node_id = None
+            server.vm_ipv4 = None
+            server.vm_port = None
+            db.commit()
+
     if not server.node_id:
         node = select_best_node(db)
         if node:
@@ -1299,6 +1305,15 @@ def toggle_server(
     if is_actually_running:
         _stop_server_process(server)
     else:
+        # Automatic Failover: if assigned node is offline, detach the server
+        if server.node_id:
+            node = db.get(Node, server.node_id)
+            if not node or node.status == "offline":
+                server.node_id = None
+                server.vm_ipv4 = None
+                server.vm_port = None
+                db.commit()
+
         if not server.node_id:
             node = select_best_node(db)
             if node:

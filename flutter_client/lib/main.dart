@@ -2,6 +2,9 @@ import 'package:flutter/material.dart';
 
 import 'state/app_state.dart';
 import 'ui/screens/home_screen.dart';
+import 'ui/screens/splash_screen.dart';
+import 'ui/screens/onboarding_screen.dart';
+import 'ui/theme/tranquil_theme.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -29,7 +32,31 @@ class _BlockHostAppState extends State<BlockHostApp> {
           _initialized = true;
         });
       }
+    }).catchError((error, stackTrace) {
+      debugPrint('Initialization error: $error\n$stackTrace');
+      // Even if init fails (e.g. plugin error, network error), 
+      // we must transition away from the splash screen.
+      if (mounted) {
+        setState(() {
+          _initialized = true;
+        });
+      }
     });
+  }
+
+  Widget _buildHome() {
+    if (!_initialized) {
+      return const SplashScreen();
+    }
+    if (!state.hasSeenOnboarding) {
+      return OnboardingScreen(
+        state: state,
+        onComplete: () {
+          setState(() {}); 
+        },
+      );
+    }
+    return HomeScreen(state: state);
   }
 
   @override
@@ -39,13 +66,16 @@ class _BlockHostAppState extends State<BlockHostApp> {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
-        textTheme: Typography.material2021().black,
-        primaryTextTheme: Typography.material2021().black,
-        scaffoldBackgroundColor: Colors.grey.shade100,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: TranquilTheme.glowCyan,
+          brightness: Brightness.dark,
+        ),
+        scaffoldBackgroundColor: const Color(0xFF0A0A0A),
+        textTheme: Typography.material2021().white,
+        primaryTextTheme: Typography.material2021().white,
         visualDensity: VisualDensity.adaptivePlatformDensity,
       ),
-      home: _initialized ? HomeScreen(state: state) : const Scaffold(backgroundColor: Color(0xFF0A0A0A), body: Center(child: CircularProgressIndicator(color: Color(0xFF00FF6A)))),
+      home: _buildHome(),
     );
   }
 }

@@ -142,6 +142,17 @@ class BlockHostApi {
     }
   }
 
+  Future<String> refreshAuthToken({required String refreshToken}) async {
+    final res = await http.post(
+      _u('/api/auth/refresh'),
+      headers: _headers(auth: false),
+      body: jsonEncode({'refresh_token': refreshToken}),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+    return body['access_token'] as String;
+  }
+
   Future<Map<String, dynamic>> googleLogin({required String idToken}) async {
     final res = await http.post(
       _u('/api/auth/google'),

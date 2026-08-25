@@ -8,21 +8,23 @@ import '../api/cached_api.dart';
 class AppState {
   static const defaultBaseUrl = String.fromEnvironment(
     'BLOCKHOST_API_BASE_URL',
-    defaultValue: 'http://localhost:8000',
+    defaultValue: 'http://52.63.135.144',
   );
 
   static const _kAccessTokenKey = 'access_token';
   static const _kRefreshTokenKey = 'refresh_token';
   static const _kBaseUrlKey = 'base_url';
+  static const _kHasSeenOnboardingKey = 'has_seen_onboarding';
 
   BlockHostApi api = CachedBlockHostApi(baseUrl: defaultBaseUrl, accessToken: null);
   String _baseUrl = defaultBaseUrl;
   String get baseUrl => _baseUrl;
   String? accessToken;
   String? refreshToken;
+  bool hasSeenOnboarding = false;
   
   // Razorpay Instance
-  late Razorpay _razorpay;
+  Razorpay? _razorpay;
   
   // Callback to tell the UI when payment is done
   void Function(bool success)? onPaymentResult;
@@ -32,13 +34,40 @@ class AppState {
     accessToken = prefs.getString(_kAccessTokenKey);
     refreshToken = prefs.getString(_kRefreshTokenKey);
     _baseUrl = prefs.getString(_kBaseUrlKey) ?? defaultBaseUrl;
+    hasSeenOnboarding = prefs.getBool(_kHasSeenOnboardingKey) ?? false;
     api = CachedBlockHostApi(baseUrl: baseUrl, accessToken: accessToken);
 
+    if (refreshToken != null && refreshToken!.isNotEmpty) {
+      try {
+        final newAccess = await api.refreshAuthToken(refreshToken: refreshToken!);
+        accessToken = newAccess;
+        await prefs.setString(_kAccessTokenKey, newAccess);
+        api = CachedBlockHostApi(baseUrl: baseUrl, accessToken: accessToken);
+      } on ApiException catch (e) {
+        debugPrint('Refresh failed (API error): $e');
+        await clearTokens();
+      } catch (e) {
+        debugPrint('Refresh failed (Network or other): $e');
+      }
+    }
+
     // Initialize Razorpay
-    _razorpay = Razorpay();
-    _razorpay.on(Razorpay.EVENT_PAYMENT_SUCCESS, _handlePaymentSuccess);
-    _razorpay.on(Razorpay.EVENT_PAYMENT_ERROR, _handlePaymentError);
-    _razorpay.on(Razorpay.EVENT_EXTERNAL_WALLET, _handleExternalWallet);
+    if (!kIsWeb) {
+      try {
+        _razorpay = Razorpay();
+        _razorpay!.on(Razorpay.EVENT_PAYMENT_SUCCESS, _handlePaymentSuccess);
+        _razorpay!.on(Razorpay.EVENT_PAYMENT_ERROR, _handlePaymentError);
+        _razorpay!.on(Razorpay.EVENT_EXTERNAL_WALLET, _handleExternalWallet);
+      } catch (e) {
+        debugPrint('Razorpay init failed: $e');
+      }
+    }
+  }
+
+  Future<void> completeOnboarding() async {
+    hasSeenOnboarding = true;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_kHasSeenOnboardingKey, true);
   }
 
   Future<void> setBaseUrl(String value) async {
@@ -74,7 +103,7 @@ class AppState {
     await prefs.remove(_kAccessTokenKey);
     await prefs.remove(_kRefreshTokenKey);
 
-    _razorpay.clear();
+    _razorpay?.clear();
   }
 
   /// Revoke refresh token on server, then clear local session.
@@ -115,7 +144,12 @@ class AppState {
       };
       
       debugPrint('🚀 OPENING RAZORPAY...');
-      _razorpay.open(options);
+      if (_razorpay != null) {
+        _razorpay!.open(options);
+      } else {
+        debugPrint('❌ Razorpay not available on this platform.');
+        onPaymentResult?.call(false);
+      }
       
     } catch (e, stacktrace) {
       // THIS WILL TELL YOU EXACTLY WHAT WENT WRONG

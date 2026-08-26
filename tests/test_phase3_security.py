@@ -102,7 +102,7 @@ def test_local_password_login_requires_verified_email(monkeypatch) -> None:
     monkeypatch.setattr("blockhost_backend.api.auth.verify_password", lambda password, password_hash: True)
 
     with pytest.raises(Exception) as exc:
-        login(LoginRequest(email="user@example.com", password="password123"), db=db, _=None)
+        login(LoginRequest(email="user@example.com", password="password123"), db=db, background_tasks=Mock())
 
     assert getattr(exc.value, "status_code", None) == 403
 

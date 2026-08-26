@@ -81,8 +81,23 @@ class NodeRouter(Runtime):
     def get_online_players_with_xuid(self, server_id: str) -> dict[str, str | None]:
         return self._get_runtime(server_id).get_online_players_with_xuid(server_id)
 
+    def ping_server(self, server_id: str) -> dict[str, object] | None:
+        """Proxy Bedrock UDP ping through the agent for remote nodes.
+        Returns None for local servers (caller should ping directly).
+        """
+        rt = self._get_runtime(server_id)
+        if hasattr(rt, "ping_server"):
+            return rt.ping_server(server_id)
+        return None
+
     def read_logs(self, server_id: str, *, tail: int = 200) -> list[LogEntry]:
         return self._get_runtime(server_id).read_logs(server_id, tail=tail)
+
+    def get_properties(self, server_id: str) -> dict[str, str | bool | int]:
+        return self._get_runtime(server_id).get_properties(server_id)
+
+    def update_properties(self, server_id: str, props: dict[str, str | bool | int]) -> None:
+        self._get_runtime(server_id).update_properties(server_id, props)
 
     def send_command(self, server_id: str, command: str) -> None:
         return self._get_runtime(server_id).send_command(server_id, command)

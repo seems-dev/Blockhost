@@ -150,6 +150,9 @@ class User(Base):
     # --- OAuth fields ---
     google_sub: Mapped[str | None] = mapped_column(String(128), unique=True, index=True, nullable=True)
     auth_provider: Mapped[str] = mapped_column(String(32), nullable=False, default="local")
+    email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    email_verification_otp_hash: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    email_verification_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
@@ -214,9 +217,30 @@ class Server(Base):
 
     owner: Mapped[User] = relationship(back_populates="servers")
     bans: Mapped[list["Ban"]] = relationship(back_populates="server", cascade="all, delete-orphan")
+    collaborators: Mapped[list["ServerCollaborator"]] = relationship(back_populates="server", cascade="all, delete-orphan")
     flavor: Mapped[ServerFlavor] = mapped_column(Enum(ServerFlavor), default=ServerFlavor.BEDROCK)
     mc_version: Mapped[str | None] = mapped_column(String(32)) # e.g., "1.21.4"
     java_version: Mapped[int | None] = mapped_column(Integer, nullable=True) # e.g., 21
+
+
+class ServerCollaborator(Base):
+    __tablename__ = "server_collaborators"
+    __table_args__ = (
+        UniqueConstraint("server_id", "user_id", name="uq_server_collaborators_server_user"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    server_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
+    
+    # List of string permissions, e.g. ["start_stop", "console", "files", "config"]
+    permissions: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+    server: Mapped["Server"] = relationship(back_populates="collaborators")
+    user: Mapped["User"] = relationship()
 
 
 class BillingPlan(Base):
@@ -460,7 +484,7 @@ class Node(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
     ip_address: Mapped[str] = mapped_column(String(64), nullable=False)
-    agent_port: Mapped[int] = mapped_column(Integer, nullable=False, default=8001)
+    agent_port: Mapped[int] = mapped_column(Integer, nullable=False, default=9000)
 
     status: Mapped[NodeState] = mapped_column(Enum(NodeState), nullable=False, default=NodeState.offline)
     approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

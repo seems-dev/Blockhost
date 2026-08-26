@@ -46,14 +46,22 @@ if [ ! -f /etc/blockhost-agent.env ]; then
 # BlockHost Agent Node Environment
 # Edit this file with your real values.
 
-# MUST match WORKER_AGENT_TOKEN in the Control Plane's deploy/.env
+# Token used by this agent to register/heartbeat with the control plane.
+# If you pre-register the node, use the one-time agent_token returned by /api/nodes/register.
 AGENT_TOKEN=REPLACE_WITH_YOUR_SHARED_SECRET_TOKEN
+
+# Token accepted for control-plane HTTP actions (provision/start/stop/files).
+# MUST match WORKER_AGENT_TOKEN in the Control Plane's deploy/.env.
+CONTROL_AGENT_TOKEN=REPLACE_WITH_CONTROL_PLANE_WORKER_AGENT_TOKEN
 
 # A human-readable name for this node (shown in admin panel)
 NODE_NAME=node-1
 
 # This node's PUBLIC IP address (so the Control Plane knows where to send players)
 NODE_PUBLIC_IP=REPLACE_WITH_THIS_EC2_PUBLIC_IP
+
+# HTTP port that the agent listens on. Must match blockhost-agent.service.
+AGENT_PORT=9000
 
 # URL of the Control Plane API (used by agent to register and send heartbeats)
 CONTROLLER_WS_URL=ws://REPLACE_WITH_CONTROL_PLANE_IP:80/api/nodes/ws
@@ -90,7 +98,8 @@ echo "======================================================"
 echo ""
 echo " Next steps:"
 echo " 1. Edit the config:   sudo nano /etc/blockhost-agent.env"
-echo "    - Set AGENT_TOKEN to match your Control Plane's WORKER_AGENT_TOKEN"
+echo "    - Set AGENT_TOKEN to the node registration token (or WORKER_AGENT_TOKEN if auto-registering)"
+echo "    - Set CONTROL_AGENT_TOKEN to match your Control Plane's WORKER_AGENT_TOKEN"
 echo "    - Set NODE_PUBLIC_IP to: $(curl -s ifconfig.me)"
 echo "    - Set CONTROLLER_WS_URL to point to your Control Plane"
 echo ""

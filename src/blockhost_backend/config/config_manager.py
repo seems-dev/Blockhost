@@ -81,6 +81,13 @@ class Settings(BaseSettings):
     console_stream_cleanup_enabled: bool = True  # Stop log stream when no listeners remain (but keep running if player tracking active)
 
     google_client_id: str = ""
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from_email: str = ""
+    smtp_use_tls: bool = True
+    email_verification_otp_expire_seconds: int = 60 * 60 * 24
     razorpay_key_id: str = ""
     razorpay_key_secret: str = ""          # matches RAZORPAY_KEY_SECRET in .env
     razorpay_webhook_secret: str = ""     # matches RAZORPAY_WEBHOOK_SECRET in .env

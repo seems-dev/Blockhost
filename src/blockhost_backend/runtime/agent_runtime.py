@@ -33,8 +33,12 @@ class AgentRuntime:
         self._lock = threading.Lock()
 
     def _post(self, path: str, json_data: dict[str, Any] | None = None) -> httpx.Response:
-        resp = httpx.post(f"{self.agent_base_url}{path}", headers=self._headers, json=json_data, timeout=30.0)
-        resp.raise_for_status()
+        resp = httpx.post(f"{self.agent_base_url}{path}", headers=self._headers, json=json_data, timeout=300.0)
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error from Agent: {resp.text}")
+            raise
         return resp
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> httpx.Response:
@@ -42,7 +46,21 @@ class AgentRuntime:
         resp.raise_for_status()
         return resp
 
+    def _put(self, path: str, json_data: dict[str, Any] | None = None) -> httpx.Response:
+        resp = httpx.put(f"{self.agent_base_url}{path}", headers=self._headers, json=json_data, timeout=300.0)
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error from Agent: {resp.text}")
+            raise
+        return resp
+
     def start_server(self, request: RuntimeStartRequest) -> RuntimeStartResult:
+        # Filter out None values so Pydantic on the Agent doesn't reject the payload
+        clean_props = {}
+        if request.server_properties_dict:
+            clean_props = {k: v for k, v in request.server_properties_dict.items() if v is not None}
+
         payload = {
             "server_dir_rel": request.server_id,
             "port": request.port,
@@ -51,6 +69,8 @@ class AgentRuntime:
             "ram_mb": request.ram_mb,
             "cpu_quota_pct": request.cpu_quota_pct,
             "jdk_path": str(request.jdk_path) if request.jdk_path else None,
+            "server_properties_dict": clean_props,
+            "jar_download_url": request.jar_download_url,
         }
         resp = self._post(f"/agent/servers/{request.server_id}/start", json_data=payload)
         data = resp.json()
@@ -83,7 +103,8 @@ class AgentRuntime:
                 uptime_seconds=data.get("uptime_seconds"),
                 online_players=data.get("online_players"),
             )
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to get status for %s: %s", server_id, e)
             return RuntimeStatus(running=False)
 
     def get_stats(self, server_id: str) -> RuntimeResourceStats:
@@ -94,15 +115,28 @@ class AgentRuntime:
                 cpu_usage=data.get("cpu_usage"),
                 ram_usage_mb=data.get("ram_usage_mb"),
             )
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to get stats for %s: %s", server_id, e)
             return RuntimeResourceStats(cpu_usage=None, ram_usage_mb=None)
 
     def get_online_players_with_xuid(self, server_id: str) -> dict[str, str | None]:
         try:
             resp = self._get(f"/agent/servers/{server_id}/online_players")
             return resp.json()
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to get online players for %s: %s", server_id, e)
             return {}
+
+    def ping_server(self, server_id: str) -> dict[str, object] | None:
+        """Ask the agent to perform a local Bedrock UDP ping and return parsed results."""
+        try:
+            resp = self._get(f"/agent/servers/{server_id}/ping")
+            data = resp.json()
+            if data.get("reachable"):
+                return data
+            return None
+        except Exception:
+            return None
 
     def read_logs(self, server_id: str, *, tail: int = 200) -> list[LogEntry]:
         try:
@@ -110,6 +144,16 @@ class AgentRuntime:
             return [LogEntry(ts=item.get("ts"), line=item["line"]) for item in resp.json()]
         except Exception:
             return []
+
+    def get_properties(self, server_id: str) -> dict[str, str | bool | int]:
+        try:
+            resp = self._get(f"/agent/servers/{server_id}/properties")
+            return resp.json()
+        except Exception:
+            return {}
+
+    def update_properties(self, server_id: str, props: dict[str, str | bool | int]) -> None:
+        self._put(f"/agent/servers/{server_id}/properties", json_data=props)
 
     def send_command(self, server_id: str, command: str) -> None:
         self._post(f"/agent/servers/{server_id}/command", json_data={"command": command})

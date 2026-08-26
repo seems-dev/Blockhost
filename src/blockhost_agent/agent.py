@@ -51,8 +51,10 @@ security = HTTPBearer()
 # ---------------------------------------------------------------------------
 
 AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "change-me-in-dev")
+CONTROL_AGENT_TOKEN = os.environ.get("CONTROL_AGENT_TOKEN", AGENT_TOKEN)
 NODE_NAME = os.environ.get("NODE_NAME", "laptop-worker-1")
 NODE_PUBLIC_IP = os.environ.get("NODE_PUBLIC_IP", "").strip()
+AGENT_PORT = int(os.environ.get("AGENT_PORT", "9000"))
 CONTROLLER_WS_URL = os.environ.get(
     "CONTROLLER_WS_URL", "ws://192.168.29.102:8000/api/nodes/ws"
 )
@@ -87,7 +89,7 @@ _background_tasks: set[asyncio.Task] = set()
 def verify_token(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> str:
-    if credentials.credentials != AGENT_TOKEN:
+    if credentials.credentials not in {AGENT_TOKEN, CONTROL_AGENT_TOKEN}:
         raise HTTPException(status_code=401, detail="Invalid token")
     return credentials.credentials
 
@@ -114,6 +116,8 @@ class StartPayload(BaseModel):
     ram_mb: int
     cpu_quota_pct: int
     jdk_path: str | None = None  # NEW
+    server_properties_dict: dict[str, str | int | bool] | None = None
+    jar_download_url: str | None = None
 
 
 class CommandPayload(BaseModel):
@@ -188,21 +192,79 @@ def start_server(
     _token: str = Depends(verify_token),
 ) -> Any:
     _validate_server_id(server_id)
-    is_java = payload.executable_path and payload.executable_path.endswith(".jar")
+    server_dir = SERVERS_ROOT_DIR / server_id
+    server_dir.mkdir(parents=True, exist_ok=True)
+    is_java = bool(payload.jar_download_url) or (payload.executable_path and payload.executable_path.endswith(".jar"))
+
+    if payload.server_properties_dict is not None:
+        props_path = server_dir / "server.properties"
+        if not props_path.exists():
+            lines = []
+            for k, v in payload.server_properties_dict.items():
+                safe_k = k.replace("_", "-")
+                v_str = "true" if v is True else "false" if v is False else str(v)
+                lines.append(f"{safe_k}={v_str}")
+            props_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        else:
+            if is_java:
+                from blockhost_backend.minecraft.java_properties import set_java_server_property
+                set_java_server_property(props_path, "server-port", payload.port)
+            else:
+                from blockhost_backend.minecraft.bedrock_properties import set_bedrock_server_property
+                set_bedrock_server_property(props_path, "server-port", payload.port)
+                set_bedrock_server_property(props_path, "server-portv6", payload.port + 1)
+
+    actual_version = payload.requested_version
 
     if is_java:
-        server_dir = SERVERS_ROOT_DIR / server_id
-        if not server_dir.is_dir():
-            raise HTTPException(status_code=404, detail="Java server directory not provisioned on agent")
-        # Ensure executable exists on the agent filesystem
-        executable_path = Path(payload.executable_path)
-        if not executable_path.is_file():
-            raise HTTPException(status_code=404, detail=f"Java executable not found on agent: {executable_path}")
+        (server_dir / "eula.txt").write_text("eula=true\n", encoding="utf-8")
+        if payload.jar_download_url:
+            version_str = payload.requested_version or "latest"
+            
+            # 1. Define a global cache directory for Java JARs
+            java_jar_cache_dir = VERSIONS_ROOT_DIR / "java-jars"
+            java_jar_cache_dir.mkdir(parents=True, exist_ok=True)
+            cached_jar_path = java_jar_cache_dir / f"{version_str}.jar"
+            
+            server_jar_path = server_dir / f"server-{version_str}.jar"
+
+            # 2. Download ONLY if it doesn't exist in the global cache
+            if not cached_jar_path.exists():
+                logger.info(f"Downloading Java jar from {payload.jar_download_url} to global cache {cached_jar_path}")
+                try:
+                    with httpx.Client(follow_redirects=True, timeout=300.0) as client:
+                        with client.stream("GET", payload.jar_download_url) as resp:
+                            resp.raise_for_status()
+                            with open(cached_jar_path, "wb") as f:
+                                for chunk in resp.iter_bytes(1024*1024):
+                                    f.write(chunk)
+                except Exception as e:
+                    if cached_jar_path.exists():
+                        cached_jar_path.unlink()
+                    raise HTTPException(status_code=500, detail=f"Failed to download jar: {e}")
+            
+            # 3. Clean up any old jar symlinks/files in the server directory to prevent version conflicts
+            for item in server_dir.glob("server-*.jar"):
+                try:
+                    item.unlink()
+                except OSError:
+                    pass
+
+            # 4. Create a relative symlink in the server folder pointing to the cached JAR
+            if not server_jar_path.exists():
+                rel_path = os.path.relpath(cached_jar_path, start=server_dir)
+                os.symlink(rel_path, server_jar_path)
+                
+            executable_path = server_jar_path
+        else:
+            executable_path = Path(payload.executable_path) if payload.executable_path else None
+            if not executable_path or not executable_path.is_file():
+                raise HTTPException(status_code=404, detail="Java executable not found on agent")
     else:
         version_name = (payload.requested_version or "").strip()
         if not version_name:
             raise HTTPException(status_code=400, detail="requested_version is required on agent")
-        server_dir = _ensure_server_layout(server_id, version_name)
+        server_dir, actual_version = _ensure_server_layout(server_id, version_name)
         if payload.executable_path:
             executable_path = Path(payload.executable_path)
         else:
@@ -215,11 +277,11 @@ def start_server(
         server_id=server_id,
         server_dir=server_dir,
         port=payload.port,
-        requested_version=payload.requested_version,
+        requested_version=actual_version,
         executable_path=executable_path,
         ram_mb=payload.ram_mb,
         cpu_quota_pct=payload.cpu_quota_pct,
-        jdk_path=Path(payload.jdk_path) if payload.jdk_path else None, # NEW
+        jdk_path=Path(payload.jdk_path) if payload.jdk_path else None,
     )
     result = runtime.start_server(req)
     return {
@@ -228,7 +290,25 @@ def start_server(
         "actual_version": result.actual_version,
     }
 
-
+@app.post("/agent/servers/{server_id}/clear-jars")
+def clear_jars(
+    server_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Deletes all server-*.jar files/symlinks in the server directory."""
+    _validate_server_id(server_id)
+    server_dir = SERVERS_ROOT_DIR / server_id
+    if not server_dir.exists():
+        return {"status": "ok", "deleted": 0}
+    
+    deleted = 0
+    for item in server_dir.glob("server-*.jar"):
+        try:
+            item.unlink()
+            deleted += 1
+        except OSError:
+            pass
+    return {"status": "ok", "deleted": deleted}
 @app.post("/agent/servers/{server_id}/stop")
 def stop_server(
     server_id: str,
@@ -299,6 +379,93 @@ def send_command(
     return {"status": "ok"}
 
 
+@app.get("/agent/servers/{server_id}/ping")
+def ping_server(
+    server_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Perform a local Bedrock UDP ping (RakNet) on behalf of the control plane.
+
+    The control plane cannot reliably send UDP across Docker NAT / AWS
+    security groups, so we ping 127.0.0.1 here on the agent node and
+    return the parsed pong payload.
+    """
+    _validate_server_id(server_id)
+    status = runtime.get_status(server_id)
+    if not status.running:
+        return {"reachable": False}
+
+    from blockhost_backend.minecraft.bedrock_ping import (
+        bedrock_unconnected_ping,
+        parse_bedrock_pong_payload,
+    )
+
+    # Determine the port from server.properties (fall back to 19132)
+    server_dir = SERVERS_ROOT_DIR / server_id
+    port = 19132
+    props_path = server_dir / "server.properties"
+    if props_path.is_file():
+        for line in props_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("server-port="):
+                try:
+                    port = int(line.split("=", 1)[1].strip())
+                except ValueError:
+                    pass
+                break
+
+    try:
+        pong = bedrock_unconnected_ping(host="127.0.0.1", port=port, timeout_seconds=2.0)
+        parsed = parse_bedrock_pong_payload(pong.payload)
+        return {
+            "reachable": True,
+            "latency_ms": pong.latency_ms,
+            **parsed,
+        }
+    except Exception as e:
+        logger.warning("Bedrock ping failed for server %s on port %d: %s", server_id, port, e)
+        return {"reachable": False}
+
+
+@app.get("/agent/servers/{server_id}/properties")
+def get_server_properties(
+    server_id: str,
+    _token: str = Depends(verify_token),
+) -> dict[str, str | bool | int]:
+    _validate_server_id(server_id)
+    server_dir = SERVERS_ROOT_DIR / server_id
+    props_path = server_dir / "server.properties"
+    
+    # We can use either bedrock or java read_properties since they are identical
+    from blockhost_backend.minecraft.java_properties import read_properties
+    return read_properties(props_path)
+
+
+@app.put("/agent/servers/{server_id}/properties")
+def update_server_properties(
+    server_id: str,
+    props: dict[str, str | bool | int],
+    _token: str = Depends(verify_token),
+) -> dict[str, str]:
+    _validate_server_id(server_id)
+    server_dir = SERVERS_ROOT_DIR / server_id
+    props_path = server_dir / "server.properties"
+    
+    # Determine flavor by checking if it's a bedrock server directory structure
+    # (simplest way on the agent is checking if bedrock_server binary exists)
+    is_bedrock = (server_dir / "bedrock_server").exists()
+    
+    if is_bedrock:
+        from blockhost_backend.minecraft.bedrock_properties import set_bedrock_server_property
+        for k, v in props.items():
+            set_bedrock_server_property(props_path, k, v)
+    else:
+        from blockhost_backend.minecraft.java_properties import set_java_server_property
+        for k, v in props.items():
+            set_java_server_property(props_path, k, v)
+            
+    return {"status": "ok"}
+
+
 # ---------------------------------------------------------------------------
 # Log Streaming (WebSocket)
 # ---------------------------------------------------------------------------
@@ -310,7 +477,7 @@ async def stream_logs(
     server_id: str,
     token: str = Query(default=""),
 ) -> None:
-    if token != AGENT_TOKEN:
+    if token not in {AGENT_TOKEN, CONTROL_AGENT_TOKEN}:
         await websocket.close(code=1008, reason="Invalid token")
         return
 
@@ -409,14 +576,141 @@ def _compute_version_binary_hash(version_dir: Path) -> str | None:
     return None
 
 
-def _ensure_server_layout(server_id: str, version_name: str) -> Path:
-    """Link static version assets into the per-server dir; preserve worlds/config."""
+def _fetch_latest_bedrock_version() -> str:
+    """Fetch the latest available Bedrock version from MCJarFiles."""
+    resp = httpx.get(
+        "https://mcjarfiles.com/api/get-versions/bedrock/latest/linux",
+        follow_redirects=True,
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+    versions = resp.json()
+    if not versions:
+        raise HTTPException(status_code=502, detail="MCJarFiles returned empty version list")
+    return versions[0]
+
+
+def _download_bedrock_version(version_name: str) -> Path:
+    """Download and extract a Bedrock version into VERSIONS_ROOT_DIR. Returns the installed version dir."""
+    import tempfile, zipfile, stat
+
+    url = f"https://mcjarfiles.com/api/get-jar/bedrock/latest/linux/{version_name}"
+    VERSIONS_ROOT_DIR.mkdir(parents=True, exist_ok=True)
     version_dir = VERSIONS_ROOT_DIR / version_name
+
+    # Mojang CDN requires a browser-like User-Agent to serve the file
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+    }
+
+    with tempfile.TemporaryDirectory(prefix="bedrock-agent-dl-") as td:
+        tmpdir = Path(td)
+        zip_path = tmpdir / "bedrock.zip"
+
+        logger.info(f"Downloading Bedrock {version_name} from MCJarFiles...")
+        try:
+            with httpx.Client(follow_redirects=True, timeout=600.0, headers=headers) as client:
+                with client.stream("GET", url) as resp:
+                    if resp.status_code == 404:
+                        raise ValueError(f"Version {version_name!r} not found on MCJarFiles (HTTP 404)")
+                    if resp.status_code != 200:
+                        raise ValueError(f"MCJarFiles returned HTTP {resp.status_code} for {version_name!r}")
+                    total = int(resp.headers.get("content-length", 0))
+                    downloaded = 0
+                    with open(zip_path, "wb") as f:
+                        for chunk in resp.iter_bytes(1024 * 1024):
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total:
+                                pct = downloaded * 100 // total
+                                if downloaded % (10 * 1024 * 1024) < 1024 * 1024:
+                                    logger.info(f"Bedrock {version_name}: {pct}% ({downloaded // (1024*1024)}MB / {total // (1024*1024)}MB)")
+                    logger.info(f"Download complete for Bedrock {version_name} ({downloaded // (1024*1024)}MB)")
+        except ValueError:
+            raise  # re-raise our descriptive errors
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Network error downloading Bedrock {version_name}: {e}")
+
+        extract_dir = tmpdir / "extract"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"Extracting Bedrock {version_name}...")
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                for info in zf.infolist():
+                    # Extract the file
+                    extracted_path = extract_dir / info.filename
+                    zf.extract(info, extract_dir)
+                    # CRITICAL: Restore Unix permissions from the ZIP's external_attr
+                    # Python's extractall() silently drops them — bedrock_server would land as 0644 (not executable)
+                    unix_perms = (info.external_attr >> 16) & 0xFFFF
+                    if unix_perms:
+                        try:
+                            extracted_path.chmod(unix_perms & 0o7777)
+                        except OSError:
+                            pass
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Invalid zip for Bedrock {version_name}: {e}")
+
+        # Locate the bedrock_server binary (may be in a subdirectory)
+        has_binary = any((extract_dir / name).exists() for name in ("bedrock_server", "bedrock_server.exe"))
+        if not has_binary:
+            children = [p for p in extract_dir.iterdir() if p.is_dir()]
+            if len(children) == 1:
+                inner = children[0]
+                has_binary = any((inner / name).exists() for name in ("bedrock_server", "bedrock_server.exe"))
+                if has_binary:
+                    extract_dir = inner
+
+        if not has_binary:
+            raise HTTPException(status_code=500, detail=f"Downloaded ZIP for {version_name} does not contain bedrock_server binary")
+
+        # Ensure bedrock_server is executable regardless of what was in the ZIP
+        for bin_name in ("bedrock_server", "bedrock_server.exe"):
+            bin_path = extract_dir / bin_name
+            if bin_path.exists():
+                current = bin_path.stat().st_mode
+                bin_path.chmod(current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                logger.info(f"Set executable bit on {bin_path}")
+
+        tmp_install = VERSIONS_ROOT_DIR / f".tmp-{version_name}"
+        if tmp_install.exists():
+            shutil.rmtree(tmp_install)
+        shutil.move(str(extract_dir), str(tmp_install))
+        tmp_install.rename(version_dir)
+        logger.info(f"Successfully installed Bedrock version {version_name} to {version_dir}")
+
+    return version_dir
+
+
+def _ensure_server_layout(server_id: str, version_name: str) -> tuple[Path, str]:
+    """Link static version assets into the per-server dir; preserve worlds/config.
+    
+    Returns (server_dir, actual_version_used) — actual version may differ from
+    requested if the requested version is unavailable and we fell back to latest.
+    """
+    version_dir = VERSIONS_ROOT_DIR / version_name
+    actual_version = version_name
+
     if not version_dir.is_dir():
-        raise HTTPException(
-            status_code=503,
-            detail=f"Version {version_name!r} not provisioned on this node",
-        )
+        try:
+            version_dir = _download_bedrock_version(version_name)
+        except ValueError as e:
+            # Version not available — fall back to latest
+            logger.warning(f"{e}. Falling back to latest Bedrock version.")
+            try:
+                actual_version = _fetch_latest_bedrock_version()
+            except Exception as fetch_err:
+                raise HTTPException(status_code=502, detail=f"Requested version unavailable and failed to fetch latest: {fetch_err}")
+            version_dir = VERSIONS_ROOT_DIR / actual_version
+            if not version_dir.is_dir():
+                version_dir = _download_bedrock_version(actual_version)
+            logger.info(f"Using Bedrock version {actual_version} (requested: {version_name})")
 
     server_dir = SERVERS_ROOT_DIR / server_id
     server_dir.mkdir(parents=True, exist_ok=True)
@@ -441,7 +735,21 @@ def _ensure_server_layout(server_id: str, version_name: str) -> Path:
         except OSError as e:
             logger.warning("Failed to link/copy %s into server dir: %s", child.name, e)
 
-    return server_dir
+    return server_dir, actual_version
+
+
+@app.get("/agent/bedrock-versions")
+def list_bedrock_versions(_token: str = Depends(verify_token)) -> Any:
+    """List Bedrock versions locally cached on the agent."""
+    if not VERSIONS_ROOT_DIR.exists():
+        return {"versions": []}
+        
+    versions = []
+    for item in VERSIONS_ROOT_DIR.iterdir():
+        if item.is_dir() and not item.name.startswith("."):
+            versions.append(item.name)
+            
+    return {"versions": sorted(versions)}
 
 
 @app.get("/agent/versions/{version}")
@@ -1153,12 +1461,12 @@ async def heartbeat_task() -> None:
                         "type": "register",
                         "data": {
                             "name": NODE_NAME,
+                            "agent_port": AGENT_PORT,
                             **({"ip_address": NODE_PUBLIC_IP} if NODE_PUBLIC_IP else {}),
                         },
                     })
                 )
                 logger.info("Connected to Controller at %s", CONTROLLER_WS_URL)
-                retry_delay = 1.0
 
                 while True:
                     await asyncio.sleep(5)
@@ -1177,6 +1485,7 @@ async def heartbeat_task() -> None:
                             }
                         )
                     )
+                    retry_delay = 1.0
 
         except asyncio.CancelledError:
             logger.info("Heartbeat task cancelled")
@@ -1217,4 +1526,4 @@ app.router.lifespan_context = lifespan
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=AGENT_PORT)

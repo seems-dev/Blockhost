@@ -1,6 +1,6 @@
-
 from __future__ import annotations
-
+#file_name = api/server.py
+from blockhost_backend.database.schema import ServerCollaborator
 from uvicorn import server
 from blockhost_backend.database.schema import Node, ServerFlavor
 import logging
@@ -28,6 +28,8 @@ from blockhost_backend.api.schemas import (
     CreateServerRequest,
     PlayerInfo,
     ServerActionResponse,
+    ServerCollaboratorCreate,
+    ServerCollaboratorOut,
     ServerConfigOut,
     ServerConfigUpdateRequest,
     SoftwareSwitchRequest,
@@ -41,7 +43,7 @@ from blockhost_backend.database.db import SessionLocal, get_db
 from blockhost_backend.database.schema import Ban, Server, ServerState, User, VMProvider
 from blockhost_backend.minecraft.bedrock_ping import bedrock_unconnected_ping, parse_bedrock_pong_payload
 from blockhost_backend.minecraft.bedrock_properties import BedrockServerProperties, write_server_properties
-from blockhost_backend.minecraft.bedrock_download import recommended_version
+from blockhost_backend.minecraft.bedrock_download import list_remote_versions
 from blockhost_backend.minecraft.port_alloc import PortRange, pick_free_udp_port, pick_free_tcp_port
 from blockhost_backend.minecraft.java_properties import (
     JavaServerProperties,
@@ -114,6 +116,37 @@ def _invalidate_server_read_cache(user_id: uuid.UUID, server_id: uuid.UUID | str
 
 
 
+
+
+def _get_server_for_user(server_id: str, user: User, db: Session, required_permission: str | None = None) -> Server:
+    try:
+        server_uuid = uuid.UUID(server_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Server not found")
+    server = db.get(Server, server_uuid)
+    if not server:
+        raise HTTPException(status_code=404, detail="Server not found")
+        
+    if server.owner_id == user.id:
+        return server
+        
+    # Check collaborators
+    from blockhost_backend.database.schema import ServerCollaborator
+    from sqlalchemy import select
+    collab = db.execute(
+        select(ServerCollaborator).where(
+            ServerCollaborator.server_id == server.id,
+            ServerCollaborator.user_id == user.id
+        )
+    ).scalars().first()
+    
+    if not collab:
+        raise HTTPException(status_code=404, detail="Server not found")
+        
+    if required_permission and required_permission not in collab.permissions:
+        raise HTTPException(status_code=403, detail=f"Missing required permission: {required_permission}")
+        
+    return server
 
 def _guard_disk_for_operation(operation: str) -> None:
     try:
@@ -322,13 +355,34 @@ def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
         is_bedrock = server.flavor == ServerFlavor.BEDROCK
         
         if is_bedrock:
-            pong = bedrock_unconnected_ping(
-                host=("127.0.0.1" if not server.node_id else host),
-                port=port,
-                timeout_seconds=1.0,
-            )
-            parsed = parse_bedrock_pong_payload(pong.payload)
-            # Convert online players dict to PlayerInfo list
+            # For remote nodes, proxy the Bedrock UDP ping through the agent
+            # (the control plane can't reliably send UDP across Docker NAT / AWS SGs).
+            # For local nodes, ping directly.
+            parsed: dict[str, object] = {}
+            ping_latency: int | None = None
+            ping_reachable = False
+
+            if server.node_id:
+                # Remote node: ask the agent to ping locally
+                pong_data = _ORCHESTRATOR.ping_server(str(server.id))
+                if pong_data and pong_data.get("reachable"):
+                    ping_reachable = True
+                    ping_latency = pong_data.get("latency_ms")
+                    parsed = pong_data
+            else:
+                # Local node: ping directly
+                try:
+                    pong = bedrock_unconnected_ping(
+                        host="127.0.0.1", port=port, timeout_seconds=1.0,
+                    )
+                    parsed = parse_bedrock_pong_payload(pong.payload)
+                    ping_latency = pong.latency_ms
+                    ping_reachable = True
+                except Exception:
+                    pass  # ping failed — still return base stats below
+
+            # Always try to get the player list from the runtime (agent HTTP),
+            # independent of whether the UDP ping succeeded.
             players_with_xuid = runtime_status.runtime_id and _ORCHESTRATOR.get_online_players_with_xuid(str(server.id))
             player_info_list = [
                 PlayerInfo(name=name, xuid=xuid)
@@ -336,8 +390,8 @@ def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
             ]
             return BedrockServerStats(
                 **base_stats,
-                reachable=True,
-                latency_ms=pong.latency_ms,
+                reachable=ping_reachable,
+                latency_ms=ping_latency,
                 edition=parsed.get("edition"),
                 motd=parsed.get("motd"),
                 motd2=parsed.get("motd2"),
@@ -354,13 +408,22 @@ def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
             import time
             start = time.monotonic()
             protocol = get_protocol_version(server.mc_version) if server.mc_version else None
+            ping_host = "127.0.0.1" if not server.node_id else host
             java_pong = java_server_ping(
-                host=("127.0.0.1" if not server.node_id else host),
+                host=ping_host,
                 port=port,
                 timeout_seconds=1.0,
                 protocol_version=protocol,
             )
             latency = int((time.monotonic() - start) * 1000)
+
+            # Get player list from runtime (journal log stream parsing)
+            players_with_xuid = runtime_status.runtime_id and _ORCHESTRATOR.get_online_players_with_xuid(str(server.id))
+            player_info_list = [
+                PlayerInfo(name=name, xuid=xuid)
+                for name, xuid in (players_with_xuid or {}).items()
+            ]
+
             if java_pong:
                 players_node = java_pong.get("players", {})
                 version_node = java_pong.get("version", {})
@@ -378,13 +441,13 @@ def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
                     version=version_node.get("name"),
                     players_online=players_node.get("online"),
                     players_max=players_node.get("max"),
-                    online_players_list=[],
+                    online_players_list=player_info_list,
                 )
             else:
                 return BedrockServerStats(
                     **base_stats,
                     reachable=False,
-                    online_players_list=[],
+                    online_players_list=player_info_list,
                 )
     except Exception:
         return BedrockServerStats(
@@ -453,40 +516,12 @@ def _get_server_stats_snapshot(
     if cached_stats is not None:
         return cached_stats
 
-    if background_tasks is None:
-        stats = _compute_server_stats(server, db)
-        _store_server_stats_snapshot(server_id, stats)
-        return stats
-
-    # Cold start (cache is empty):
-    # Return placeholder stats immediately and trigger background refresh task.
-    limits = get_effective_server_resource_limits(db=db, server=server)
-    is_running = server.state == ServerState.running
-
-    placeholder_stats = BedrockServerStats(
-        host=server.vm_ipv4 or get_settings().minecraft_public_host,
-        port=server.vm_port or get_settings().bedrock_port_range_start,
-        allocated_ram_mb=limits["ram_mb"],
-        allocated_cpu_cores=limits["cpu_quota_pct"] / 100.0,
-        process_running=is_running,
-        uptime_seconds=0,
-        cpu_usage=0.0,
-        ram_usage_mb=0.0,
-        cpu_usage_percent=0.0,
-        ram_usage_percent=0.0,
-        reachable=False,
-        online_players_list=[],
-    )
-
-    get_api_cache().set_json(
-        _server_stats_cache_key(server_id),
-        placeholder_stats.model_dump(mode="json"),
-        _STATS_REDIS_TTL_SECONDS,
-    )
-
-    background_tasks.add_task(_refresh_server_stats_snapshot, server_id)
-
-    return placeholder_stats
+    # Cold cache must compute real stats. Caching a placeholder here causes the
+    # panel to show data briefly, then replace it with empty values for the
+    # 5-second stats TTL.
+    stats = _compute_server_stats(server, db)
+    _store_server_stats_snapshot(server_id, stats)
+    return stats
 
 
 def _server_dirs() -> tuple[Path, Path, Path]:
@@ -506,7 +541,8 @@ def _ensure_version_on_disk(*, versions_dir: Path, requested_version: str | None
         return
     rv = str(requested_version).strip()
     if rv.lower() in {"recommended", "default"}:
-        rv = recommended_version(manifest_path=Path(settings.bedrock_versions_manifest))
+        rvs = list_remote_versions()
+        rv = rvs[0] if rvs else "1.21"
     if rv.upper() in {"LATEST", "PREVIEW"}:
         installed_versions = [p.name for p in versions_dir.iterdir() if p.is_dir()] if versions_dir.exists() else []
         if not installed_versions:
@@ -537,7 +573,8 @@ def _normalize_requested_version(requested_version: str | None) -> str | None:
     rv = _sanitize_version(rv)
     settings = get_settings()
     if rv and rv.lower() in {"recommended", "default"}:
-        return recommended_version(manifest_path=Path(settings.bedrock_versions_manifest))
+        rvs = list_remote_versions()
+        return rvs[0] if rvs else "1.21"
     return rv
 
 
@@ -663,6 +700,8 @@ def _java_server_properties_from_config(*, server: Server, port: int) -> JavaSer
     if online_mode is None:
         online_mode = False
 
+    import uuid
+
     return JavaServerProperties(
         server_port=port,
         motd=cfg.get("motd") or server.world_name,
@@ -672,6 +711,9 @@ def _java_server_properties_from_config(*, server: Server, port: int) -> JavaSer
         online_mode=False,  # Enforced via JVM flag; property rewritten by server anyway
         level_name=cfg.get("level_name") or server.world_name,
         level_seed=cfg.get("level_seed") or "",
+        enable_rcon=True,
+        rcon_port=25575,  # We can just use 25575 since it only binds to localhost
+        rcon_password=uuid.uuid4().hex,
     )
 
 
@@ -688,27 +730,15 @@ def _prepare_java_server_for_start(*, server: Server, db: Session) -> Path:
             raise HTTPException(status_code=503, detail=f"Failed to allocate TCP port: {e}")
 
     _, servers_dir, _ = _server_dirs()
-    if not (server.mc_config or {}).get("server_dir"):
-        raise HTTPException(status_code=503, detail="Server directory not configured")
-
-    server_dir = _validate_server_dir(Path(server.mc_config["server_dir"]), servers_dir)
-    # JAR is now in the shared binary registry — no local JAR check needed.
-    # The binary_manager resolves the executable at start time.
-
-    props_path = server_dir / "server.properties"
-    write_java_server_properties(props_path, _java_server_properties_from_config(server=server, port=server.vm_port))
     
-    eula_path = server_dir / "eula.txt"
-    if not eula_path.exists():
-        eula_path.write_text("eula=true\n", encoding="utf-8")
-
-    if server.node_id:
-        node = db.get(Node, server.node_id)
-        if node:
-            from blockhost_backend.services.node_provision import sync_remote_java_config
-
-            sync_remote_java_config(node=node, server=server, server_dir=server_dir)
-
+    server_dir = servers_dir / str(server.id)
+    cfg = dict(server.mc_config or {})
+    cfg["runtime_mode"] = "process"
+    cfg["server_dir"] = str(server_dir)
+    server.mc_config = cfg
+    if db:
+        db.commit()
+    
     return server_dir
 
 
@@ -723,35 +753,18 @@ def _prepare_bedrock_server_for_start(*, server: Server, db: Session) -> Path:
         (server.mc_config or {}).get("bedrock_version")
     )
     
-    from blockhost_backend.minecraft.binary_manager import ensure_binary_installed
-    binary = ensure_binary_installed(db, ServerFlavor.BEDROCK, requested_version)
-    version_dir = Path(binary.executable_path).parent
-    version_name = binary.version
+    version_name = requested_version or "latest"
 
-    if not (server.mc_config or {}).get("server_dir"):
-        _, servers_dir, _ = _server_dirs()
-        server_dir = materialize_server_dir(
-            version_dir=version_dir, servers_dir=servers_dir, server_id=str(server.id)
-        )
-        _validate_server_dir(server_dir, servers_dir)
-        write_server_properties(
-            server_dir / "server.properties",
-            _server_props_from_config(server=server, port=server.vm_port),
-        )
-        cfg = dict(server.mc_config or {})
-        cfg["runtime_mode"] = "process"
-        cfg["template_version"] = version_name
-        cfg["server_dir"] = str(server_dir)
-        server.mc_config = cfg
-        _provision_remote_server(server, server_dir, db, version_name, version_dir)
-    else:
-        _, servers_dir, _ = _server_dirs()
-        server_dir = _validate_server_dir(Path(server.mc_config["server_dir"]), servers_dir)
-        write_server_properties(
-            server_dir / "server.properties",
-            _server_props_from_config(server=server, port=server.vm_port),
-        )
-        _provision_remote_server(server, server_dir, db, version_name, version_dir)
+    _, servers_dir, _ = _server_dirs()
+    server_dir = servers_dir / str(server.id)
+    
+    cfg = dict(server.mc_config or {})
+    cfg["runtime_mode"] = "process"
+    cfg["template_version"] = version_name
+    cfg["server_dir"] = str(server_dir)
+    server.mc_config = cfg
+    if db:
+        db.commit()
 
     return server_dir
 
@@ -805,6 +818,11 @@ def create_server(
         raise HTTPException(status_code=422, detail=str(e))
 
     node = select_best_node(db)
+    if settings.production_mode and not node:
+        raise HTTPException(
+            status_code=503,
+            detail="No online worker node is available. Check agent registration and heartbeat.",
+        )
     node_id = node.id if node else None
 
     try:
@@ -834,56 +852,24 @@ def create_server(
 
     versions_dir, servers_dir, _logs_dir = _server_dirs()
     try:
+        cfg = dict(server.mc_config or {})
+        server_dir = servers_dir / str(server.id)
+        
         if payload.flavor == ServerFlavor.BEDROCK:
-            # --- EXISTING BEDROCK LOGIC (UNCHANGED) ---
-            requested_version = _normalize_requested_version(
-                (server.mc_config or {}).get("bedrock_version")
-            )
-            _ensure_version_on_disk(versions_dir=versions_dir, requested_version=requested_version)
-            version_name, version_dir = resolve_version_dir(
-                versions_dir=versions_dir, requested=requested_version
-            )
-            server_dir = materialize_server_dir(
-                version_dir=version_dir, servers_dir=servers_dir, server_id=str(server.id)
-            )
-            _validate_server_dir(server_dir, servers_dir)
-
-            write_server_properties(
-                server_dir / "server.properties",
-                _server_props_from_config(server=server, port=server.vm_port),
-            )
-
-            cfg = dict(server.mc_config or {})
+            requested_version = _normalize_requested_version(cfg.get("bedrock_version"))
             cfg["runtime_mode"] = "process"
-            cfg["template_version"] = version_name
+            cfg["template_version"] = requested_version or "latest"
             cfg["server_dir"] = str(server_dir)
             server.mc_config = cfg
-            
         else:
-            # --- NEW JAVA LOGIC ---
-            from blockhost_backend.minecraft.binary_manager import ensure_binary_installed
-            
-            server_dir = servers_dir / str(server.id)
-            server_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Ensure the binary is in the shared registry (downloads if needed)
-            binary = ensure_binary_installed(db, payload.flavor, payload.mc_version)
-            
-            # Write eula.txt and server.properties — no JAR copied here
-            (server_dir / "eula.txt").write_text("eula=true\n", encoding="utf-8")
-            props = _java_server_properties_from_config(server=server, port=server.vm_port)
-            write_java_server_properties(server_dir / "server.properties", props)
-            
-            cfg = dict(server.mc_config or {})
             cfg["runtime_mode"] = "process"
             cfg["server_dir"] = str(server_dir)
-            # No longer store executable_name — the binary registry handles it
             server.mc_config = cfg
 
     except Exception as e:
         db.rollback()
         raise HTTPException(
-            status_code=503, detail=f"Failed to setup server files: {e}"
+            status_code=503, detail=f"Failed to setup server config: {e}"
         )
 
     # Server is created suspended — user must subscribe via Billing, then POST /start.
@@ -972,13 +958,7 @@ def reprovision_java_server(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerActionResponse:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="start_stop")
     if not is_java_flavor(server.flavor):
         raise HTTPException(status_code=400, detail="Only Java servers can be reprovisioned")
     if not server.mc_version:
@@ -1023,13 +1003,7 @@ def switch_server_software(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerActionResponse:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="config")
 
     is_currently_java = is_java_flavor(server.flavor)
     target_is_java = is_java_flavor(payload.target_flavor)
@@ -1037,39 +1011,34 @@ def switch_server_software(
     if is_currently_java != target_is_java:
         raise HTTPException(status_code=400, detail="Cross-platform switching (Java <-> Bedrock) is not supported.")
 
+    # Stop the server if it's currently running
+    if server.state == ServerState.running:
+        _stop_server_process(server)
+
     server.flavor = payload.target_flavor
     
     if target_is_java:
         server.mc_version = payload.target_mc_version
         
-        _, servers_dir, _ = _server_dirs()
-        server_dir = servers_dir / str(server.id)
-        server_dir.mkdir(parents=True, exist_ok=True)
-        jar_path = server_dir / "server.jar"
-
-        from blockhost_backend.minecraft.software_provider import resolve_jar_url
-
-        try:
-            jar_url = resolve_jar_url(server.flavor, server.mc_version)
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"Failed to resolve JAR URL: {e}")
+        # Tell the Agent to delete any existing JARs so the new version starts fresh
+        if server.node_id:
+            try:
+                node = db.get(Node, server.node_id)
+                if node:
+                    settings = get_settings()
+                    base = f"http://{node.ip_address}:{node.agent_port}"
+                    headers = {"Authorization": f"Bearer {settings.worker_agent_token}"}
+                    import httpx
+                    httpx.post(f"{base}/agent/servers/{server.id}/clear-jars", headers=headers, timeout=10.0)
+            except Exception as e:
+                logger.warning(f"Failed to clear old jars on agent for server {server.id}: {e}")
 
         cfg = dict(server.mc_config or {})
-        cfg["server_dir"] = str(server_dir)
-        cfg["executable_name"] = "server.jar"
         cfg.pop("provision_error", None)
         server.mc_config = cfg
-        server.state = ServerState.provisioning
+        server.state = ServerState.suspended
         db.commit()
 
-        background_tasks.add_task(
-            _provision_java_server,
-            str(server.id),
-            jar_url,
-            str(jar_path),
-            str(server_dir),
-            server.vm_port or 25565,
-        )
     else:
         # Bedrock
         cfg = dict(server.mc_config or {})
@@ -1079,6 +1048,7 @@ def switch_server_software(
             raise HTTPException(status_code=422, detail=str(e))
         
         server.mc_config = cfg
+        server.state = ServerState.suspended
         db.commit()
 
     _invalidate_server_read_cache(user.id, server.id)
@@ -1201,13 +1171,7 @@ def get_server(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerStateSnapshot:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db)
     cache = get_api_cache()
     cache_key = _server_detail_cache_key(user.id, server.id)
     cached_detail = cache.get_json(cache_key)
@@ -1247,13 +1211,7 @@ def start_server(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerActionResponse:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="start_stop")
 
     is_actually_running = False
     if server.state == ServerState.running:
@@ -1263,6 +1221,27 @@ def start_server(
         return ServerActionResponse(id=server.id, state=server.state)
 
     settings = get_settings()
+
+    # Automatic Failover: if assigned node is offline, detach the server
+    if server.node_id:
+        node = db.get(Node, server.node_id)
+        if not node or node.status == "offline":
+            server.node_id = None
+            server.vm_ipv4 = None
+            server.vm_port = None
+            db.commit()
+
+    if not server.node_id:
+        node = select_best_node(db)
+        if node:
+            server.node_id = node.id
+            server.vm_ipv4 = node.ip_address
+            db.commit()
+        elif settings.production_mode:
+            raise HTTPException(
+                status_code=503,
+                detail="Server is not assigned to a worker node. Recreate it after the agent is online.",
+            )
     is_java = is_java_flavor(server.flavor)
 
     try:
@@ -1301,13 +1280,7 @@ def stop_server(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerActionResponse:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="start_stop")
 
     _stop_server_process(server)
     db.commit()
@@ -1322,13 +1295,7 @@ def toggle_server(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerActionResponse:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="start_stop")
 
     is_actually_running = False
     if server.state == ServerState.running:
@@ -1338,6 +1305,26 @@ def toggle_server(
     if is_actually_running:
         _stop_server_process(server)
     else:
+        # Automatic Failover: if assigned node is offline, detach the server
+        if server.node_id:
+            node = db.get(Node, server.node_id)
+            if not node or node.status == "offline":
+                server.node_id = None
+                server.vm_ipv4 = None
+                server.vm_port = None
+                db.commit()
+
+        if not server.node_id:
+            node = select_best_node(db)
+            if node:
+                server.node_id = node.id
+                server.vm_ipv4 = node.ip_address
+                db.commit()
+            elif settings.production_mode:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Server is not assigned to a worker node. Recreate it after the agent is online.",
+                )
         is_java = is_java_flavor(server.flavor)
         try:
             if is_java:
@@ -1357,6 +1344,7 @@ def toggle_server(
             server.state = ServerState.suspended
             _drop_server_stats_snapshot(str(server.id))
             label = "Java" if is_java else "Bedrock"
+            logger.exception(f"Failed to start {label} process")
             raise HTTPException(
                 status_code=503, detail=f"Failed to start {label} process: {e}"
             )
@@ -1373,13 +1361,7 @@ def get_server_config(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerConfigOut:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="config")
     cache = get_api_cache()
     cache_key = _server_config_cache_key(user.id, server.id)
     cached = cache.get_json(cache_key)
@@ -1397,13 +1379,7 @@ def update_server_config(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ServerConfigOut:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="config")
 
     current = dict(server.mc_config or {})
     update = payload.config.model_dump(exclude_none=True)
@@ -1422,25 +1398,79 @@ def update_server_config(
     current.update(update)
     server.mc_config = current
 
-    if server.state == ServerState.running and (server.mc_config or {}).get("server_dir"):
+    if server.state == ServerState.running:
         try:
-            _, servers_dir, _ = _server_dirs()
-            server_dir = _validate_server_dir(
-                Path(server.mc_config["server_dir"]), servers_dir
-            )
-            write_server_properties(
-                server_dir / "server.properties",
-                _server_props_from_config(server=server, port=server.vm_port),
-            )
+            port = server.vm_port
+            props_dict: dict[str, object] = {}
+            if server.flavor == ServerFlavor.BEDROCK:
+                props_dict = {
+                    "server-name": update.get("server_name") or server.world_name,
+                    "gamemode": update.get("gamemode"),
+                    "difficulty": update.get("difficulty"),
+                    "max-players": update.get("max_players"),
+                    "allow-cheats": update.get("allow_cheats"),
+                    "level-name": update.get("level_name") or server.world_name,
+                    "level-seed": update.get("level_seed"),
+                }
+            else:
+                props_dict = {
+                    "motd": update.get("motd") or server.world_name,
+                    "max-players": update.get("max_players") or 20,
+                    "gamemode": update.get("gamemode") or "survival",
+                    "difficulty": update.get("difficulty") or "normal",
+                    "level-name": update.get("level_name") or server.world_name,
+                    "level-seed": update.get("level_seed") or "",
+                }
+            # Remove None values
+            props_dict = {k: v for k, v in props_dict.items() if v is not None}
+            if props_dict:
+                _ORCHESTRATOR.update_properties(str(server.id), props_dict)
         except Exception as e:
             raise HTTPException(
-                status_code=503, detail=f"Failed to update server.properties: {e}"
+                status_code=503, detail=f"Failed to update server properties: {e}"
             )
 
     db.commit()
     db.refresh(server)
     _invalidate_server_read_cache(user.id, server.id)
     return ServerConfigOut(id=server.id, mc_config=server.mc_config or {})
+
+
+@router.get("/{server_id}/properties")
+def get_server_properties(
+    server_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, str | bool | int]:
+    server = _get_server_for_user(server_id, user, db, required_permission="config")
+    
+    # We must try to reach the node. If offline, this will fail.
+    try:
+        return _ORCHESTRATOR.get_properties(str(server.id))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Failed to fetch properties from server node: {e}")
+
+
+@router.put("/{server_id}/properties")
+def update_server_properties(
+    server_id: str,
+    props: dict[str, str | bool | int],
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, str | bool]:
+    # Properties that must never be changed from the UI
+    BLOCKED_KEYS = {"server-port", "server-portv6"}
+    blocked = BLOCKED_KEYS & props.keys()
+    if blocked:
+        raise HTTPException(status_code=400, detail=f"Cannot modify protected properties: {', '.join(sorted(blocked))}")
+
+    server = _get_server_for_user(server_id, user, db, required_permission="config")
+    
+    try:
+        _ORCHESTRATOR.update_properties(str(server.id), props)
+        return {"status": "ok", "restart_required": True}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Failed to update properties on server node: {e}")
 
 
 @router.get("/{server_id}/stats", response_model=BedrockServerStats)
@@ -1450,13 +1480,7 @@ def get_server_stats(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> BedrockServerStats:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db)
     return _get_server_stats_snapshot(server, db, background_tasks)
 
 
@@ -1468,13 +1492,7 @@ def get_server_logs(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[str]:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="console")
 
     # Clamp tail to prevent memory DoS from huge values
     tail = max(1, min(tail, _MAX_LOG_TAIL))
@@ -1576,13 +1594,7 @@ async def console_websocket(
 
 
 def _require_server(server_id: str, user: User, db: Session) -> Server:
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = _get_server_for_user(server_id, user, db, required_permission="console")
     return server
 
 def _send_cmd(server_id: str, cmd: str) -> dict:
@@ -1760,3 +1772,124 @@ def get_blocklist(server_id: str, user: User = Depends(get_current_user), db: Se
     _require_server(server_id, user, db)
     # Mocking blocklist for now, since vanilla BDS doesn't track this neatly via command
     return {"players": []}
+
+
+@router.post("/{server_id}/collaborators", response_model=ServerCollaboratorOut)
+def invite_collaborator(
+    server_id: str,
+    payload: ServerCollaboratorCreate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        server_uuid = uuid.UUID(server_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Server not found")
+        
+    server = db.get(Server, server_uuid)
+    if not server or server.owner_id != user.id:
+        raise HTTPException(status_code=403, detail="Only the server owner can manage collaborators")
+        
+    target_user = db.execute(select(User).where(User.email == payload.email)).scalars().first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User with this email not found")
+        
+    if target_user.id == user.id:
+        raise HTTPException(status_code=400, detail="Cannot invite yourself")
+        
+    collab = db.execute(
+        select(ServerCollaborator).where(
+            ServerCollaborator.server_id == server.id,
+            ServerCollaborator.user_id == target_user.id
+        )
+    ).scalars().first()
+    
+    if collab:
+        # Update existing
+        collab.permissions = payload.permissions
+    else:
+        collab = ServerCollaborator(
+            server_id=server.id,
+            user_id=target_user.id,
+            permissions=payload.permissions
+        )
+        db.add(collab)
+        
+    db.commit()
+    db.refresh(collab)
+    
+    return ServerCollaboratorOut(
+        id=collab.id,
+        server_id=collab.server_id,
+        user_id=collab.user_id,
+        nickname=target_user.nickname,
+        email=target_user.email,
+        permissions=collab.permissions,
+        created_at=collab.created_at,
+        updated_at=collab.updated_at
+    )
+
+@router.get("/{server_id}/collaborators", response_model=list[ServerCollaboratorOut])
+def list_collaborators(
+    server_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        server_uuid = uuid.UUID(server_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Server not found")
+        
+    server = db.get(Server, server_uuid)
+    if not server or server.owner_id != user.id:
+        raise HTTPException(status_code=403, detail="Only the server owner can view collaborators")
+        
+    collabs = db.execute(
+        select(ServerCollaborator).where(ServerCollaborator.server_id == server.id)
+    ).scalars().all()
+    
+    results = []
+    for c in collabs:
+        # We need the user info, we can access c.user since we have relationship configured
+        results.append(
+            ServerCollaboratorOut(
+                id=c.id,
+                server_id=c.server_id,
+                user_id=c.user_id,
+                nickname=c.user.nickname,
+                email=c.user.email,
+                permissions=c.permissions,
+                created_at=c.created_at,
+                updated_at=c.updated_at
+            )
+        )
+    return results
+
+@router.delete("/{server_id}/collaborators/{user_id}", status_code=204)
+def remove_collaborator(
+    server_id: str,
+    user_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        server_uuid = uuid.UUID(server_id)
+        target_user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Not found")
+        
+    server = db.get(Server, server_uuid)
+    if not server or server.owner_id != user.id:
+        raise HTTPException(status_code=403, detail="Only the server owner can manage collaborators")
+        
+    collab = db.execute(
+        select(ServerCollaborator).where(
+            ServerCollaborator.server_id == server.id,
+            ServerCollaborator.user_id == target_user_uuid
+        )
+    ).scalars().first()
+    
+    if collab:
+        db.delete(collab)
+        db.commit()
+    return None

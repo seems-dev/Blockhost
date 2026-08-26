@@ -26,15 +26,23 @@ _UNIT_RE = re.compile(r"[^A-Za-z0-9_.@-]+")
 
 import threading
 
-# Matches: Bedrock: "Player connected: Name, xuid: ..." or Java: "]: Name joined the game"
+# Matches Bedrock connect events:
+#   "Player connected: Name, xuid: 12345"   (comma-separated)
+#   "Player Spawned: Name xuid: 12345"       (space-separated, newer BDS)
+# Also matches Java: "]: Name joined the game"
 _PLAYER_CONNECTED_RE = re.compile(
-    r"(?:Player (?:connected|Spawned):\s*([^,]+)(?:,\s*xuid:\s*(\d+))?)|(?:\]:\s*([A-Za-z0-9_]+)\s+joined the game)",
-    re.IGNORECASE
+    r"(?:Player (?:connected|Spawned):\s*(.+?)(?:[,\s]+xuid:\s*(\d+))?(?:\s*$|,))"
+    r"|(?:(?:^|\]:\s*)([A-Za-z0-9_]{1,16})\s+joined the game)",
+    re.IGNORECASE,
 )
-# Matches: Bedrock: "Player disconnected: Name" or Java: "]: Name left the game"
+# Matches Bedrock disconnect:
+#   "Player disconnected: Name, xuid: 12345"
+#   "Player disconnected: Name, xuid: 12345, pfid: ..."
+# Also matches Java: "]: Name left the game"
 _PLAYER_DISCONNECTED_RE = re.compile(
-    r"(?:Player disconnected:\s*([^,]+))|(?:\]:\s*([A-Za-z0-9_]+)\s+left the game)", 
-    re.IGNORECASE
+    r"(?:Player disconnected:\s*(.+?)(?:[,\s]+xuid:\s*(\d+))?(?:\s*$|,))"
+    r"|(?:(?:^|\]:\s*)([A-Za-z0-9_]{1,16})\s+left the game)",
+    re.IGNORECASE,
 )
 
 class SystemdRuntime:
@@ -52,8 +60,14 @@ class SystemdRuntime:
         self._online_players: dict[str, dict[str, str | None]] = {}
         self._lock = threading.Lock()
 
+    def _systemctl_available(self) -> bool:
+        return shutil.which("systemctl") is not None
+
     # ---------------- START ----------------
     def start_server(self, request: RuntimeStartRequest) -> RuntimeStartResult:
+        if shutil.which("systemd-run") is None:
+            raise RuntimeError("Local systemd runtime is unavailable; assign this server to a worker node.")
+
         server_dir = request.server_dir.resolve()
         self._server_dirs[request.server_id] = server_dir
         executable = request.executable_path.resolve()
@@ -120,15 +134,22 @@ class SystemdRuntime:
         else:
             # --- BEDROCK STARTUP LOGIC ---
             exe_cmd = f"exec 3<> stdin.fifo; exec '{executable}' <&3"
+        import pwd
+        import grp
+        user_name = pwd.getpwuid(os.getuid()).pw_name
+        group_name = grp.getgrgid(os.getgid()).gr_name
 
         cmd = [
             "systemd-run",
-            "--user",
             "--unit", unit,
             "--collect",
             "--property", f"WorkingDirectory={server_dir}",
+            "--property", f"User={user_name}",
+            "--property", f"Group={group_name}",
             "--property", f"MemoryMax={request.ram_mb + 512}M" if is_java else f"MemoryMax={request.ram_mb}M",
             "--property", f"CPUQuota={request.cpu_quota_pct}%",
+            "--property", "MemoryAccounting=yes",
+            "--property", "CPUAccounting=yes",
             "--property", "TasksMax=512",
             "/bin/bash", "-c", exe_cmd,
         ]
@@ -151,15 +172,18 @@ class SystemdRuntime:
 
     # ---------------- STOP ----------------
     def stop_server(self, server_id: str) -> None:
+        if not self._systemctl_available():
+            return
+
         unit = self._unit_name(server_id)
 
         subprocess.run(
-            ["systemctl", "--user", "stop", unit],
+            ["systemctl",  "stop", unit],
             capture_output=True
         )
 
         subprocess.run(
-            ["systemctl", "--user", "reset-failed", unit],
+            ["systemctl",  "reset-failed", unit],
             capture_output=True
         )
 
@@ -177,20 +201,44 @@ class SystemdRuntime:
 
     # ---------------- STATUS ----------------
     def get_status(self, server_id: str) -> RuntimeStatus:
+        if not self._systemctl_available():
+            return RuntimeStatus(running=False)
+
         unit = self._unit_name(server_id)
 
         result = subprocess.run(
-            ["systemctl", "--user", "is-active", unit],
+            ["systemctl",  "is-active", unit],
             capture_output=True,
             text=True,
         )
 
         running = result.stdout.strip() == "active"
+        uptime_seconds = None
+
+        if running:
+            show_result = subprocess.run(
+                ["systemctl", "show", unit, "-p", "ActiveEnterTimestampMonotonic"],
+                capture_output=True,
+                text=True,
+            )
+            for line in show_result.stdout.splitlines():
+                if line.startswith("ActiveEnterTimestampMonotonic="):
+                    try:
+                        active_enter_us = int(line.split("=", 1)[1])
+                        if active_enter_us > 0:
+                            with open("/proc/uptime", "r") as f:
+                                current_uptime_s = float(f.read().split()[0])
+                                uptime_seconds = int(current_uptime_s - (active_enter_us / 1000000.0))
+                    except (ValueError, FileNotFoundError, IndexError):
+                        pass
 
         with self._lock:
             if not running:
                 self._stop_log_stream(server_id)
                 self._listeners.pop(server_id, None)
+            else:
+                if server_id not in self._log_procs:
+                    self._start_log_stream(server_id)
             # Convert {player_name: xuid} dict to list of player names
             players_dict = self._online_players.get(server_id, {})
             players = list(players_dict.keys()) if players_dict else []
@@ -198,19 +246,64 @@ class SystemdRuntime:
         return RuntimeStatus(
             running=running,
             runtime_id=unit if running else None,
+            uptime_seconds=uptime_seconds,
             online_players=players if running else None,
         )
     # Get players with their XUIDs (dict format: {name: xuid_or_none})
     def get_online_players_with_xuid(self, server_id: str) -> dict[str, str | None]:
+        # Try RCON for Java servers first
+        server_dir = self._server_dirs.get(server_id)
+        if server_dir is None:
+            from blockhost_backend.config.config_manager import get_settings
+            root = self._servers_root or Path(get_settings().bedrock_servers_dir)
+            server_dir = (root / server_id).resolve()
+        
+        is_java = not (server_dir / "bedrock_server").exists()
+        if is_java:
+            props = self.get_properties(server_id)
+            if props.get("enable-rcon") is True:
+                rcon_port = props.get("rcon.port", 25575)
+                rcon_password = props.get("rcon.password", "")
+                try:
+                    from blockhost_backend.minecraft.rcon_client import RconClient
+                    with RconClient("127.0.0.1", int(rcon_port), str(rcon_password)) as rcon:
+                        resp = rcon.command("/list")
+                        # Java /list response: "There are X of a max of Y players online: player1, player2"
+                        # Or simply "player1, player2" in some variants.
+                        import re
+                        m = re.search(r"online:\s*(.*)", resp, re.IGNORECASE)
+                        if m:
+                            players_str = m.group(1).strip()
+                        else:
+                            players_str = resp.strip()
+                        
+                        players = {}
+                        if players_str:
+                            for name in players_str.split(","):
+                                name = name.strip()
+                                if name:
+                                    players[name] = None
+                        return players
+                except Exception as e:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"RCON /list failed for Java server {server_id}: {e}")
+
+        # Fallback to log parsing. Rebuild from journal on demand so player
+        # state survives agent restarts and missed live log-stream windows.
+        self._rebuild_online_players_from_journal(server_id)
         with self._lock:
             return dict(self._online_players.get(server_id, {}))
     # ---------------- STATS (BASIC) ----------------
     def get_stats(self, server_id: str) -> RuntimeResourceStats:
+        if not self._systemctl_available():
+            return RuntimeResourceStats(cpu_usage=None, ram_usage_mb=None)
+
         unit = self._unit_name(server_id)
 
         # Get memory and all PIDs in the unit's cgroup
         show_result = subprocess.run(
-            ["systemctl", "--user", "show", unit, "-p", "MemoryCurrent"],
+            ["systemctl",  "show", unit, "-p", "MemoryCurrent"],
             capture_output=True,
             text=True,
         )
@@ -219,13 +312,15 @@ class SystemdRuntime:
         for line in show_result.stdout.splitlines():
             if line.startswith("MemoryCurrent="):
                 try:
-                    mem_bytes = int(line.split("=", 1)[1])
+                    val = line.split("=", 1)[1]
+                    if val not in ("[not set]", "infinity"):
+                        mem_bytes = int(val)
                 except ValueError:
                     pass
 
         # Get all PIDs in the unit cgroup
         pids_result = subprocess.run(
-            ["systemctl", "--user", "show", unit, "-p", "MainPID,ControlGroup"],
+            ["systemctl", "show", unit, "-p", "MainPID", "-p", "ControlGroup"],
             capture_output=True,
             text=True,
         )
@@ -259,6 +354,18 @@ class SystemdRuntime:
         if not all_pids and main_pid and main_pid > 0:
             all_pids = [main_pid]
 
+        # Fallback for memory if MemoryCurrent was [not set]
+        if mem_bytes is None and all_pids:
+            try:
+                with open(f"/proc/{all_pids[0]}/status") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            mem_kb = int(line.split()[1])
+                            mem_bytes = mem_kb * 1024
+                            break
+            except (OSError, ValueError, IndexError):
+                pass
+
         cpu_usage = None
         if all_pids:
             ps_result = subprocess.run(
@@ -285,12 +392,43 @@ class SystemdRuntime:
             ram_usage_mb=ram_usage_mb,
         )
 
+    def get_properties(self, server_id: str) -> dict[str, str | bool | int]:
+        server_dir = self._server_dirs.get(server_id)
+        if server_dir is None:
+            from blockhost_backend.config.config_manager import get_settings
+            root = self._servers_root or Path(get_settings().bedrock_servers_dir)
+            server_dir = (root / server_id).resolve()
+        props_path = server_dir / "server.properties"
+        from blockhost_backend.minecraft.java_properties import read_properties
+        return read_properties(props_path)
+
+    def update_properties(self, server_id: str, props: dict[str, str | bool | int]) -> None:
+        server_dir = self._server_dirs.get(server_id)
+        if server_dir is None:
+            from blockhost_backend.config.config_manager import get_settings
+            root = self._servers_root or Path(get_settings().bedrock_servers_dir)
+            server_dir = (root / server_id).resolve()
+        props_path = server_dir / "server.properties"
+        is_bedrock = (server_dir / "bedrock_server").exists()
+        
+        if is_bedrock:
+            from blockhost_backend.minecraft.bedrock_properties import set_bedrock_server_property
+            for k, v in props.items():
+                set_bedrock_server_property(props_path, k, v)
+        else:
+            from blockhost_backend.minecraft.java_properties import set_java_server_property
+            for k, v in props.items():
+                set_java_server_property(props_path, k, v)
+
     # ---------------- LOGS ----------------
-    def read_logs(self, server_id: str, tail: int = 200) -> list[LogEntry]:
+    def read_logs(self, server_id: str, *, tail: int = 200) -> list[LogEntry]:
+        if shutil.which("journalctl") is None:
+            return []
+
         unit = self._unit_name(server_id)
 
         result = subprocess.run(
-            ["journalctl", "--user", "-u", unit, "-n", str(tail), "--no-pager"],
+            ["journalctl", "-u", unit, "-n", str(tail), "--no-pager"],
             capture_output=True,
             text=True,
         )
@@ -299,6 +437,67 @@ class SystemdRuntime:
             LogEntry(ts=None, line=line)
             for line in result.stdout.splitlines()
         ]
+
+    def _unit_active_since(self, server_id: str) -> str | None:
+        if not self._systemctl_available():
+            return None
+
+        result = subprocess.run(
+            ["systemctl", "show", self._unit_name(server_id), "-p", "ActiveEnterTimestamp"],
+            capture_output=True,
+            text=True,
+        )
+        for line in result.stdout.splitlines():
+            if not line.startswith("ActiveEnterTimestamp="):
+                continue
+            value = line.split("=", 1)[1].strip()
+            if value and value not in {"n/a", "0"}:
+                return value
+        return None
+
+    def _journal_lines_for_player_state(self, server_id: str, *, tail: int = 5000) -> list[str]:
+        if shutil.which("journalctl") is None:
+            return []
+
+        cmd = ["journalctl", "-u", self._unit_name(server_id), "-n", str(tail), "--no-pager", "-o", "cat"]
+        active_since = self._unit_active_since(server_id)
+        if active_since:
+            cmd.extend(["--since", active_since])
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return result.stdout.splitlines()
+
+    def _apply_player_log_line(self, players: dict[str, str | None], line: str) -> None:
+        m_conn = _PLAYER_CONNECTED_RE.search(line)
+        if m_conn:
+            player_name = (m_conn.group(1) or m_conn.group(3)).strip()
+            xuid = m_conn.group(2) if m_conn.group(2) else None
+            players[player_name] = xuid
+            return
+
+        m_disc = _PLAYER_DISCONNECTED_RE.search(line)
+        if m_disc:
+            player_name = (m_disc.group(1) or m_disc.group(3)).strip()
+            players.pop(player_name, None)
+
+    def _rebuild_online_players_from_journal(self, server_id: str) -> None:
+        try:
+            lines = self._journal_lines_for_player_state(server_id)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning("Failed to rebuild player state from journal for %s: %s", server_id, e)
+            return
+
+        players: dict[str, str | None] = {}
+        for line in lines:
+            self._apply_player_log_line(players, line)
+
+        if not lines:
+            return
+
+        with self._lock:
+            self._online_players[server_id] = players
 
     # ---------------- COMMAND ----------------
     def send_command(self, server_id: str, command: str) -> None:
@@ -313,13 +512,37 @@ class SystemdRuntime:
         if not status.running:
             raise RuntimeError("Server is not running")
 
+        is_java = not (server_dir / "bedrock_server").exists()
+        if is_java:
+            props = self.get_properties(server_id)
+            if props.get("enable-rcon") is True:
+                rcon_port = props.get("rcon.port", 25575)
+                rcon_password = props.get("rcon.password", "")
+                try:
+                    from blockhost_backend.minecraft.rcon_client import RconClient
+                    with RconClient("127.0.0.1", int(rcon_port), str(rcon_password)) as rcon:
+                        rcon.command(command)
+                        return
+                except Exception as e:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"RCON command failed for Java server {server_id}: {e}. Falling back to stdin FIFO.")
+
         if not fifo_path.exists():
-            raise RuntimeError("Server stdin FIFO not found. Try restarting the server.")
+            import os
+            os.mkfifo(fifo_path)
+            # Make sure it's accessible by the user/group that systemd runs as
+            # By default it inherits from the python process (root/ubuntu), but systemd-run uses User/Group.
+            # But we can at least try creating it.
+            # actually if we are the agent, we own the directory so it's fine.
 
         with open(fifo_path, "w") as f:
             f.write(command + "\n")
 
     def add_log_listener(self, server_id: str, listener: LogListener) -> None:
+        if shutil.which("journalctl") is None:
+            return
+
         with self._lock:
             if server_id not in self._listeners:
                 self._listeners[server_id] = []
@@ -347,11 +570,14 @@ class SystemdRuntime:
                     self._stop_log_stream(server_id)
 
     def _start_log_stream(self, server_id: str) -> None:
+        if shutil.which("journalctl") is None:
+            return
+
         unit = self._unit_name(server_id)
         proc = subprocess.Popen(
-            ["journalctl", "--user", "-u", unit, "-f", "-n", "0", "--no-pager"],
+            ["journalctl", "-u", unit, "-f", "-n", "200", "--no-pager"],
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
         )
         self._log_procs[server_id] = proc
@@ -364,17 +590,9 @@ class SystemdRuntime:
                     stripped = line.strip("\n")
                     entry = LogEntry(ts=None, line=stripped)
 
-                    # Parse player connect/disconnect events
-                    m_conn = _PLAYER_CONNECTED_RE.search(stripped)
-                    m_disc = _PLAYER_DISCONNECTED_RE.search(stripped)
                     with self._lock:
-                        if m_conn:
-                            player_name = (m_conn.group(1) or m_conn.group(3)).strip()
-                            xuid = m_conn.group(2) if m_conn.lastindex >= 2 and m_conn.group(2) else None
-                            self._online_players.setdefault(server_id, {})[player_name] = xuid
-                        elif m_disc:
-                            player_name = (m_disc.group(1) or m_disc.group(2)).strip()
-                            self._online_players.setdefault(server_id, {}).pop(player_name, None)
+                        players = self._online_players.setdefault(server_id, {})
+                        self._apply_player_log_line(players, stripped)
                         listeners = list(self._listeners.get(server_id, []))
 
                     # Harden listener execution: catch exceptions to prevent stream crash

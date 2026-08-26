@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-
+#file_name = java_properties.py 
 @dataclass(frozen=True)
 class JavaServerProperties:
     server_port: int = 25565
@@ -25,6 +25,8 @@ class JavaServerProperties:
     max_tick_time: int = 60000
     network_compression_threshold: int = 256
     prevent_proxy_connections: bool = False
+    rcon_port: int = 25575
+    rcon_password: str = ""
 
 
 def set_java_server_property(path: Path, key: str, value: object) -> None:
@@ -56,7 +58,16 @@ def set_java_server_property(path: Path, key: str, value: object) -> None:
         else:
             new_lines.append(f"{key}={value}")
 
-    path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    import shutil
+    import os
+
+    if path.exists():
+        backup_path = path.with_suffix(".properties.bak")
+        shutil.copy2(path, backup_path)
+
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    os.replace(tmp_path, path)
 
 
 def write_java_server_properties(path: Path, props: JavaServerProperties) -> None:
@@ -81,8 +92,9 @@ def write_java_server_properties(path: Path, props: JavaServerProperties) -> Non
     put("level-name", props.level_name)
     put("level-seed", props.level_seed)
     put("motd", props.motd)
-    
     put("enable-rcon", props.enable_rcon)
+    put("rcon.port", props.rcon_port)
+    put("rcon.password", props.rcon_password)
     put("spawn-protection", props.spawn_protection)
     put("view-distance", props.view_distance)
     put("simulation-distance", props.simulation_distance)
@@ -94,5 +106,41 @@ def write_java_server_properties(path: Path, props: JavaServerProperties) -> Non
     put("network-compression-threshold", props.network_compression_threshold)
     put("prevent-proxy-connections", props.prevent_proxy_connections)
 
+    import shutil
+    import os
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if path.exists():
+        backup_path = path.with_suffix(".properties.bak")
+        shutil.copy2(path, backup_path)
+
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def read_properties(path: Path) -> dict[str, str | bool | int]:
+    """Parse a properties file into a dictionary."""
+    if not path.exists():
+        return {}
+
+    props = {}
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if "=" in line:
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            
+            # Simple type coercion
+            if val.lower() == "true":
+                props[key] = True
+            elif val.lower() == "false":
+                props[key] = False
+            elif val.isdigit():
+                props[key] = int(val)
+            else:
+                props[key] = val
+    return props

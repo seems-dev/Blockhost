@@ -1,15 +1,27 @@
 from __future__ import annotations
 
 import uuid
+import secrets
+from datetime import datetime, timedelta, timezone
+import hashlib
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from blockhost_backend.api.deps import auth_rate_limit, get_current_user
-from blockhost_backend.api.schemas import AuthResponse, LoginRequest, RefreshRequest, SignupRequest, UserOut
+from blockhost_backend.api.schemas import (
+    AuthResponse,
+    EmailVerificationRequiredResponse,
+    LoginRequest,
+    RefreshRequest,
+    ResendVerificationRequest,
+    SignupRequest,
+    UserOut,
+    VerifyEmailRequest,
+)
 from blockhost_backend.config.config_manager import get_settings
 from blockhost_backend.core.security import (
     TokenError,
@@ -19,7 +31,8 @@ from blockhost_backend.core.security import (
     verify_password,
 )
 from blockhost_backend.database.db import get_db
-from blockhost_backend.database.schema import BlockcoinReason, BlockcoinTransaction, User
+from blockhost_backend.database.schema import BlockcoinReason, BlockcoinTransaction, User, utcnow
+from blockhost_backend.services.email import send_verification_email
 from blockhost_backend.services.auth_tokens import (
     issue_refresh_token,
     revoke_all_refresh_tokens,
@@ -45,13 +58,69 @@ class LogoutRequest(BaseModel):
     refresh_token: str
 
 
-@router.post("/signup", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
+def _user_out(user: User) -> UserOut:
+    return UserOut(
+        id=user.id,
+        email=user.email,
+        nickname=user.nickname,
+        referrer_code=user.referrer_code,
+        blockcoin_balance=user.blockcoin_balance,
+        email_verified=user.email_verified_at is not None,
+    )
+
+
+def _generate_email_otp() -> str:
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def _verification_otp_hash(*, email: str, otp: str) -> str:
+    normalized_email = email.lower().strip()
+    return hashlib.sha256(f"{normalized_email}:{otp}".encode("utf-8")).hexdigest()
+
+
+def _issue_email_verification(user: User, background_tasks: BackgroundTasks) -> None:
+    settings = get_settings()
+    otp = _generate_email_otp()
+    user.email_verification_otp_hash = _verification_otp_hash(email=user.email, otp=otp)
+    user.email_verification_expires_at = utcnow() + timedelta(
+        seconds=settings.email_verification_otp_expire_seconds
+    )
+    background_tasks.add_task(
+        send_verification_email,
+        to_email=user.email,
+        nickname=user.nickname,
+        otp=otp,
+    )
+
+
+def _issue_auth_response(*, db: Session, user: User) -> AuthResponse:
+    settings = get_settings()
+    access_token = create_access_token(subject=str(user.id), expires_seconds=settings.jwt_access_token_expire_seconds)
+    refresh_token = issue_refresh_token(db=db, user=user)
+    return AuthResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        user=_user_out(user),
+    )
+
+
+def _is_expired(expires_at: datetime | None) -> bool:
+    if expires_at is None:
+        return True
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at < utcnow()
+
+
+@router.post("/signup", response_model=EmailVerificationRequiredResponse, status_code=status.HTTP_201_CREATED)
 def signup(
     payload: SignupRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     _: None = Depends(auth_rate_limit()),
-) -> AuthResponse:
-    existing = db.execute(select(User).where(User.email == payload.email)).scalar_one_or_none()
+) -> EmailVerificationRequiredResponse:
+    email = str(payload.email).lower()
+    existing = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
 
@@ -62,7 +131,7 @@ def signup(
             referred_by_id = referrer.id
 
     user = User(
-        email=str(payload.email).lower(),
+        email=email,
         phone=payload.phone,
         nickname=payload.nickname,
         auth_hash=hash_password(payload.password),
@@ -72,6 +141,7 @@ def signup(
     )
     db.add(user)
     db.flush()
+    _issue_email_verification(user, background_tasks)
 
     if referred_by_id is not None:
         db.add(
@@ -84,54 +154,88 @@ def signup(
         )
         user.blockcoin_balance += 100
 
-    settings = get_settings()
-    access_token = create_access_token(subject=str(user.id), expires_seconds=settings.jwt_access_token_expire_seconds)
-    refresh_token = issue_refresh_token(db=db, user=user)
     db.commit()
-    db.refresh(user)
 
-    return AuthResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        user=UserOut(
-            id=user.id,
-            email=user.email,
-            nickname=user.nickname,
-            referrer_code=user.referrer_code,
-            blockcoin_balance=user.blockcoin_balance,
-        ),
+    return EmailVerificationRequiredResponse(
+        status="verification_required",
+        email=user.email,
+        message="Check your email to verify your account.",
     )
 
 
-@router.post("/login", response_model=AuthResponse)
+@router.post("/login")
 def login(
     payload: LoginRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     _: None = Depends(auth_rate_limit()),
-) -> AuthResponse:
+) -> AuthResponse | EmailVerificationRequiredResponse:
     user = db.execute(select(User).where(User.email == str(payload.email).lower())).scalar_one_or_none()
     if not user or user.deleted_at is not None:
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not verify_password(payload.password, user.auth_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    if user.auth_provider == "local" and user.email_verified_at is None:
+        # Instead of a dead-end 403, re-send the OTP and tell the client
+        # to show the verification screen so the user can complete signup.
+        _issue_email_verification(user, background_tasks)
+        db.commit()
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "status": "verification_required",
+                "email": user.email,
+                "message": "Email not verified. A new verification code has been sent to your email.",
+            },
+        )
 
-    settings = get_settings()
-    access_token = create_access_token(subject=str(user.id), expires_seconds=settings.jwt_access_token_expire_seconds)
-    refresh_token = issue_refresh_token(db=db, user=user)
+    response = _issue_auth_response(db=db, user=user)
     db.commit()
     db.refresh(user)
+    return response
 
-    return AuthResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        user=UserOut(
-            id=user.id,
-            email=user.email,
-            nickname=user.nickname,
-            referrer_code=user.referrer_code,
-            blockcoin_balance=user.blockcoin_balance,
-        ),
-    )
+
+@router.post("/verify-email", response_model=AuthResponse)
+def verify_email(
+    payload: VerifyEmailRequest,
+    db: Session = Depends(get_db),
+    _: None = Depends(auth_rate_limit()),
+) -> AuthResponse:
+    email = str(payload.email).lower()
+    user = db.execute(
+        select(User).where(User.email == email)
+    ).scalar_one_or_none()
+    if not user or user.deleted_at is not None:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+    otp_hash = _verification_otp_hash(email=email, otp=payload.otp)
+    if user.email_verification_otp_hash != otp_hash:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+    if _is_expired(user.email_verification_expires_at):
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+
+    user.email_verified_at = utcnow()
+    user.email_verification_otp_hash = None
+    user.email_verification_expires_at = None
+    response = _issue_auth_response(db=db, user=user)
+    db.commit()
+    db.refresh(user)
+    return response
+
+
+@router.post("/resend-verification")
+def resend_verification(
+    payload: ResendVerificationRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    _: None = Depends(auth_rate_limit()),
+) -> dict:
+    user = db.execute(
+        select(User).where(User.email == str(payload.email).lower())
+    ).scalar_one_or_none()
+    if user and user.deleted_at is None and user.auth_provider == "local" and user.email_verified_at is None:
+        _issue_email_verification(user, background_tasks)
+        db.commit()
+    return {"status": "ok", "message": "If this email exists, a verification email was sent."}
 
 
 @router.post("/refresh")
@@ -206,6 +310,7 @@ def google_login(
         if user is not None:
             user.google_sub = google_sub
             user.auth_provider = "google"
+            user.email_verified_at = user.email_verified_at or utcnow()
             db.commit()
             db.refresh(user)
         else:
@@ -223,6 +328,7 @@ def google_login(
                 auth_hash="",
                 google_sub=google_sub,
                 auth_provider="google",
+                email_verified_at=utcnow(),
                 referrer_code=_unique_referrer_code(db),
                 referred_by_id=referred_by_id,
                 blockcoin_balance=0,
@@ -247,22 +353,8 @@ def google_login(
     if user.deleted_at is not None:
         raise HTTPException(status_code=403, detail="Account suspended")
 
-    access_token = create_access_token(
-        subject=str(user.id),
-        expires_seconds=settings.jwt_access_token_expire_seconds,
-    )
-    refresh_token = issue_refresh_token(db=db, user=user)
+    user.email_verified_at = user.email_verified_at or utcnow()
+    response = _issue_auth_response(db=db, user=user)
     db.commit()
     db.refresh(user)
-
-    return AuthResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        user=UserOut(
-            id=user.id,
-            email=user.email,
-            nickname=user.nickname,
-            referrer_code=user.referrer_code,
-            blockcoin_balance=user.blockcoin_balance,
-        ),
-    )
+    return response

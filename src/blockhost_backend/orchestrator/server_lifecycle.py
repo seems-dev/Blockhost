@@ -5,7 +5,7 @@ import os
 import shutil
 from pathlib import Path
 from sqlalchemy.orm import Session
-
+import dataclasses
 import httpx
 
 from blockhost_backend.config.config_manager import Settings
@@ -16,7 +16,7 @@ from blockhost_backend.database.schema import (
     User,
 )
 from blockhost_backend.minecraft.java_compat import is_java_flavor, required_java_version
-from blockhost_backend.minecraft.binary_manager import ensure_binary_installed
+
 from blockhost_backend.orchestrator.resources import get_effective_server_resource_limits
 from blockhost_backend.runtime.interface import (
     LogEntry,
@@ -52,6 +52,12 @@ class ServerLifecycleOrchestrator:
 
     def get_online_players_with_xuid(self, server_id: str) -> dict[str, str | None]:
         return self._runtime.get_online_players_with_xuid(server_id)
+
+    def ping_server(self, server_id: str) -> dict[str, object] | None:
+        """Proxy Bedrock ping through the agent for remote nodes."""
+        if hasattr(self._runtime, "ping_server"):
+            return self._runtime.ping_server(server_id)
+        return None
 
     # ---------------- START ----------------
     def start_server(
@@ -93,35 +99,54 @@ class ServerLifecycleOrchestrator:
         if not requested_version:
             requested_version = "recommended" if not is_java else "1.21.4"
             
-        # We need db for ensure_binary_installed
-        if db is None:
-            raise RuntimeError("Database session is required to start server")
-            
-        binary = ensure_binary_installed(db, server.flavor, requested_version)
+        jar_download_url = None
+        server_properties_dict = {}
+
+        if is_java:
+            from blockhost_backend.minecraft.software_provider import resolve_jar_url
+            jar_download_url = resolve_jar_url(server.flavor, requested_version)
+            from blockhost_backend.api.servers import _java_server_properties_from_config
+            server_properties_dict = {
+                k: v for k, v in dataclasses.asdict(
+                    _java_server_properties_from_config(server=server, port=server.vm_port)
+                ).items() if v is not None
+            }
+        else:
+            from blockhost_backend.api.servers import _server_props_from_config
+            server_properties_dict = {
+                k: v for k, v in dataclasses.asdict(
+                    _server_props_from_config(server=server, port=server.vm_port)
+                ).items() if v is not None
+            }
 
         result = self._runtime.start_server(
             RuntimeStartRequest(
                 server_id=str(server.id),
                 server_dir=server_dir,
                 port=server.vm_port,
-                requested_version=binary.version,
-                executable_path=Path(binary.executable_path),
+                requested_version=requested_version,
+                executable_path=None,
                 ram_mb=limits["ram_mb"],
                 cpu_quota_pct=limits["cpu_quota_pct"],
                 flavor=server.flavor.value if server.flavor else None,
                 jdk_path=self._resolve_jdk_path(server=server, settings=settings, db=db),
+                server_properties_dict=server_properties_dict,
+                jar_download_url=jar_download_url,
             )
         )
 
-        # OPTIONAL VERSION CHECK (Bedrock only)
+        # If the agent used a different version than requested (e.g. fell back to latest
+        # because the stored version wasn't available on MCJarFiles), accept it and
+        # update mc_config so future starts also use the working version.
         requested = mc_config.get("template_version")
-        if not is_java and requested and result.actual_version:
-            if requested not in {"LATEST", "PREVIEW"}:
-                if not str(result.actual_version).startswith(str(requested)):
-                    self._runtime.stop_server(str(server.id))
-                    raise RuntimeError(
-                        f"Version mismatch (requested={requested}, actual={result.actual_version})"
-                    )
+        if not is_java and result.actual_version and requested and result.actual_version != requested:
+            logger.warning(
+                "Server %s: requested version %r but agent used %r — updating stored version.",
+                server.id, requested, result.actual_version,
+            )
+            updated_config = dict(server.mc_config or {})
+            updated_config["template_version"] = result.actual_version
+            server.mc_config = updated_config
 
         server.vm_id = result.runtime_id
         if server.node_id and server.vm_ipv4:
@@ -144,6 +169,12 @@ class ServerLifecycleOrchestrator:
     # ---------------- LOGS ----------------
     def read_logs(self, server_id: str, *, tail: int = 200) -> list[LogEntry]:
         return self._runtime.read_logs(server_id, tail=tail)
+
+    def get_properties(self, server_id: str) -> dict[str, str | bool | int]:
+        return self._runtime.get_properties(server_id)
+
+    def update_properties(self, server_id: str, props: dict[str, str | bool | int]) -> None:
+        self._runtime.update_properties(server_id, props)
 
     # ---------------- COMMANDS ----------------
     def send_command(self, server_id: str, command: str) -> None:
@@ -210,10 +241,10 @@ class ServerLifecycleOrchestrator:
         path = resp.json().get("path")
         if not path:
             raise RuntimeError(f"Agent did not return a JDK path for Java {java_version}")
-        jdk_path = Path(path)
-        if not (jdk_path / "bin" / "java").exists():
-            raise RuntimeError(f"JDK not found on agent at {jdk_path}")
-        return jdk_path
+        
+        # Return the path directly. The Agent has already verified the file exists.
+        # We cannot check .exists() here because the file is on the Agent's filesystem, not the Control Plane's.
+        return Path(path)
 
     # ---------------- VALIDATION ----------------
     def _validate_server_dir(self, server_dir: Path, servers_dir: Path) -> Path:

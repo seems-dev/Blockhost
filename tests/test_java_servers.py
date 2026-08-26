@@ -198,3 +198,101 @@ def test_java_port_allocation_ignores_bedrock_servers():
     mock_pick.assert_called_once()
     used_ports = mock_pick.call_args.kwargs["used_ports"]
     assert 19132 not in used_ports
+
+
+def test_systemd_runtime_rebuilds_bedrock_players_from_journal(tmp_path: Path):
+    from blockhost_backend.runtime.systemd_runtime import SystemdRuntime
+
+    server_id = "11111111-1111-1111-1111-111111111111"
+    server_dir = tmp_path / server_id
+    server_dir.mkdir()
+    (server_dir / "bedrock_server").write_text("", encoding="utf-8")
+
+    runtime = SystemdRuntime(servers_root=tmp_path)
+    journal_result = Mock()
+    journal_result.stdout = "\n".join(
+        [
+            "Player connected: Alex, xuid: 12345",
+            "Player connected: Steve, xuid: 67890",
+            "Player disconnected: Alex, xuid: 12345",
+        ]
+    )
+
+    with patch("blockhost_backend.runtime.systemd_runtime.shutil.which", return_value="/usr/bin/journalctl"), \
+         patch.object(runtime, "_unit_active_since", return_value="Fri 2026-08-21 10:00:00 UTC"), \
+         patch("blockhost_backend.runtime.systemd_runtime.subprocess.run", return_value=journal_result):
+        players = runtime.get_online_players_with_xuid(server_id)
+
+    assert players == {"Steve": "67890"}
+
+
+def test_systemd_runtime_player_log_parser_handles_java_join_leave_lines():
+    from blockhost_backend.runtime.systemd_runtime import SystemdRuntime
+
+    runtime = SystemdRuntime()
+    players: dict[str, str | None] = {}
+
+    runtime._apply_player_log_line(players, "Steve joined the game")
+    runtime._apply_player_log_line(players, "[12:00:01 INFO]: Alex joined the game")
+    runtime._apply_player_log_line(players, "[12:00:05 INFO]: Steve left the game")
+
+    assert players == {"Alex": None}
+
+
+def test_systemd_runtime_get_stats_queries_systemd_properties_separately():
+    from blockhost_backend.runtime.systemd_runtime import SystemdRuntime
+
+    runtime = SystemdRuntime()
+    server_id = "11111111-1111-1111-1111-111111111111"
+
+    memory_result = Mock()
+    memory_result.stdout = "MemoryCurrent=104857600\n"
+    pids_result = Mock()
+    pids_result.stdout = "MainPID=123\nControlGroup=/system.slice/blockhost-server.service\n"
+    ps_result = Mock()
+    ps_result.stdout = "12.5\n"
+
+    with patch("blockhost_backend.runtime.systemd_runtime.shutil.which", return_value="/usr/bin/systemctl"), \
+         patch(
+             "blockhost_backend.runtime.systemd_runtime.subprocess.run",
+             side_effect=[memory_result, pids_result, ps_result],
+         ) as run:
+        stats = runtime.get_stats(server_id)
+
+    assert stats.ram_usage_mb == 100.0
+    assert stats.cpu_usage == 12.5
+    assert run.call_args_list[1].args[0] == [
+        "systemctl",
+        "show",
+        "blockhost-server-11111111-1111-1111-1111-111111111111.service",
+        "-p",
+        "MainPID",
+        "-p",
+        "ControlGroup",
+    ]
+
+
+def test_get_server_stats_snapshot_computes_real_stats_on_cold_cache():
+    from blockhost_backend.api.schemas import BedrockServerStats
+    from blockhost_backend.api.servers import _get_server_stats_snapshot
+
+    server = Mock()
+    server.id = uuid.uuid4()
+    db = Mock()
+    real_stats = BedrockServerStats(
+        host="127.0.0.1",
+        port=19132,
+        reachable=True,
+        players_online=1,
+        cpu_usage=12.5,
+        ram_usage_mb=128.0,
+    )
+
+    with patch("blockhost_backend.api.servers._cached_server_stats_snapshot", return_value=None), \
+         patch("blockhost_backend.api.servers._compute_server_stats", return_value=real_stats) as compute, \
+         patch("blockhost_backend.api.servers._store_server_stats_snapshot") as store:
+        stats = _get_server_stats_snapshot(server, db, BackgroundTasks())
+
+    assert stats is real_stats
+    compute.assert_called_once_with(server, db)
+    store.assert_called_once_with(str(server.id), real_stats)

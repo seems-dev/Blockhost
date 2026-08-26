@@ -29,6 +29,9 @@ def validate_production_settings(settings: Settings) -> None:
     if settings.worker_agent_token in _FORBIDDEN_SECRETS or len(settings.worker_agent_token) < 32:
         errors.append("WORKER_AGENT_TOKEN must be set to a strong secret (32+ characters)")
 
+    if not settings.smtp_host or not (settings.smtp_from_email or settings.smtp_user):
+        errors.append("SMTP_HOST and SMTP_FROM_EMAIL/SMTP_USER must be set for email verification")
+
     if settings.billing_provider == "razorpay":
         if not settings.razorpay_key_id or settings.razorpay_key_id.startswith("change-me"):
             errors.append("RAZORPAY_KEY_ID must be set for live billing")

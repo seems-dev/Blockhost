@@ -202,6 +202,7 @@ class Server(Base):
     vm_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     vm_ipv4: Mapped[str | None] = mapped_column(String(64), nullable=True)
     vm_port: Mapped[int] = mapped_column(Integer, nullable=False, default=19132)
+    proxy_port: Mapped[int | None] = mapped_column(Integer, unique=True, nullable=True)
 
     mc_config: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
 
@@ -489,6 +490,9 @@ class Node(Base):
     status: Mapped[NodeState] = mapped_column(Enum(NodeState), nullable=False, default=NodeState.offline)
     approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     agent_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    provider_instance_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     total_ram_mb: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     used_ram_mb: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

@@ -139,7 +139,7 @@ def _resolve_existing_world_path(server_dir: Path, world_name: str, *, java_flav
     if world_name:
         candidates.append(server_dir / world_name)
     if java_flavor:
-        candidates.extend([server_dir / "world", server_dir / "world"])
+        candidates.append(server_dir / "world")
     else:
         candidates.append(server_dir / "worlds" / world_name)
         candidates.append(server_dir / "worlds")
@@ -310,11 +310,8 @@ def _update_restore_job(
 
 
 def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    with path.open("rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
 
 
 def _fsync_file(path: Path) -> None:

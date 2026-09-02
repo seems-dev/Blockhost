@@ -7,7 +7,6 @@ from pydantic import BaseModel, EmailStr, Field, model_validator
 
 from blockhost_backend.database.schema import BackupKind, BackupStatus, RestoreStatus, ServerFlavor, ServerState,  VMProvider
 
-#file_name = schemas.py
 class ServerConfig(BaseModel):
     # Mirrors common `server.properties` keys supported by popular Bedrock server containers.
     # `bedrock_image` allows pinning a per-server container image/tag (version).

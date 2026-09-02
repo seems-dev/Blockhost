@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import pwd
+import grp
 import os
 import re
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -134,8 +137,6 @@ class SystemdRuntime:
         else:
             # --- BEDROCK STARTUP LOGIC ---
             exe_cmd = f"exec 3<> stdin.fifo; exec '{executable}' <&3"
-        import pwd
-        import grp
         user_name = pwd.getpwuid(os.getuid()).pw_name
         group_name = grp.getgrgid(os.getgid()).gr_name
 
@@ -301,14 +302,17 @@ class SystemdRuntime:
 
         unit = self._unit_name(server_id)
 
-        # Get memory and all PIDs in the unit's cgroup
+        # Get memory and all PIDs in the unit's cgroup in a single call
         show_result = subprocess.run(
-            ["systemctl",  "show", unit, "-p", "MemoryCurrent"],
+            ["systemctl", "show", unit, "-p", "MemoryCurrent", "-p", "MainPID", "-p", "ControlGroup"],
             capture_output=True,
             text=True,
         )
 
         mem_bytes = None
+        main_pid = None
+        cgroup_path = None
+        
         for line in show_result.stdout.splitlines():
             if line.startswith("MemoryCurrent="):
                 try:
@@ -317,18 +321,7 @@ class SystemdRuntime:
                         mem_bytes = int(val)
                 except ValueError:
                     pass
-
-        # Get all PIDs in the unit cgroup
-        pids_result = subprocess.run(
-            ["systemctl", "show", unit, "-p", "MainPID", "-p", "ControlGroup"],
-            capture_output=True,
-            text=True,
-        )
-
-        main_pid = None
-        cgroup_path = None
-        for line in pids_result.stdout.splitlines():
-            if line.startswith("MainPID="):
+            elif line.startswith("MainPID="):
                 try:
                     main_pid = int(line.split("=", 1)[1])
                 except ValueError:

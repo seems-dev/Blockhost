@@ -36,6 +36,8 @@ class NodeRouter(Runtime):
 
     def __init__(self):
         self._local = SystemdRuntime()
+        self._cache: dict[str, tuple[Runtime, float]] = {}
+        self._cache_ttl = 10.0  # seconds
 
     def _get_agent_runtime(self, node: Node) -> AgentRuntime:
         agent_token = get_settings().worker_agent_token
@@ -43,25 +45,36 @@ class NodeRouter(Runtime):
         return AgentRuntime(agent_base_url=agent_base_url, agent_token=agent_token)
 
     def _get_runtime(self, server_id: str) -> Runtime:
+        import time
+        now = time.monotonic()
+        if server_id in self._cache:
+            runtime, expiry = self._cache[server_id]
+            if now < expiry:
+                return runtime
+
         with SessionLocal() as db:
             try:
                 server = db.get(Server, uuid.UUID(server_id))
             except ValueError:
-                return self._local
-            if not server or not server.node_id:
-                return self._local
-
-            node = db.get(Node, server.node_id)
-            if not node:
-                return self._local
-
-            return self._get_agent_runtime(node)
+                runtime = self._local
+            else:
+                if not server or not server.node_id:
+                    runtime = self._local
+                else:
+                    node = db.get(Node, server.node_id)
+                    if not node:
+                        runtime = self._local
+                    else:
+                        runtime = self._get_agent_runtime(node)
+                        
+        self._cache[server_id] = (runtime, now + self._cache_ttl)
+        return runtime
 
     def invalidate_server(self, server_id: str) -> None:
-        pass
+        self._cache.pop(server_id, None)
 
     def invalidate_node(self, node_id: uuid.UUID) -> None:
-        pass
+        self._cache.clear()
 
     def start_server(self, request: RuntimeStartRequest) -> RuntimeStartResult:
         return self._get_runtime(request.server_id).start_server(request)

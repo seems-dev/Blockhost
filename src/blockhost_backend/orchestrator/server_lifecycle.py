@@ -27,7 +27,7 @@ from blockhost_backend.runtime.interface import (
     RuntimeStatus,
 )
 from blockhost_backend.services.ban_service import ban_service
-#file_name = server_lifecycle.py
+
 logger = logging.getLogger(__name__)
 
 
@@ -39,6 +39,11 @@ class ServerLifecycleOrchestrator:
 
     def __init__(self, runtime: Runtime) -> None:
         self._runtime = runtime
+
+    def invalidate_server(self, server_id: str) -> None:
+        """Flush cached runtime routing for a server (e.g. after node reassignment)."""
+        if hasattr(self._runtime, "invalidate_server"):
+            self._runtime.invalidate_server(server_id)
 
     # ---------------- STATUS ----------------
     def get_status(self, server_id: str) -> RuntimeStatus:

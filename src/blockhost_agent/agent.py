@@ -884,6 +884,123 @@ async def provision_server(
 
 
 # ---------------------------------------------------------------------------
+# S3 World Backup & Restore (for durability and cross-node migration)
+# ---------------------------------------------------------------------------
+
+# Files/dirs to EXCLUDE from world backup zips — large binaries that are
+# already cached separately via the version provisioning system.
+_BACKUP_EXCLUDE_NAMES = {
+    "bedrock_server", "bedrock_server.exe", "bedrock_server_symbols.debug",
+    "__pycache__",
+}
+_BACKUP_EXCLUDE_EXTS = {".so", ".debug", ".jar"}
+
+
+def _should_exclude(name: str) -> bool:
+    if name in _BACKUP_EXCLUDE_NAMES:
+        return True
+    if name.startswith("."):
+        return True
+    for ext in _BACKUP_EXCLUDE_EXTS:
+        if name.endswith(ext):
+            return True
+    return False
+
+
+@app.post("/agent/servers/{server_id}/backup")
+def backup_server_to_s3(
+    server_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Zip the server directory (world data + config) and upload to S3."""
+    import zipfile
+    from blockhost_backend.services.s3_storage import (
+        s3_key_for_server,
+        upload_file_to_s3,
+    )
+
+    _validate_server_id(server_id)
+    server_dir = SERVERS_ROOT_DIR / server_id
+
+    if not server_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Server directory not found")
+
+    s3_key = s3_key_for_server(server_id)
+
+    with tempfile.TemporaryDirectory(prefix="blockhost-backup-") as td:
+        zip_path = Path(td) / "world.zip"
+
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for root, dirs, files in os.walk(server_dir, followlinks=True):
+                # Prune excluded directories in-place
+                dirs[:] = [d for d in dirs if not _should_exclude(d)]
+
+                for fname in files:
+                    if _should_exclude(fname):
+                        continue
+                    full_path = Path(root) / fname
+                    # Skip symlinks pointing outside the server dir
+                    if full_path.is_symlink():
+                        target = full_path.resolve()
+                        if not target.is_relative_to(server_dir):
+                            continue
+                    arc_name = full_path.relative_to(server_dir)
+                    zf.write(full_path, arc_name)
+
+        zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
+        logger.info("Backup zip for %s: %.1f MB", server_id, zip_size_mb)
+
+        upload_file_to_s3(str(zip_path), s3_key)
+
+    return {
+        "status": "ok",
+        "s3_key": s3_key,
+        "size_mb": round(zip_size_mb, 2),
+    }
+
+
+@app.post("/agent/servers/{server_id}/restore")
+def restore_server_from_s3(
+    server_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Download the world zip from S3 and extract into the server directory."""
+    import zipfile
+    from blockhost_backend.services.s3_storage import (
+        s3_key_for_server,
+        download_file_from_s3,
+        s3_key_exists,
+    )
+
+    _validate_server_id(server_id)
+    server_dir = SERVERS_ROOT_DIR / server_id
+    s3_key = s3_key_for_server(server_id)
+
+    if not s3_key_exists(s3_key):
+        raise HTTPException(status_code=404, detail="No S3 backup found for this server")
+
+    with tempfile.TemporaryDirectory(prefix="blockhost-restore-") as td:
+        zip_path = Path(td) / "world.zip"
+        download_file_from_s3(s3_key, str(zip_path))
+
+        # Wipe existing world data but keep the directory
+        if server_dir.exists():
+            shutil.rmtree(server_dir, ignore_errors=True)
+        server_dir.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for info in zf.infolist():
+                # Security: block path traversal
+                if info.filename.startswith(("/", "\\")) or ".." in info.filename:
+                    logger.warning("Blocked path traversal in restore zip: %s", info.filename)
+                    continue
+                zf.extract(info, server_dir)
+
+    logger.info("Restore complete for %s from s3://%s", server_id, s3_key)
+    return {"status": "ok", "s3_key": s3_key}
+
+
+# ---------------------------------------------------------------------------
 # File Management
 # ---------------------------------------------------------------------------
 
@@ -1441,7 +1558,47 @@ def agent_delete_mod(
 # ---------------------------------------------------------------------------
 
 
+async def _discover_public_ip() -> str:
+    """Attempt to discover the public IP via AWS IMDS or a public API."""
+    async with httpx.AsyncClient(timeout=3.0) as client:
+        try:
+            # Try AWS IMDSv2 first (fastest on EC2)
+            token_resp = await client.put(
+                "http://169.254.169.254/latest/api/token",
+                headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"}
+            )
+            if token_resp.status_code == 200:
+                token = token_resp.text
+                ip_resp = await client.get(
+                    "http://169.254.169.254/latest/meta-data/public-ipv4",
+                    headers={"X-aws-ec2-metadata-token": token}
+                )
+                if ip_resp.status_code == 200:
+                    return ip_resp.text.strip()
+        except Exception:
+            pass
+        
+        # Fallback to ipify for non-AWS environments
+        try:
+            resp = await client.get("https://api.ipify.org")
+            if resp.status_code == 200:
+                return resp.text.strip()
+        except Exception:
+            pass
+            
+    return ""
+
+
 async def heartbeat_task() -> None:
+    global NODE_PUBLIC_IP
+    if not NODE_PUBLIC_IP:
+        discovered_ip = await _discover_public_ip()
+        if discovered_ip:
+            logger.info("Dynamically discovered public IP: %s", discovered_ip)
+            NODE_PUBLIC_IP = discovered_ip
+        else:
+            logger.warning("Failed to dynamically discover public IP. Will rely on Control Plane resolution.")
+
     retry_delay = 1.0
     max_retry_delay = 30.0
     ws_url = CONTROLLER_WS_URL

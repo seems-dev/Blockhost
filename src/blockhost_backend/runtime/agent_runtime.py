@@ -158,6 +158,16 @@ class AgentRuntime:
     def send_command(self, server_id: str, command: str) -> None:
         self._post(f"/agent/servers/{server_id}/command", json_data={"command": command})
 
+    def backup_to_s3(self, server_id: str) -> dict[str, Any]:
+        """Ask the agent to zip the server world and upload to S3."""
+        resp = self._post(f"/agent/servers/{server_id}/backup")
+        return resp.json()
+
+    def restore_from_s3(self, server_id: str) -> dict[str, Any]:
+        """Ask the agent to download the world zip from S3 and extract it."""
+        resp = self._post(f"/agent/servers/{server_id}/restore")
+        return resp.json()
+
     def add_log_listener(self, server_id: str, listener: LogListener) -> None:
         with self._lock:
             if server_id not in self._log_listeners:

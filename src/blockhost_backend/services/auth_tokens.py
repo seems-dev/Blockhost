@@ -29,8 +29,6 @@ def issue_refresh_token(*, db: Session, user: User) -> str:
         expires_seconds=settings.jwt_refresh_token_expire_seconds,
     )
     decoded = decode_token(token, expected_type="refresh")
-    from datetime import datetime, timezone
-
     expires_at = datetime.fromtimestamp(decoded["exp"], tz=timezone.utc)
     store_refresh_token(db=db, user_id=user.id, jti=str(decoded["jti"]), expires_at=expires_at)
     return token
@@ -72,14 +70,14 @@ def revoke_refresh_token(*, db: Session, token: str) -> None:
 
 
 def revoke_all_refresh_tokens(*, db: Session, user_id: uuid.UUID) -> int:
-    rows = db.execute(
-        select(RefreshToken).where(
+    from sqlalchemy import update
+
+    result = db.execute(
+        update(RefreshToken)
+        .where(
             RefreshToken.user_id == user_id,
             RefreshToken.revoked_at.is_(None),
         )
-    ).scalars().all()
-    now = utcnow()
-    for row in rows:
-        row.revoked_at = now
-        db.add(row)
-    return len(rows)
+        .values(revoked_at=utcnow())
+    )
+    return result.rowcount

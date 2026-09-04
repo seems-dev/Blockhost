@@ -1,23 +1,23 @@
 // lib/api/cached_api.dart
 //
-// Drop-in cached wrapper around BlockHostApi.
+// Drop-in cached wrapper around ErexApi.
 //
 // Every READ method checks ApiCache first; if the entry is still fresh it
 // returns immediately without hitting the network.  Every WRITE/mutation call
 // delegates to the underlying API *and* invalidates the relevant cache keys so
 // the next read gets a fresh response.
 //
-// To use, replace `api` in AppState with a CachedBlockHostApi instance.
+// To use, replace `api` in AppState with a CachedErexApi instance.
 // All existing screen code that calls `widget.state.api.*` continues to work
 // unchanged — the caching is completely transparent.
 
 import '../models/backup_models.dart';
 import '../models/ban_models.dart';
 import '../services/api_cache.dart';
-import 'blockhost_api.dart';
+import 'erex_api.dart';
 
-class CachedBlockHostApi extends BlockHostApi {
-  CachedBlockHostApi({
+class CachedErexApi extends ErexApi {
+  CachedErexApi({
     required super.baseUrl,
     required super.accessToken,
   });

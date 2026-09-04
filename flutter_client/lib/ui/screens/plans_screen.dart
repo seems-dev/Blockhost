@@ -116,7 +116,7 @@ class PlansScreen extends StatelessWidget {
       var options = {
         'key': 'rzp_test_T69ehXcllvB6zI', // Hardcoded as agreed
         'amount': (double.parse(order['amount'].toString()) * 100).toInt(), // paise
-        'name': 'BlockHost',
+        'name': 'Erex',
         'description': 'Server Upgrade: ${plan.name}',
         'order_id': orderId,
         'prefill': {

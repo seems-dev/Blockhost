@@ -1110,6 +1110,11 @@ def _do_start_server(server: Server, db: Session) -> None:
         if node:
             server.node_id = node.id
             server.vm_ipv4 = node.ip_address
+            # We must re-allocate a fresh port on the new node
+            try:
+                server.vm_port = _allocate_port(db=db, flavor=server.flavor, node_id=server.node_id)
+            except Exception as e:
+                raise HTTPException(status_code=503, detail=f"Failed to allocate port on new node: {e}")
             db.commit()
         elif settings.production_mode:
             raise HTTPException(

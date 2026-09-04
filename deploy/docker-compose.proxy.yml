@@ -18,10 +18,11 @@ services:
       - .env
     environment:
       PROXY_ENABLED: "true"
-    ports:
-      # Proxy port range — players connect here
-      - "30000-30100:30000-30100/tcp"
-      - "30000-30100:30000-30100/udp"
-    # Note: Expand the port range above as you add more servers.
-    # Docker limits the number of ports in a range mapping, so start
-    # small and expand as needed (or use --network host for unlimited).
+    # Host networking is strongly preferred for Bedrock (UDP/RakNet).
+    # docker-proxy conntrack often breaks RakNet; published port ranges also
+    # silently drop traffic if proxy_port is outside the mapped range.
+    network_mode: host
+    # If you cannot use host networking, map the full PROXY_PORT_RANGE:
+    # ports:
+    #   - "30000-30100:30000-30100/tcp"
+    #   - "30000-30100:30000-30100/udp"

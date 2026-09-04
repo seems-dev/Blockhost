@@ -5,20 +5,22 @@ import 'ui/screens/home_screen.dart';
 import 'ui/screens/splash_screen.dart';
 import 'ui/screens/onboarding_screen.dart';
 import 'ui/theme/tranquil_theme.dart';
+import 'services/push_notification_service.dart';
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const BlockHostApp());
+  await PushNotificationService.init();
+  runApp(const ErexApp());
 }
 
-class BlockHostApp extends StatefulWidget {
-  const BlockHostApp({super.key});
+class ErexApp extends StatefulWidget {
+  const ErexApp({super.key});
 
   @override
-  State<BlockHostApp> createState() => _BlockHostAppState();
+  State<ErexApp> createState() => _ErexAppState();
 }
 
-class _BlockHostAppState extends State<BlockHostApp> {
+class _ErexAppState extends State<ErexApp> {
   final AppState state = AppState();
 
   bool _initialized = false;
@@ -62,7 +64,7 @@ class _BlockHostAppState extends State<BlockHostApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'BlockHost',
+      title: 'Erex',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,

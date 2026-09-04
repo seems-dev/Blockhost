@@ -2,7 +2,7 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import '../../api/blockhost_api.dart';
+import '../../api/erex_api.dart';
 import '../../models/server_creation.dart';
 import '../../state/app_state.dart';
 import '../theme/tranquil_theme.dart';

@@ -8,7 +8,7 @@ class MinecraftLauncher {
     final safeName = serverName.replaceAll('|', ' ').trim();
     final safeAddress = address.trim();
     return Uri.parse(
-      'minecraft://?addExternalServer=${Uri.encodeComponent('${safeName.isEmpty ? 'BlockHost Server' : safeName}|$safeAddress')}',
+      'minecraft://?addExternalServer=${Uri.encodeComponent('${safeName.isEmpty ? 'Erex Server' : safeName}|$safeAddress')}',
     );
   }
 

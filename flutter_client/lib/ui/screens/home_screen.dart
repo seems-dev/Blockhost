@@ -51,7 +51,7 @@ class _HomeScreenState extends State<HomeScreen> {
       children: [
         // ── Background image ─────────────────────────────────────────────
         Positioned.fill(
-          child: Image.asset('assets/bg_tranquil_pond.png', fit: BoxFit.cover),
+          child: Image.asset('assets/bg_tranquil_pond.png', fit: BoxFit.cover, color: const Color(0xFF0F0020).withOpacity(0.8), colorBlendMode: BlendMode.darken),
         ),
 
         // ── App scaffold ─────────────────────────────────────────────────
@@ -79,19 +79,22 @@ class _BottomNav extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return GlassCard(
-      margin: const EdgeInsets.only(left: 16, right: 16, bottom: 16),
-      padding: EdgeInsets.zero,
-      child: SizedBox(
-        height: 68,
-        child: Row(
-          children: [
-            _NavItem(icon: Icons.dashboard_rounded,         label: 'Dashboard', index: 0, selectedIndex: selectedIndex, onTap: onTap),
-            _NavItem(icon: Icons.add_rounded,               label: 'Create',    index: 1, selectedIndex: selectedIndex, onTap: onTap, isCreate: true),
-            _NavItem(icon: Icons.workspace_premium_rounded, label: 'Plans',     index: 2, selectedIndex: selectedIndex, onTap: onTap),
-            _NavItem(icon: Icons.settings_rounded,          label: 'Settings',  index: 3, selectedIndex: selectedIndex, onTap: onTap),
-          ],
-        ),
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF161622),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: Colors.white.withOpacity(0.05)),
+      ),
+      height: 64,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+        children: [
+          _NavItem(icon: Icons.view_agenda_rounded, label: 'Servers',  index: 0, selectedIndex: selectedIndex, onTap: onTap),
+          _NavItem(icon: Icons.terminal_rounded,    label: 'Console',  index: 1, selectedIndex: selectedIndex, onTap: onTap),
+          _NavItem(icon: Icons.folder_outlined,     label: 'Files',    index: 2, selectedIndex: selectedIndex, onTap: onTap),
+          _NavItem(icon: Icons.settings_outlined,   label: 'Settings', index: 3, selectedIndex: selectedIndex, onTap: onTap),
+        ],
       ),
     );
   }
@@ -104,7 +107,6 @@ class _NavItem extends StatelessWidget {
     required this.index,
     required this.selectedIndex,
     required this.onTap,
-    this.isCreate = false,
   });
 
   final IconData icon;
@@ -112,59 +114,44 @@ class _NavItem extends StatelessWidget {
   final int index;
   final int selectedIndex;
   final ValueChanged<int> onTap;
-  final bool isCreate;
 
   bool get _selected => selectedIndex == index;
 
   @override
   Widget build(BuildContext context) {
-    return Expanded(
-      child: GestureDetector(
-        onTap: () {
-          AudioService.playClick();
-          onTap(index);
-        },
-        behavior: HitTestBehavior.opaque,
-        child: SizedBox(
-          height: 68,
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              if (isCreate && _selected)
-                Container(
-                  width: 44, height: 44,
-                  decoration: BoxDecoration(
-                    color: TranquilTheme.glowCyan,
-                    borderRadius: BorderRadius.circular(22),
-                    boxShadow: [BoxShadow(color: TranquilTheme.glowCyan.withOpacity(0.3), blurRadius: 8, spreadRadius: 1)],
-                  ),
-                  child: Icon(icon, color: TranquilTheme.deepWater, size: 22),
-                )
-              else if (isCreate)
-                Container(
-                  width: 44, height: 44,
-                  decoration: BoxDecoration(
-                    border: Border.all(color: TranquilTheme.glowCyan.withOpacity(0.3)),
-                    borderRadius: BorderRadius.circular(22),
-                  ),
-                  child: Icon(icon, color: TranquilTheme.textBright, size: 22),
-                )
-              else
-                Icon(icon, color: _selected ? TranquilTheme.glowCyan : TranquilTheme.textMuted, size: 22),
-              if (!isCreate) ...[
-                const SizedBox(height: 4),
-                Text(
-                  label,
-                  style: TextStyle(
-                    color: _selected ? TranquilTheme.glowCyan : TranquilTheme.textMuted,
-                    fontSize: 10,
-                    fontFamily: 'monospace',
-                    fontWeight: _selected ? FontWeight.w600 : FontWeight.normal,
-                  ),
-                ),
-              ],
-            ],
-          ),
+    return GestureDetector(
+      onTap: () {
+        AudioService.playClick();
+        onTap(index);
+      },
+      behavior: HitTestBehavior.opaque,
+      child: Container(
+        width: 72,
+        margin: const EdgeInsets.symmetric(vertical: 8),
+        decoration: BoxDecoration(
+          color: _selected ? const Color(0xFF06B6D4).withOpacity(0.15) : Colors.transparent,
+          borderRadius: BorderRadius.circular(16),
+          border: _selected ? Border.all(color: const Color(0xFF06B6D4).withOpacity(0.3)) : null,
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              icon,
+              color: _selected ? const Color(0xFF06B6D4) : const Color(0xFF8A8A93),
+              size: 20,
+            ),
+            const SizedBox(height: 4),
+            Text(
+              label,
+              style: TextStyle(
+                color: _selected ? const Color(0xFF06B6D4) : const Color(0xFF8A8A93),
+                fontSize: 10,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 0.5,
+              ),
+            ),
+          ],
         ),
       ),
     );

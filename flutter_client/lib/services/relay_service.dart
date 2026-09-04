@@ -2,9 +2,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 
-/// BlockHost Relay Service Client
+/// Erex Relay Service Client
 ///
-/// Provides a Dart interface for the BlockHost relay system. Handles:
+/// Provides a Dart interface for the Erex relay system. Handles:
 /// - Server registration and lookup via join codes
 /// - Automatic heartbeat management
 /// - HTTP communication with the Python relay backend
@@ -19,7 +19,7 @@ import 'package:http/http.dart' as http;
 class RelayService {
   /// The relay backend URL (e.g., "http://localhost:8000")
   static const String defaultRelayUrl = String.fromEnvironment(
-    'BLOCKHOST_API_BASE_URL',
+    'EREX_API_BASE_URL',
     defaultValue: 'http://localhost:8000',
   );
 
@@ -294,7 +294,7 @@ class RelayService {
       final client = http.Client();
 
       final response = await client
-          .get(url, headers: {'User-Agent': 'BlockHost/1.0'})
+          .get(url, headers: {'User-Agent': 'Erex/1.0'})
           .timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200) {

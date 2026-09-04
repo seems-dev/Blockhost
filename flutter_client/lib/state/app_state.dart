@@ -2,13 +2,13 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:razorpay_flutter/razorpay_flutter.dart';
 import 'package:flutter/foundation.dart';
 
-import '../api/blockhost_api.dart';
+import '../api/erex_api.dart';
 import '../api/cached_api.dart';
 
 class AppState {
   static const defaultBaseUrl = String.fromEnvironment(
-    'BLOCKHOST_API_BASE_URL',
-    defaultValue: 'http://52.63.135.144',
+    'EREX_API_BASE_URL',
+    defaultValue: 'http://54.66.183.201',
   );
 
   static const _kAccessTokenKey = 'access_token';
@@ -16,7 +16,7 @@ class AppState {
   static const _kBaseUrlKey = 'base_url';
   static const _kHasSeenOnboardingKey = 'has_seen_onboarding';
 
-  BlockHostApi api = CachedBlockHostApi(baseUrl: defaultBaseUrl, accessToken: null);
+  ErexApi api = CachedErexApi(baseUrl: defaultBaseUrl, accessToken: null);
   String _baseUrl = defaultBaseUrl;
   String get baseUrl => _baseUrl;
   String? accessToken;
@@ -35,14 +35,14 @@ class AppState {
     refreshToken = prefs.getString(_kRefreshTokenKey);
     _baseUrl = prefs.getString(_kBaseUrlKey) ?? defaultBaseUrl;
     hasSeenOnboarding = prefs.getBool(_kHasSeenOnboardingKey) ?? false;
-    api = CachedBlockHostApi(baseUrl: baseUrl, accessToken: accessToken);
+    api = CachedErexApi(baseUrl: baseUrl, accessToken: accessToken);
 
     if (refreshToken != null && refreshToken!.isNotEmpty) {
       try {
         final newAccess = await api.refreshAuthToken(refreshToken: refreshToken!);
         accessToken = newAccess;
         await prefs.setString(_kAccessTokenKey, newAccess);
-        api = CachedBlockHostApi(baseUrl: baseUrl, accessToken: accessToken);
+        api = CachedErexApi(baseUrl: baseUrl, accessToken: accessToken);
       } on ApiException catch (e) {
         debugPrint('Refresh failed (API error): $e');
         await clearTokens();
@@ -75,7 +75,7 @@ class AppState {
     if (trimmed.isEmpty) return;
     final normalized = trimmed.startsWith(RegExp(r'https?://')) ? trimmed : 'http://$trimmed';
     _baseUrl = normalized;
-    api = CachedBlockHostApi(baseUrl: baseUrl, accessToken: accessToken);
+    api = CachedErexApi(baseUrl: baseUrl, accessToken: accessToken);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_kBaseUrlKey, normalized);
   }
@@ -88,7 +88,7 @@ class AppState {
   Future<void> setTokens({required String access, required String refresh}) async {
     accessToken = access;
     refreshToken = refresh;
-    api = CachedBlockHostApi(baseUrl: baseUrl, accessToken: accessToken);
+    api = CachedErexApi(baseUrl: baseUrl, accessToken: accessToken);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_kAccessTokenKey, access);
     await prefs.setString(_kRefreshTokenKey, refresh);
@@ -97,8 +97,8 @@ class AppState {
   Future<void> clearTokens() async {
     accessToken = null;
     refreshToken = null;
-    if (api is CachedBlockHostApi) (api as CachedBlockHostApi).clearCache();
-    api = CachedBlockHostApi(baseUrl: baseUrl, accessToken: null);
+    if (api is CachedErexApi) (api as CachedErexApi).clearCache();
+    api = CachedErexApi(baseUrl: baseUrl, accessToken: null);
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_kAccessTokenKey);
     await prefs.remove(_kRefreshTokenKey);
@@ -138,7 +138,7 @@ class AppState {
       var options = {
         'key': 'rzp_test_T69ehXcllvB6zI', // PUT YOUR REAL KEY HERE
         'amount': (double.parse(orderData['amount'].toString()) * 100).toInt(),
-        'name': 'BlockHost',
+        'name': 'Erex',
         'description': 'Server Plan Upgrade',
         'order_id': orderData['provider_order_id'], 
       };

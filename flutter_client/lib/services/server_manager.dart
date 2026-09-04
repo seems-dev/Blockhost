@@ -1,4 +1,4 @@
-import 'package:blockhost_client/services/relay_service.dart';
+import 'package:erex_client/services/relay_service.dart';
 
 /// ServerManager handles the lifecycle of a Minecraft server through the relay.
 ///
@@ -467,7 +467,7 @@ class ServerManager {
 /// Example 3: Full application flow
 ///
 /// ```dart
-/// class BlockHostApp {
+/// class ErexApp {
 ///   late ServerManager _manager;
 ///
 ///   Future<void> startHosting(String userId, String authToken) async {

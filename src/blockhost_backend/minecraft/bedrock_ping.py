@@ -93,6 +93,51 @@ def parse_bedrock_pong_payload(payload: str) -> dict[str, object]:
         out["motd2"] = parts[7] or None
     if len(parts) > 8:
         out["gamemode"] = parts[8] or None
+    if len(parts) > 10:
+        out["port_v4"] = _to_int(parts[10])
+    if len(parts) > 11:
+        out["port_v6"] = _to_int(parts[11])
 
     return out
+
+
+def rewrite_bedrock_pong_ports(data: bytes, advertised_port: int) -> bytes:
+    """Rewrite server-port fields in a RakNet unconnected pong.
+
+    Bedrock clients read port_v4/port_v6 from the pong and reconnect to that
+    port on the address they pinged. If we leave the node's real vm_port in
+    the payload, the client abandons proxy_host:proxy_port and tries
+    proxy_host:vm_port — a different process, often a different MC version
+    ("version not supported").
+    """
+    if not data or data[0] != 0x1C:
+        return data
+
+    header_len = 1 + 8 + 8 + 16  # id + time + guid + magic
+    if len(data) < header_len + 2:
+        return data
+
+    payload_len = struct.unpack(">H", data[header_len : header_len + 2])[0]
+    payload_start = header_len + 2
+    payload_end = payload_start + payload_len
+    if payload_end > len(data):
+        return data
+
+    try:
+        payload = data[payload_start:payload_end].decode("utf-8")
+    except UnicodeDecodeError:
+        return data
+
+    parts = payload.split(";")
+    # MCPE;MOTD;protocol;version;online;max;server_id;MOTD2;gamemode;gamemode_id;port_v4;port_v6
+    if len(parts) < 11 or parts[0] not in ("MCPE", "MCEE"):
+        return data
+
+    port_str = str(advertised_port)
+    parts[10] = port_str
+    if len(parts) >= 12:
+        parts[11] = port_str
+
+    new_payload = ";".join(parts).encode("utf-8")
+    return data[:header_len] + struct.pack(">H", len(new_payload)) + new_payload + data[payload_end:]
 

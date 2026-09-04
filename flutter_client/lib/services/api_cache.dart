@@ -1,6 +1,6 @@
 // lib/services/api_cache.dart
 //
-// Centralized TTL cache for BlockHost API responses.
+// Centralized TTL cache for Erex API responses.
 //
 // Cache policy at a glance:
 //

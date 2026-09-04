@@ -1,7 +1,7 @@
 import 'dart:ui';
 import 'package:flutter/material.dart';
 
-import '../../api/blockhost_api.dart';
+import '../../api/erex_api.dart';
 import '../../models/mod_models.dart';
 import '../../state/app_state.dart';
 import '../theme/tranquil_theme.dart';
@@ -36,7 +36,7 @@ class _ModsScreenState extends State<ModsScreen>
   ModCapability? _capability;
   List<ModSearchResult> _searchResults = [];
   List<InstalledMod> _installedMods = [];
-  BlockHostApi get _api => widget.state.api;
+  ErexApi get _api => widget.state.api;
 
   @override
   void initState() {

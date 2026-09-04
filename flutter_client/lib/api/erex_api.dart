@@ -25,8 +25,8 @@ class EmailNotVerifiedException implements Exception {
   String toString() => message;
 }
 
-class BlockHostApi {
-  BlockHostApi({required this.baseUrl, required this.accessToken});
+class ErexApi {
+  ErexApi({required this.baseUrl, required this.accessToken});
 
   final String baseUrl;
   final String? accessToken;

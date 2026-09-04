@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -909,9 +908,8 @@ class _ServerDetailView extends StatelessWidget {
 
                     const SizedBox(height: 28),
 
-
                     // ── Power button ─────────────────────────────────────────
-                    _GlowingPowerButton(
+                    _RotatingSquareButton(
                       isRunning: _isRunning,
                       busy: busy,
                       onToggle: onToggle,
@@ -1022,19 +1020,27 @@ class _ServerDetailView extends StatelessWidget {
                     const SizedBox(height: 16),
 
                     // ── CPU / RAM ─────────────────────────────────────────────
-                    _StatProgressCard(
-                      title: 'CPU USAGE',
-                      subtitle: 'Core Usage',
-                      percent: cpuUsage != null ? ((cpuUsage as num) / 100).clamp(0.0, 1.0) : 0.0,
-                      displayValue: cpuStr,
-                    ),
-                    const SizedBox(height: 12),
-                    _StatProgressCard(
-                      title: 'RAM USAGE',
-                      subtitle: ramUsageMb != null ? '${(ramUsageMb / 1024).toStringAsFixed(1)} GB' : 'N/A',
-                      percent: ramPct != null ? ((ramPct as num) / 100).clamp(0.0, 1.0) : 0.0,
-                      displayValue: ramPct != null ? '${(ramPct as num).toStringAsFixed(0)}%' : '0%',
-                    ),
+                    Row(children: [
+                      Expanded(
+                          child: _MetricBlock(
+                        label: 'CPU',
+                        value: cpuStr,
+                        progress: cpuUsage != null
+                            ? ((cpuUsage as num) / 100).clamp(0.0, 1.0)
+                            : 0,
+                        barColor: const Color(0xFF4488FF),
+                      )),
+                      const SizedBox(width: 12),
+                      Expanded(
+                          child: _MetricBlock(
+                        label: 'RAM',
+                        value: ramStr,
+                        progress: ramPct != null
+                            ? ((ramPct as num) / 100).clamp(0.0, 1.0)
+                            : 0,
+                        barColor: _green,
+                      )),
+                    ]),
 
                     const SizedBox(height: 16),
 
@@ -1422,189 +1428,96 @@ class _PulsingDotState extends State<_PulsingDot>
       );
 }
 
-class _StatProgressCard extends StatelessWidget {
-  const _StatProgressCard({
-    required this.title,
-    required this.subtitle,
-    required this.percent,
-    required this.displayValue,
-  });
-
-  final String title;
-  final String subtitle;
-  final double percent;
-  final String displayValue;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: const Color(0xFF161622),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: Colors.white.withOpacity(0.05)),
-      ),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 70,
-            height: 70,
-            child: Stack(
-              children: [
-                CustomPaint(
-                  size: const Size(70, 70),
-                  painter: _RingPainter(percent: percent),
-                ),
-                Center(
-                  child: Text(
-                    displayValue,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                      fontFamily: _mono,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 24),
-          Expanded(
-            child: Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                border: Border.all(
-                  color: Colors.indigo.withOpacity(0.3),
-                  width: 1.5,
-                ),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    style: const TextStyle(
-                      color: _muted,
-                      fontSize: 10,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 1.0,
-                      fontFamily: _mono,
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    subtitle,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 15,
-                      fontFamily: _mono,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-
-class _RingPainter extends CustomPainter {
-  _RingPainter({required this.percent});
-  final double percent;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final center = Offset(size.width / 2, size.height / 2);
-    final radius = size.width / 2 - 4;
-
-    final bgPaint = Paint()
-      ..color = Colors.white.withOpacity(0.1)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 6;
-    canvas.drawCircle(center, radius, bgPaint);
-
-    final fgPaint = Paint()
-      ..shader = SweepGradient(
-        colors: const [Color(0xFF0284C7), _green, Color(0xFF0284C7)],
-        stops: const [0.0, 0.5, 1.0],
-      ).createShader(Rect.fromCircle(center: center, radius: radius))
-      ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.round
-      ..strokeWidth = 6;
-
-    canvas.drawArc(
-      Rect.fromCircle(center: center, radius: radius),
-      -pi / 2,
-      2 * pi * percent,
-      false,
-      fgPaint,
-    );
-  }
-
-  @override
-  bool shouldRepaint(covariant _RingPainter oldDelegate) {
-    return oldDelegate.percent != percent;
-  }
-}
-
-class _GlowingPowerButton extends StatelessWidget {
-  const _GlowingPowerButton({
+class _RotatingSquareButton extends StatefulWidget {
+  const _RotatingSquareButton({
     required this.isRunning,
     required this.busy,
     required this.onToggle,
   });
+
   final bool isRunning;
   final bool busy;
   final VoidCallback onToggle;
-  
+
+  @override
+  State<_RotatingSquareButton> createState() => _RotatingSquareButtonState();
+}
+
+class _RotatingSquareButtonState extends State<_RotatingSquareButton>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl = AnimationController(
+    vsync: this,
+    duration: const Duration(seconds: 4),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: busy ? null : onToggle,
-      child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(vertical: 16),
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            colors: isRunning 
-                ? [const Color(0xFFEF4444), const Color(0xFFB91C1C)]
-                : [const Color(0xFF06B6D4), const Color(0xFF0284C7)],
-          ),
-          borderRadius: BorderRadius.circular(32),
-          boxShadow: [
-            BoxShadow(
-              color: isRunning 
-                  ? const Color(0xFFEF4444).withOpacity(0.3)
-                  : const Color(0xFF06B6D4).withOpacity(0.3),
-              blurRadius: 16,
-              offset: const Offset(0, 8),
-            ),
-          ],
-        ),
-        child: busy 
-          ? const Center(child: SizedBox(height: 20, width: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2)))
-          : Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Icon(Icons.power_settings_new_rounded, color: Colors.white, size: 20),
-                const SizedBox(width: 8),
-                Text(
-                  isRunning ? 'STOP SERVER' : 'START SERVER',
-                  style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 14,
-                      fontWeight: FontWeight.bold,
-                      fontFamily: _mono,
-                      letterSpacing: 0.5),
+    return Center(
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          AnimatedBuilder(
+            animation: _ctrl,
+            builder: (_, __) {
+              return Transform.rotate(
+                angle: _ctrl.value * 2 * 3.141592653589793,
+                child: Container(
+                  width: 135,
+                  height: 135,
+                  decoration: BoxDecoration(
+                    border: Border.all(
+                      color: widget.isRunning
+                          ? Colors.redAccent.withOpacity(0.5)
+                          : _green.withOpacity(0.5),
+                      width: 1.5,
+                    ),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
                 ),
-              ],
+              );
+            },
+          ),
+          GestureDetector(
+            onTap: widget.busy ? null : widget.onToggle,
+            child: Container(
+              width: 110,
+              height: 110,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: _surface,
+                border: Border.all(
+                  color: widget.isRunning ? Colors.redAccent : _green,
+                  width: 1.5,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: (widget.isRunning ? Colors.redAccent : _green)
+                        .withOpacity(.25),
+                    blurRadius: 28,
+                    spreadRadius: 2,
+                  ),
+                ],
+              ),
+              child: widget.busy
+                  ? const Center(
+                      child: CircularProgressIndicator(
+                          color: _green, strokeWidth: 1.5))
+                  : Icon(
+                      widget.isRunning
+                          ? Icons.power_settings_new_rounded
+                          : Icons.play_arrow_rounded,
+                      color: widget.isRunning ? Colors.redAccent : _green,
+                      size: 40,
+                    ),
             ),
+          ),
+        ],
       ),
     );
   }

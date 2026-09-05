@@ -15,17 +15,23 @@ import logging
 import threading
 import time
 import uuid
-from datetime import timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from blockhost_backend.config.config_manager import get_settings
 from blockhost_backend.database.db import SessionLocal
-from blockhost_backend.database.schema import Node, NodeState, Server, ServerState, utcnow
+from blockhost_backend.database.schema import Node, NodeState, Server, ServerState
 from blockhost_backend.runtime.agent_runtime import AgentRuntime
 from blockhost_backend.services.cloud.cloud_provider import get_cloud_provider
+from blockhost_backend.services.migration_guards import (
+    can_run_migration_now,
+    mark_server_migrated,
+    record_migration,
+    server_in_migration_cooldown,
+)
 from blockhost_backend.services.node_capacity import is_node_heartbeat_fresh
+from blockhost_backend.services.s3_storage import delete_migration_snapshot, require_s3_configured
 
 logger = logging.getLogger(__name__)
 
@@ -39,15 +45,33 @@ NODE_IDLE_RATIO = 0.30  # 30%
 # Minimum seconds between rebalance cycles (prevents thrashing).
 REBALANCE_INTERVAL_SECONDS = 120
 
-# Cooldown after a migration — don't touch the same server again for this long.
-MIGRATION_COOLDOWN_SECONDS = 300
-
 
 def _node_ram_ratio(node: Node) -> float:
     """Return the fraction of RAM currently used (0.0 – 1.0)."""
     if node.total_ram_mb <= 0:
         return 1.0  # treat unconfigured nodes as full
     return node.used_ram_mb / node.total_ram_mb
+
+
+def _node_active_ram_ratio(node: Node, db: Session) -> float:
+    """Return the fraction of RAM currently used by active servers (running/provisioning)."""
+    if node.total_ram_mb <= 0:
+        return 1.0
+    active_states = (ServerState.running, ServerState.provisioning, ServerState.syncing)
+    active_servers = db.execute(
+        select(Server).where(
+            Server.node_id == node.id,
+            Server.state.in_(active_states),
+        )
+    ).scalars().all()
+    
+    active_ram = 0
+    from blockhost_backend.orchestrator.resources import get_effective_server_resource_limits
+    for s in active_servers:
+        limits = get_effective_server_resource_limits(db=db, server=s)
+        active_ram += limits["ram_mb"]
+        
+    return active_ram / node.total_ram_mb
 
 
 def _agent_for_node(node: Node) -> AgentRuntime:
@@ -94,6 +118,13 @@ def _migrate_server(
     Returns True on success, False on any failure.
     """
     sid = str(server.id)
+    was_running = (server.state == ServerState.running)
+
+    try:
+        require_s3_configured()
+    except RuntimeError as e:
+        logger.error("[rebalancer] Skipping migrate for %s: %s", sid, e)
+        return False
 
     from_agent = _agent_for_node(from_node)
     to_agent = _agent_for_node(to_node)
@@ -141,15 +172,33 @@ def _migrate_server(
         get_server_lifecycle_orchestrator().invalidate_server(sid)
         return False
 
-    # 5. Start on new node
-    try:
-        from blockhost_backend.api.servers import _do_start_server
-        _do_start_server(server, db)
+    # 5. Start on new node if it was running
+    if was_running:
+        try:
+            from blockhost_backend.api.servers import _do_start_server
+            _do_start_server(server, db)
+            mark_server_migrated(db, server)
+            db.commit()
+        except Exception as e:
+            logger.error("[rebalancer] Start failed for %s on new node: %s", sid, e)
+            # Server data is on new node but not running — leave it for manual fix
+            return False
+    else:
+        server.state = ServerState.suspended
+        mark_server_migrated(db, server)
         db.commit()
+
+    record_migration()
+    delete_migration_snapshot(sid)
+
+    # Drop orphaned world files on the source node (best-effort).
+    try:
+        from_agent.purge_server_data(sid)
     except Exception as e:
-        logger.error("[rebalancer] Start failed for %s on new node: %s", sid, e)
-        # Server data is on new node but not running — leave it for manual fix
-        return False
+        logger.warning(
+            "[rebalancer] Failed to purge source data for %s on %s: %s",
+            sid, from_node.name, e,
+        )
 
     logger.info(
         "[rebalancer] Migration complete: %s → %s (node %s)",
@@ -158,12 +207,27 @@ def _migrate_server(
     return True
 
 
+def _pick_migratable_server(servers: list[Server]) -> Server | None:
+    for server in servers:
+        if server_in_migration_cooldown(server):
+            logger.info(
+                "[rebalancer] Skipping server %s — still in migration cooldown",
+                server.id,
+            )
+            continue
+        return server
+    return None
+
+
 def _rebalance_cycle() -> None:
     """Run one rebalance evaluation cycle."""
     with SessionLocal() as db:
         nodes = _healthy_online_nodes(db)
         if len(nodes) < 2:
             return  # nothing to rebalance with a single node
+
+        if not can_run_migration_now():
+            return
 
         # ── Scenario 1: Overflow Protection ──────────────────────────
         # Find overloaded nodes and shed their least-active server to
@@ -208,19 +272,18 @@ def _rebalance_cycle() -> None:
                         logger.error("[rebalancer] Failed to wake up node %s: %s", offline_node.name, e)
                 return
 
-            # Pick the least-active running server on the overloaded node
-            servers = _running_servers_on_node(db, node.id)
-            if not servers:
+            # Pick the least-active running server not in cooldown
+            victim = _pick_migratable_server(_running_servers_on_node(db, node.id))
+            if not victim:
                 continue
 
-            victim = servers[0]  # least recently active
             _migrate_server(victim, node, best_target, db)
             return  # one migration per cycle to avoid thrashing
 
         # ── Scenario 2: Consolidation ────────────────────────────────
-        # If ALL nodes are below the idle threshold, pack servers from
-        # the least-loaded node onto the most-loaded one.
-        all_idle = all(_node_ram_ratio(n) < NODE_IDLE_RATIO for n in nodes)
+        # If ALL nodes are below the idle threshold (based on ACTIVE servers),
+        # pack servers from the least-loaded node onto the most-loaded one.
+        all_idle = all(_node_active_ram_ratio(n, db) < NODE_IDLE_RATIO for n in nodes)
         if not all_idle:
             return
 
@@ -251,11 +314,15 @@ def _rebalance_cycle() -> None:
         if free_on_target < 512:  # need at least 512 MB free to accept a transfer
             return
 
+        victim = _pick_migratable_server(servers)
+        if not victim:
+            return
+
         logger.info(
             "[rebalancer] Consolidating: moving server from %s → %s (all nodes idle)",
             source_node.name, target_node.name,
         )
-        _migrate_server(servers[0], source_node, target_node, db)
+        _migrate_server(victim, source_node, target_node, db)
 
 
 def _rebalancer_loop() -> None:

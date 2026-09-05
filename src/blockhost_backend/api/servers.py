@@ -57,6 +57,8 @@ from blockhost_backend.services.system_health import DiskProtectionError, assert
 from blockhost_backend.utils import generate_join_code
 from blockhost_backend.services.billing import BillingError
 from blockhost_backend.services.node_capacity import refresh_node_allocated_ram, select_best_node
+from blockhost_backend.services.plan_limits import clamp_max_players
+from blockhost_backend.services.s3_storage import delete_migration_snapshot
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/servers", tags=["servers"])
@@ -652,14 +654,15 @@ def _allocate_proxy_port(db: Session) -> int | None:
     )
 
 
-def _server_props_from_config(*, server: Server, port: int) -> BedrockServerProperties:
+def _server_props_from_config(*, server: Server, port: int, db: Session | None = None) -> BedrockServerProperties:
     cfg = dict(server.mc_config or {})
     server_name = str(cfg.get("server_name") or server.world_name)
+    max_players = clamp_max_players(cfg.get("max_players"), db=db, server=server)
     return BedrockServerProperties(
         server_name=server_name,
         gamemode=cfg.get("gamemode"),
         difficulty=cfg.get("difficulty"),
-        max_players=cfg.get("max_players"),
+        max_players=max_players,
         allow_cheats=cfg.get("allow_cheats"),
         online_mode=False,
         level_name=cfg.get("level_name") or server.world_name,
@@ -669,13 +672,14 @@ def _server_props_from_config(*, server: Server, port: int) -> BedrockServerProp
     )
 
 
-def _java_server_properties_from_config(*, server: Server, port: int) -> JavaServerProperties:
+def _java_server_properties_from_config(*, server: Server, port: int, db: Session | None = None) -> JavaServerProperties:
     cfg = dict(server.mc_config or {})
+    max_players = clamp_max_players(cfg.get("max_players"), db=db, server=server, default=20) or 1
 
     return JavaServerProperties(
         server_port=port,
         motd=cfg.get("motd") or server.world_name,
-        max_players=cfg.get("max_players") or 20,
+        max_players=max_players,
         gamemode=cfg.get("gamemode") or "survival",
         difficulty=cfg.get("difficulty") or "normal",
         online_mode=False,  # Enforced via JVM flag; property rewritten by server anyway
@@ -774,8 +778,16 @@ def create_server(
     settings = get_settings()
     _guard_disk_for_operation("create_server")
 
-    
-    
+    max_servers = settings.max_servers_per_user
+    if max_servers > 0:
+        owned = db.execute(
+            select(func.count()).select_from(Server).where(Server.owner_id == user.id)
+        ).scalar_one()
+        if owned >= max_servers:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Server limit reached ({max_servers}). Delete an existing server or contact support.",
+            )
 
     config = payload.config.model_dump(exclude_none=True) if payload.config else {}
     config.pop("bedrock_image", None)  # Docker-only field, never accepted
@@ -787,7 +799,8 @@ def create_server(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    node = select_best_node(db)
+    # Unpaid servers reserve 0 RAM until a plan is active; still place on freest node.
+    node = select_best_node(db, required_ram_mb=0)
     if settings.production_mode and not node:
         raise HTTPException(
             status_code=503,
@@ -871,7 +884,7 @@ def _provision_java_server(server_id: str, jar_url: str, jar_path_str: str, serv
         with SessionLocal() as db:
             server = db.get(Server, server_uuid)
             if server:
-                props = _java_server_properties_from_config(server=server, port=port)
+                props = _java_server_properties_from_config(server=server, port=port, db=db)
                 props_path = server_dir / "server.properties"
                 write_java_server_properties(props_path, props)
                 set_java_server_property(props_path, "online-mode", False)
@@ -1106,7 +1119,9 @@ def _do_start_server(server: Server, db: Session) -> None:
             db.commit()
 
     if not server.node_id:
-        node = select_best_node(db)
+        limits = get_effective_server_resource_limits(db=db, server=server)
+        required_ram = int(limits.get("ram_mb") or 0)
+        node = select_best_node(db, required_ram_mb=required_ram)
         if node:
             server.node_id = node.id
             server.vm_ipv4 = node.ip_address
@@ -1187,6 +1202,50 @@ def stop_server(
     return ServerActionResponse(id=server.id, state=server.state)
 
 
+@router.delete("/{server_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_server(
+    server_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    """Stop, purge agent files, remove DB row, and delete the S3 migration snapshot."""
+    server = _get_server_for_user(server_id, user, db, required_permission="start_stop")
+    sid = str(server.id)
+    server_uuid = server.id
+    node_id = server.node_id
+    owner_id = server.owner_id
+
+    try:
+        if server.state == ServerState.running:
+            _stop_server_process(server)
+    except Exception:
+        logger.exception("Failed to stop server %s before delete", sid)
+
+    if node_id:
+        node = db.get(Node, node_id)
+        if node and node.ip_address:
+            try:
+                from blockhost_backend.runtime.agent_runtime import AgentRuntime
+
+                AgentRuntime(
+                    agent_base_url=f"http://{node.ip_address}:{node.agent_port}",
+                    agent_token=get_settings().worker_agent_token,
+                ).purge_server_data(sid)
+            except Exception:
+                logger.exception("Failed to purge agent data for %s on node %s", sid, node.name)
+
+    db.delete(server)
+    db.commit()
+
+    if node_id:
+        refresh_node_allocated_ram(db, node_id)
+        db.commit()
+
+    delete_migration_snapshot(sid)
+    _drop_server_stats_snapshot(sid)
+    _invalidate_server_read_cache(owner_id, server_uuid)
+
+
 @router.post("/{server_id}/toggle", response_model=ServerActionResponse)
 def toggle_server(
     server_id: str,
@@ -1250,6 +1309,15 @@ def update_server_config(
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
 
+    if "max_players" in update:
+        capped = clamp_max_players(update.get("max_players"), db=db, server=server)
+        if capped is None:
+            raise HTTPException(
+                status_code=402,
+                detail="An active subscription is required to set max players.",
+            )
+        update["max_players"] = capped
+
     current.update(update)
     server.mc_config = current
 
@@ -1270,7 +1338,7 @@ def update_server_config(
             else:
                 props_dict = {
                     "motd": update.get("motd") or server.world_name,
-                    "max-players": update.get("max_players") or 20,
+                    "max-players": update.get("max_players") or clamp_max_players(None, db=db, server=server, default=20),
                     "gamemode": update.get("gamemode") or "survival",
                     "difficulty": update.get("difficulty") or "normal",
                     "level-name": update.get("level_name") or server.world_name,
@@ -1320,9 +1388,24 @@ def update_server_properties(
         raise HTTPException(status_code=400, detail=f"Cannot modify protected properties: {', '.join(sorted(blocked))}")
 
     server = _get_server_for_user(server_id, user, db, required_permission="config")
-    
+
+    sanitized = dict(props)
+    for key in ("max-players", "max_players"):
+        if key in sanitized:
+            try:
+                requested = int(sanitized[key])  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=422, detail=f"Invalid {key} value")
+            capped = clamp_max_players(requested, db=db, server=server)
+            if capped is None:
+                raise HTTPException(
+                    status_code=402,
+                    detail="An active subscription is required to set max players.",
+                )
+            sanitized[key] = capped
+
     try:
-        _ORCHESTRATOR.update_properties(str(server.id), props)
+        _ORCHESTRATOR.update_properties(str(server.id), sanitized)
         return {"status": "ok", "restart_required": True}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Failed to update properties on server node: {e}")

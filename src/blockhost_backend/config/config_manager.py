@@ -105,6 +105,11 @@ class Settings(BaseSettings):
     proxy_port_range_end: int = 39999
     proxy_db_refresh_seconds: int = 10  # how often the proxy re-reads routing from DB
 
+    # Spend / capacity guards
+    max_servers_per_user: int = 5
+    migration_cooldown_seconds: int = 300
+    max_migrations_per_hour: int = 10
+
     # When true: require Postgres, strong secrets, Alembic-only schema (no create_all).
     production_mode: bool = False
 

@@ -76,10 +76,9 @@ class ServerLifecycleOrchestrator:
     ) -> None:
 
         if db is not None:
-            # Temporarily bypassed for infrastructure testing
-            # from blockhost_backend.services.billing import ensure_active_subscription_for_start
-            # ensure_active_subscription_for_start(db=db, server=server)
-            pass
+            from blockhost_backend.services.billing import ensure_active_subscription_for_start
+
+            ensure_active_subscription_for_start(db=db, server=server)
 
         if not server.vm_port:
 
@@ -115,14 +114,14 @@ class ServerLifecycleOrchestrator:
             from blockhost_backend.api.servers import _java_server_properties_from_config
             server_properties_dict = {
                 k: v for k, v in dataclasses.asdict(
-                    _java_server_properties_from_config(server=server, port=server.vm_port)
+                    _java_server_properties_from_config(server=server, port=server.vm_port, db=db)
                 ).items() if v is not None
             }
         else:
             from blockhost_backend.api.servers import _server_props_from_config
             server_properties_dict = {
                 k: v for k, v in dataclasses.asdict(
-                    _server_props_from_config(server=server, port=server.vm_port)
+                    _server_props_from_config(server=server, port=server.vm_port, db=db)
                 ).items() if v is not None
             }
 

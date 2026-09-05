@@ -319,6 +319,34 @@ def stop_server(
     return {"status": "ok"}
 
 
+@app.delete("/agent/servers/{server_id}/data")
+def purge_server_data(
+    server_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Stop the process (if any) and delete the local server directory.
+
+    Used after a successful migration away from this node, or when the
+    control plane permanently deletes a world.
+    """
+    _validate_server_id(server_id)
+    server_dir = (SERVERS_ROOT_DIR / server_id).resolve()
+    if not server_dir.is_relative_to(SERVERS_ROOT_DIR.resolve()):
+        raise HTTPException(status_code=400, detail="Invalid server path")
+
+    try:
+        runtime.stop_server(server_id)
+    except Exception as e:
+        logger.warning("Stop before purge for %s failed (continuing): %s", server_id, e)
+
+    if server_dir.exists():
+        shutil.rmtree(server_dir, ignore_errors=True)
+        logger.info("Purged local server data for %s at %s", server_id, server_dir)
+        return {"status": "ok", "deleted": True}
+
+    return {"status": "ok", "deleted": False}
+
+
 @app.get("/agent/servers/{server_id}/status")
 def get_status(
     server_id: str,

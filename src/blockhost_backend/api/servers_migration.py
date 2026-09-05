@@ -21,9 +21,16 @@ from blockhost_backend.api.servers import (
 )
 from blockhost_backend.config.config_manager import get_settings
 from blockhost_backend.database.db import get_db
-from blockhost_backend.database.schema import Node, Server, ServerState, User
+from blockhost_backend.database.schema import Node, NodeState, Server, ServerState, User
 from blockhost_backend.runtime.agent_runtime import AgentRuntime
-from blockhost_backend.services.node_capacity import select_best_node
+from blockhost_backend.services.migration_guards import (
+    can_run_migration_now,
+    mark_server_migrated,
+    record_migration,
+    server_in_migration_cooldown,
+)
+from blockhost_backend.services.s3_storage import delete_migration_snapshot, require_s3_configured
+from blockhost_backend.orchestrator.resources import get_effective_server_resource_limits
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +62,23 @@ def migrate_server(
     """
     server = _get_server_for_user(server_id, user, db, required_permission="start_stop")
     sid = str(server.id)
+
+    try:
+        require_s3_configured()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    if not can_run_migration_now():
+        raise HTTPException(
+            status_code=429,
+            detail="Too many migrations recently. Try again later.",
+        )
+
+    if server_in_migration_cooldown(server):
+        raise HTTPException(
+            status_code=429,
+            detail="This server was migrated recently. Wait for the cooldown before migrating again.",
+        )
 
     # ── Resolve the current node ──────────────────────────────────────
     old_node: Node | None = None
@@ -91,15 +115,16 @@ def migrate_server(
         )
 
     # ── Step 3: Select a new node (exclude current) ───────────────────
+    limits = get_effective_server_resource_limits(db=db, server=server)
+    required_ram = int(limits.get("ram_mb") or 0)
     candidates = db.execute(
-        select(Node).where(Node.id != old_node.id, Node.status == "online")
+        select(Node).where(Node.id != old_node.id, Node.status == NodeState.online)
     ).scalars().all()
-
     new_node: Node | None = None
     best_free = -1
     for node in candidates:
         free = node.total_ram_mb - node.used_ram_mb
-        if free > best_free:
+        if free >= required_ram and free > best_free:
             best_free = free
             new_node = node
 
@@ -146,6 +171,7 @@ def migrate_server(
     logger.info("[migrate] Starting server %s on new node %s", sid, new_node.name)
     try:
         _do_start_server(server, db)
+        mark_server_migrated(db, server)
         db.commit()
     except HTTPException:
         raise
@@ -154,6 +180,17 @@ def migrate_server(
         raise HTTPException(
             status_code=503,
             detail=f"Restore succeeded but failed to start on new node: {e}",
+        )
+
+    record_migration()
+    delete_migration_snapshot(sid)
+
+    try:
+        old_agent.purge_server_data(sid)
+    except Exception as e:
+        logger.warning(
+            "[migrate] Failed to purge source data for %s on %s: %s",
+            sid, old_node.name, e,
         )
 
     _invalidate_server_read_cache(user.id, server.id)

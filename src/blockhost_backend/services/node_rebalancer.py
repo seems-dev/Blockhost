@@ -223,6 +223,29 @@ def _pick_migratable_server(servers: list[Server]) -> Server | None:
 def _rebalance_cycle() -> None:
     """Run one rebalance evaluation cycle."""
     with SessionLocal() as db:
+        # ── Scenario 0: Auto-Shutdown Empty Nodes ────────────────────────
+        # Shut down any node (healthy or not) that is online but has no servers.
+        # This handles nodes that were recently emptied, or nodes with stale heartbeats.
+        all_online_nodes = db.execute(
+            select(Node).where(Node.status == NodeState.online)
+        ).scalars().all()
+        
+        for node in all_online_nodes:
+            servers = _all_servers_on_node(db, node.id)
+            if not servers and node.provider and node.provider_instance_id:
+                logger.info("[rebalancer] Auto-Shutdown: Node %s is completely empty. Shutting down.", node.name)
+                try:
+                    provider = get_cloud_provider(node.provider)
+                    provider.stop_instance(node.provider_instance_id)
+                    node.status = NodeState.offline
+                    db.commit()
+                except Exception as e:
+                    logger.error("[rebalancer] Failed to shut down provider for node %s: %s", node.name, e)
+                
+                # Mark as offline so we don't attempt to shut it down again next cycle
+                
+
+        # Fetch only healthy nodes for the actual migrations
         nodes = _healthy_online_nodes(db)
         if len(nodes) < 2:
             return  # nothing to rebalance with a single node
@@ -298,17 +321,7 @@ def _rebalance_cycle() -> None:
 
         servers = _all_servers_on_node(db, source_node.id)
         if not servers:
-            # Source node is completely empty. We can shut it down if it has a provider.
-            if source_node.provider and source_node.provider_instance_id:
-                logger.info("[rebalancer] Auto-Shutdown: Node %s is empty. Shutting down.", source_node.name)
-                try:
-                    provider = get_cloud_provider(source_node.provider)
-                    provider.stop_instance(source_node.provider_instance_id)
-                    source_node.status = NodeState.offline
-                    db.commit()
-                except Exception as e:
-                    logger.error("[rebalancer] Failed to shut down node %s: %s", source_node.name, e)
-            return
+            return  # handled by Scenario 0 now
 
         # Check that the target has enough room
         free_on_target = target_node.total_ram_mb - target_node.used_ram_mb

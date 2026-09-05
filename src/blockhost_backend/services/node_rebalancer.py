@@ -11,6 +11,7 @@ Runs as a daemon thread alongside the other background workers.
 
 from __future__ import annotations
 
+from blockhost_backend.database.schema import utcnow
 import logging
 import threading
 import time

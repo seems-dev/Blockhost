@@ -16,13 +16,11 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_STALE_SECONDS = 30
 
-# Server states that reserve RAM on a node.
+# Server states that reserve RAM on a node (Active RAM).
 _RAM_RESERVING_STATES = (
-    ServerState.created,
     ServerState.provisioning,
     ServerState.running,
     ServerState.syncing,
-    ServerState.suspended,
 )
 
 
@@ -71,7 +69,7 @@ def select_best_node(db: Session, *, required_ram_mb: int = 0) -> Node | None:
     candidates = db.execute(
         select(Node).where(
             Node.status == NodeState.online,
-        )
+        ).with_for_update()
     ).scalars().all()
 
     best: Node | None = None
@@ -86,6 +84,41 @@ def select_best_node(db: Session, *, required_ram_mb: int = 0) -> Node | None:
             best_free = free
             best = node
     return best
+
+
+def auto_wakeup_offline_node(db: Session) -> bool:
+    """Attempt to start one offline node that has a configured cloud provider. Returns True if a wake signal was sent."""
+    # Check if a node is already starting to prevent AWS API rate limits (Thundering Herd)
+    is_starting = db.execute(
+        select(Node).where(Node.status == NodeState.starting)
+    ).scalars().first()
+    if is_starting:
+        return True
+
+    offline_node = db.execute(
+        select(Node).where(
+            Node.status == NodeState.offline,
+            Node.provider.is_not(None),
+            Node.provider_instance_id.is_not(None)
+        )
+    ).scalars().first()
+
+    if not offline_node:
+        return False
+        
+    try:
+        from blockhost_backend.services.cloud.cloud_provider import get_cloud_provider
+        provider = get_cloud_provider(offline_node.provider)
+        provider.start_instance(offline_node.provider_instance_id)
+        
+        # Mark as starting so we don't boot it again on the next cycle
+        offline_node.status = NodeState.starting
+        offline_node.status_updated_at = utcnow()
+        db.commit()
+        return True
+    except Exception as e:
+        logger.error("Failed to wake up offline node %s: %s", offline_node.name, e)
+        return False
 
 
 def suspend_running_servers_on_node(db: Session, node_id: uuid.UUID) -> list[uuid.UUID]:
@@ -124,8 +157,9 @@ def suspend_running_servers_on_node(db: Session, node_id: uuid.UUID) -> list[uui
 
 
 def mark_stale_nodes_offline(db: Session) -> list[uuid.UUID]:
-    """Mark nodes with stale heartbeats as offline; suspend their running servers."""
-    cutoff = utcnow() - timedelta(seconds=HEARTBEAT_STALE_SECONDS)
+    """Mark nodes with stale heartbeats as offline; suspend their running servers. Also recovers deadlocked starting nodes."""
+    now = utcnow()
+    cutoff = now - timedelta(seconds=HEARTBEAT_STALE_SECONDS)
     stale_nodes = db.execute(
         select(Node).where(
             Node.status == NodeState.online,
@@ -137,9 +171,27 @@ def mark_stale_nodes_offline(db: Session) -> list[uuid.UUID]:
     affected: list[uuid.UUID] = []
     for node in stale_nodes:
         node.status = NodeState.offline
+        node.status_updated_at = now
         db.add(node)
         affected.append(node.id)
         suspend_running_servers_on_node(db, node.id)
+    
+    # Check for Boot Deadlock (starting > 5 mins)
+    deadlock_cutoff = now - timedelta(minutes=5)
+    stuck_nodes = db.execute(
+        select(Node).where(
+            Node.status == NodeState.starting,
+            Node.status_updated_at < deadlock_cutoff
+        )
+    ).scalars().all()
+    
+    for node in stuck_nodes:
+        logger.warning("Node '%s' stuck in starting state for > 5 mins. Reverting to offline.", node.id)
+        node.status = NodeState.offline
+        node.status_updated_at = now
+        db.add(node)
+        affected.append(node.id)
+
     if affected:
         db.commit()
     return affected

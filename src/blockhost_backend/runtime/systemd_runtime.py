@@ -152,6 +152,9 @@ class SystemdRuntime:
             "--property", "MemoryAccounting=yes",
             "--property", "CPUAccounting=yes",
             "--property", "TasksMax=512",
+            "--property", "Restart=on-failure",
+            "--property", "StartLimitBurst=3",
+            "--property", "StartLimitIntervalSec=60s",
             "/bin/bash", "-c", exe_cmd,
         ]
 
@@ -295,6 +298,34 @@ class SystemdRuntime:
         self._rebuild_online_players_from_journal(server_id)
         with self._lock:
             return dict(self._online_players.get(server_id, {}))
+
+    def get_all_running_player_counts(self) -> dict[str, int]:
+        """Fast method to get player counts for all active systemd servers."""
+        if not self._systemctl_available():
+            return {}
+
+        result = subprocess.run(
+            ["systemctl", "list-units", "blockhost-server-*.service", "--state=active", "--no-legend"],
+            capture_output=True,
+            text=True,
+        )
+
+        counts = {}
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            unit_name = parts[0]
+            # blockhost-server-uuid.service -> uuid
+            if unit_name.startswith("blockhost-server-") and unit_name.endswith(".service"):
+                # Systemd escapes dashes differently, but our _unit_name replaces all bad chars with dash
+                # Actually, our _UNIT_RE replaces dashes with dash, so the uuid is preserved.
+                server_id = unit_name[17:-8]
+                if server_id:
+                    players = self.get_online_players_with_xuid(server_id)
+                    counts[server_id] = len(players)
+        return counts
+
     # ---------------- STATS (BASIC) ----------------
     def get_stats(self, server_id: str) -> RuntimeResourceStats:
         if not self._systemctl_available():

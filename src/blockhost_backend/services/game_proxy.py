@@ -24,6 +24,7 @@ import logging
 import socket
 from dataclasses import dataclass
 
+import uuid
 from sqlalchemy import select
 
 from blockhost_backend.database.db import SessionLocal
@@ -42,6 +43,31 @@ class RouteTarget:
     backend_port: int
     flavor: str | None = None
     server_id: str | None = None
+    is_suspended: bool = False
+
+_waking_servers: set[str] = set()
+
+def _sync_trigger_wakeup(server_id: str) -> None:
+    """Synchronous function to wake up a server."""
+    if server_id in _waking_servers:
+        return
+    _waking_servers.add(server_id)
+    try:
+        from blockhost_backend.api.servers import _do_start_server
+        with SessionLocal() as db:
+            server = db.get(Server, uuid.UUID(server_id))
+            if server and server.state == ServerState.suspended:
+                logger.info("Wake-on-Connect triggered for %s", server_id)
+                _do_start_server(server, db)
+                db.commit()
+    except Exception as e:
+        logger.error("Wake-on-Connect failed for %s: %s", server_id, e)
+    finally:
+        _waking_servers.discard(server_id)
+
+async def _trigger_wakeup(server_id: str) -> None:
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _sync_trigger_wakeup, server_id)
 
 
 def _load_routing_table(*, log_routes: bool = False) -> dict[int, RouteTarget]:
@@ -56,12 +82,13 @@ def _load_routing_table(*, log_routes: bool = False) -> dict[int, RouteTarget]:
                 Server.vm_ipv4,
                 Server.vm_port,
                 Server.flavor,
+                Server.state,
                 Node.ip_address.label("node_ip"),
             )
             .outerjoin(Node, Server.node_id == Node.id)
             .where(
                 Server.proxy_port.is_not(None),
-                Server.state == ServerState.running,
+                Server.state.in_([ServerState.running, ServerState.suspended]),
             )
         ).all()
 
@@ -81,15 +108,17 @@ def _load_routing_table(*, log_routes: bool = False) -> dict[int, RouteTarget]:
                     backend_port=backend_port,
                     flavor=flavor,
                     server_id=str(row.id),
+                    is_suspended=(row.state == ServerState.suspended),
                 )
                 if log_routes:
                     logger.info(
-                        "Route proxy:%d → %s:%d (%s %s)",
+                        "Route proxy:%d → %s:%d (%s %s) suspended=%s",
                         proxy_port,
                         backend_ip,
                         backend_port,
                         flavor or "unknown",
                         str(row.id)[:8],
+                        row.state == ServerState.suspended,
                     )
     return routes
 
@@ -142,6 +171,13 @@ async def _handle_tcp_client(
         "TCP %s → proxy:%d → %s:%d",
         peer, proxy_port, route.backend_ip, route.backend_port,
     )
+    
+    if route.is_suspended:
+        logger.info("TCP proxy %d: Server suspended, triggering Wake-on-Connect", proxy_port)
+        if route.server_id:
+            asyncio.create_task(_trigger_wakeup(route.server_id))
+        client_writer.close()
+        return
 
     try:
         backend_reader, backend_writer = await asyncio.open_connection(
@@ -188,6 +224,22 @@ class UdpProxyProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr: tuple) -> None:
         route = self.routing_table.get(self.proxy_port)
         if not route:
+            return
+
+        if route.is_suspended:
+            if route.server_id:
+                self.loop.create_task(_trigger_wakeup(route.server_id))
+            
+            # Send fake pong if it's an Unconnected Ping (0x01)
+            if len(data) >= 33 and data[0] == 0x01 and self.transport:
+                timestamp = data[1:9]
+                magic = data[9:25]
+                server_guid = b"\x00\x00\x00\x00\x00\x00\x00\x01"
+                payload = f"MCPE;Server Waking Up...;503;1.20;0;0;1;Wait 15s...;Survival;1;{self.proxy_port};{self.proxy_port}".encode("utf-8")
+                import struct
+                payload_len = struct.pack(">H", len(payload))
+                fake_pong = b"\x1c" + timestamp + server_guid + magic + payload_len + payload
+                self.transport.sendto(fake_pong, addr)
             return
 
         session = self._client_sessions.get(addr)

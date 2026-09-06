@@ -309,6 +309,21 @@ def clear_jars(
         except OSError:
             pass
     return {"status": "ok", "deleted": deleted}
+@app.post("/agent/halt-all")
+def agent_halt_all(
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Halt all running servers forcefully (Split-Brain handling)."""
+    running_counts = runtime.get_all_running_player_counts()
+    for sid in running_counts.keys():
+        try:
+            logger.info("Halting server %s due to split-brain recovery", sid)
+            runtime.stop_server(sid)
+        except Exception as e:
+            logger.error("Failed to halt server %s: %s", sid, e)
+    return {"status": "ok", "halted": len(running_counts)}
+
+
 @app.post("/agent/servers/{server_id}/stop")
 def stop_server(
     server_id: str,
@@ -1666,6 +1681,7 @@ async def heartbeat_task() -> None:
                                     "used_ram_mb": ram.used // (1024 * 1024),
                                     "cpu_usage_percent": cpu,
                                     "cpu_cores": psutil.cpu_count(),
+                                    "running_servers": runtime.get_all_running_player_counts(),
                                 },
                             }
                         )

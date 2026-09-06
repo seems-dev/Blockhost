@@ -120,6 +120,7 @@ class NodeState(str, enum.Enum):
     online = "online"
     offline = "offline"
     draining = "draining"
+    starting = "starting"
 
 
 class ServerFlavor(str, enum.Enum):
@@ -211,6 +212,7 @@ class Server(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     last_activity: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    players_online: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_backup_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     world_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     backup_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -488,6 +490,7 @@ class Node(Base):
     agent_port: Mapped[int] = mapped_column(Integer, nullable=False, default=9000)
 
     status: Mapped[NodeState] = mapped_column(Enum(NodeState), nullable=False, default=NodeState.offline)
+    status_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     agent_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 

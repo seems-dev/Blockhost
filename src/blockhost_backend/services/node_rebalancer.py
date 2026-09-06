@@ -247,13 +247,31 @@ def _rebalance_cycle() -> None:
 
         # Fetch only healthy nodes for the actual migrations
         nodes = _healthy_online_nodes(db)
-        if len(nodes) < 2:
-            return  # nothing to rebalance with a single node
 
         if not can_run_migration_now():
             return
 
-        # ── Scenario 1: Overflow Protection ──────────────────────────
+        # ── Scenario 1: Evacuate "Empty" Nodes ──────────────────────────
+        # If a node has 0 running servers but has suspended servers, migrate them
+        # so the node can eventually be shut down.
+        for node in nodes:
+            running = _running_servers_on_node(db, node.id)
+            if len(running) == 0:
+                all_servers = _all_servers_on_node(db, node.id)
+                if len(all_servers) > 0:
+                    candidates = [n for n in nodes if n.id != node.id]
+                    if not candidates:
+                        continue
+                    # Sort by used_ram_mb descending to pack tightly
+                    target_node = sorted(candidates, key=lambda n: n.used_ram_mb, reverse=True)[0]
+                    victim = _pick_migratable_server(all_servers)
+                    if victim:
+                        logger.info("[rebalancer] Evacuating suspended server from node %s with 0 running servers to %s", node.name, target_node.name)
+                        # We skip RAM capacity checks because the server is suspended!
+                        _migrate_server(victim, node, target_node, db)
+                        return  # one migration per cycle
+
+        # ── Scenario 2: Overflow Protection ──────────────────────────
         # Find overloaded nodes and shed their least-active server to
         # the node with the most free RAM.
         for node in nodes:
@@ -280,20 +298,9 @@ def _rebalance_cycle() -> None:
             if not best_target:
                 logger.warning("[rebalancer] No suitable target node for overflow from %s", node.name)
                 # Auto-Wakeup: Try to start an offline node
-                offline_node = db.execute(
-                    select(Node).where(
-                        Node.status == NodeState.offline,
-                        Node.provider.is_not(None),
-                        Node.provider_instance_id.is_not(None)
-                    )
-                ).scalars().first()
-                if offline_node:
-                    logger.info("[rebalancer] Auto-Wakeup: Triggering start for node %s", offline_node.name)
-                    try:
-                        provider = get_cloud_provider(offline_node.provider)
-                        provider.start_instance(offline_node.provider_instance_id)
-                    except Exception as e:
-                        logger.error("[rebalancer] Failed to wake up node %s: %s", offline_node.name, e)
+                from blockhost_backend.services.node_capacity import auto_wakeup_offline_node
+                if auto_wakeup_offline_node(db):
+                    logger.info("[rebalancer] Auto-Wakeup: Triggering start for offline node due to overflow on %s", node.name)
                 return
 
             # Pick the least-active running server not in cooldown
@@ -304,7 +311,10 @@ def _rebalance_cycle() -> None:
             _migrate_server(victim, node, best_target, db)
             return  # one migration per cycle to avoid thrashing
 
-        # ── Scenario 2: Consolidation ────────────────────────────────
+        if len(nodes) < 2:
+            return  # nothing to consolidate with a single node
+
+        # ── Scenario 3: Consolidation ────────────────────────────────
         # If ALL nodes are below the idle threshold (based on ACTIVE servers),
         # pack servers from the least-loaded node onto the most-loaded one.
         all_idle = all(_node_active_ram_ratio(n, db) < NODE_IDLE_RATIO for n in nodes)
@@ -323,14 +333,15 @@ def _rebalance_cycle() -> None:
         if not servers:
             return  # handled by Scenario 0 now
 
-        # Check that the target has enough room
-        free_on_target = target_node.total_ram_mb - target_node.used_ram_mb
-        if free_on_target < 512:  # need at least 512 MB free to accept a transfer
-            return
-
         victim = _pick_migratable_server(servers)
         if not victim:
             return
+
+        if victim.state == ServerState.running:
+            # Check that the target has enough room ONLY for running servers
+            free_on_target = target_node.total_ram_mb - target_node.used_ram_mb
+            if free_on_target < 512:  # need at least 512 MB free to accept a transfer
+                return
 
         logger.info(
             "[rebalancer] Consolidating: moving server from %s → %s (all nodes idle)",

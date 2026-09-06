@@ -38,7 +38,7 @@ from blockhost_backend.api.schemas import (
 from blockhost_backend.config.config_manager import get_settings
 from blockhost_backend.database import db
 from blockhost_backend.database.db import SessionLocal, get_db
-from blockhost_backend.database.schema import Ban, Server, ServerState, User, VMProvider
+from blockhost_backend.database.schema import Node, NodeState, Server, ServerState, User, VMProvider
 from blockhost_backend.minecraft.bedrock_ping import bedrock_unconnected_ping, parse_bedrock_pong_payload
 from blockhost_backend.minecraft.bedrock_properties import BedrockServerProperties, write_server_properties
 from blockhost_backend.minecraft.bedrock_download import list_remote_versions
@@ -802,10 +802,17 @@ def create_server(
     # Unpaid servers reserve 0 RAM until a plan is active; still place on freest node.
     node = select_best_node(db, required_ram_mb=0)
     if settings.production_mode and not node:
-        raise HTTPException(
-            status_code=503,
-            detail="No online worker node is available. Check agent registration and heartbeat.",
-        )
+        from blockhost_backend.services.node_capacity import auto_wakeup_offline_node
+        if auto_wakeup_offline_node(db):
+            raise HTTPException(
+                status_code=503,
+                detail="Network is scaling up! A new node is booting to handle your server. Please wait 60 seconds and try again.",
+            )
+        else:
+            raise HTTPException(
+                status_code=503,
+                detail="No worker nodes are available (and none can be booted). Check agent registration.",
+            )
     node_id = node.id if node else None
 
     try:
@@ -1109,10 +1116,10 @@ def _provision_remote_server(server: Server, server_dir: Path, db: Session, vers
 def _do_start_server(server: Server, db: Session) -> None:
     settings = get_settings()
 
-    # Automatic Failover: if assigned node is offline, detach the server
+    # Automatic Failover: if assigned node is offline or starting, detach the server
     if server.node_id:
         node = db.get(Node, server.node_id)
-        if not node or node.status == "offline":
+        if not node or node.status in (NodeState.offline, NodeState.starting):
             server.node_id = None
             server.vm_ipv4 = None
             server.vm_port = None
@@ -1125,6 +1132,8 @@ def _do_start_server(server: Server, db: Session) -> None:
         if node:
             server.node_id = node.id
             server.vm_ipv4 = node.ip_address
+            server.state = ServerState.provisioning # Reserve RAM before lock release
+            refresh_node_allocated_ram(db, node.id)
             # We must re-allocate a fresh port on the new node
             try:
                 server.vm_port = _allocate_port(db=db, flavor=server.flavor, node_id=server.node_id)
@@ -1132,10 +1141,17 @@ def _do_start_server(server: Server, db: Session) -> None:
                 raise HTTPException(status_code=503, detail=f"Failed to allocate port on new node: {e}")
             db.commit()
         elif settings.production_mode:
-            raise HTTPException(
-                status_code=503,
-                detail="Server is not assigned to a worker node. Recreate it after the agent is online.",
-            )
+            from blockhost_backend.services.node_capacity import auto_wakeup_offline_node
+            if auto_wakeup_offline_node(db):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Network is scaling up! A new node is booting. Please wait 60 seconds and try again.",
+                )
+            else:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Server is not assigned to a worker node. No capacity is currently available.",
+                )
     is_java = is_java_flavor(server.flavor)
 
     try:

@@ -147,12 +147,12 @@ async def node_agent_websocket(
             if node_obj.status == NodeState.offline:
                 logger.warning("Node '%s' reconnecting from offline state. Initiating split-brain recovery.", node_name)
                 import httpx
-                agent_port = data.get("agent_port", 9000)
+                agent_port = register_data.get("agent_port", 9000)
                 try:
                     async with httpx.AsyncClient(timeout=10.0) as client:
                         resp = await client.post(
                             f"http://{node_ip}:{agent_port}/agent/halt-all",
-                            headers={"Authorization": f"Bearer {AGENT_TOKEN}"}
+                            headers={"Authorization": f"Bearer {get_settings().worker_agent_token}"}
                         )
                         resp.raise_for_status()
                         logger.info("Split-brain recovery successful for node '%s'. Orphaned processes halted.", node_name)

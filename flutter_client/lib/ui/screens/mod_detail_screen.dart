@@ -2,7 +2,7 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 
-import '../../api/blockhost_api.dart';
+import '../../api/erex_api.dart';
 import '../../models/mod_models.dart';
 import '../theme/tranquil_theme.dart';
 
@@ -16,7 +16,7 @@ const _warningAmber = Color(0xFFFFD93D);
 
 class ModDetailScreen extends StatefulWidget {
   final String serverId;
-  final BlockHostApi api;
+  final ErexApi api;
   final String projectId;
   final String initialTitle;
 

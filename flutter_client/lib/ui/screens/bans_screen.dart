@@ -2,7 +2,7 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
-import '../../api/blockhost_api.dart';
+import '../../api/erex_api.dart';
 import '../../models/ban_models.dart';
 import '../../state/app_state.dart';
 import '../theme/tranquil_theme.dart';

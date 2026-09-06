@@ -156,25 +156,46 @@ def _get_server(server_id: str, user: User, db: Session, required_permission: st
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
         
-    if server.owner_id == user.id:
-        return server
+    if server.owner_id != user.id:
+        from sqlalchemy import select
+        from blockhost_backend.database.schema import ServerCollaborator
         
-    from sqlalchemy import select
-    from blockhost_backend.database.schema import ServerCollaborator
-    
-    collab = db.execute(
-        select(ServerCollaborator).where(
-            ServerCollaborator.server_id == server.id,
-            ServerCollaborator.user_id == user.id
-        )
-    ).scalars().first()
-    
-    if not collab:
-        raise HTTPException(status_code=404, detail="Server not found")
+        collab = db.execute(
+            select(ServerCollaborator).where(
+                ServerCollaborator.server_id == server.id,
+                ServerCollaborator.user_id == user.id
+            )
+        ).scalars().first()
         
-    if required_permission not in collab.permissions:
-        raise HTTPException(status_code=403, detail=f"Missing required permission: {required_permission}")
+        if not collab:
+            raise HTTPException(status_code=404, detail="Server not found")
+            
+        if required_permission not in collab.permissions:
+            raise HTTPException(status_code=403, detail=f"Missing required permission: {required_permission}")
+            
+    # --- Virtual Player: Reset auto-sleep timer on file activity ---
+    from blockhost_backend.database.schema import ServerState, NodeState, utcnow
+    server.last_activity = utcnow()
+    db.add(server)
+    db.commit()
+
+    # --- Rebalancing Guard ---
+    if server.state in (ServerState.syncing, ServerState.provisioning, ServerState.migrating):
+        raise HTTPException(status_code=409, detail="Server is currently migrating or provisioning. Please wait.")
         
+    # --- Suspending Guard ---
+    if server.state == ServerState.suspending:
+        raise HTTPException(status_code=409, detail="Server is currently going to sleep. Please wake it up and try again.")
+        
+    # --- Cold Storage Guard ---
+    if server.state == ServerState.suspended:
+        if not server.node_id:
+            raise HTTPException(status_code=400, detail="Server is in cold storage. Please click Start to wake it up.")
+            
+        node = db.get(Node, server.node_id)
+        if not node or node.status == NodeState.offline:
+            raise HTTPException(status_code=400, detail="The node hosting this server is currently offline.")
+
     return server
 
 

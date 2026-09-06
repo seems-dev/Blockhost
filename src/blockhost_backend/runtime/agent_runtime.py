@@ -55,6 +55,15 @@ class AgentRuntime:
             raise
         return resp
 
+    def _delete(self, path: str) -> httpx.Response:
+        resp = httpx.delete(f"{self.agent_base_url}{path}", headers=self._headers, timeout=120.0)
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error from Agent: {resp.text}")
+            raise
+        return resp
+
     def start_server(self, request: RuntimeStartRequest) -> RuntimeStartResult:
         # Filter out None values so Pydantic on the Agent doesn't reject the payload
         clean_props = {}
@@ -157,6 +166,21 @@ class AgentRuntime:
 
     def send_command(self, server_id: str, command: str) -> None:
         self._post(f"/agent/servers/{server_id}/command", json_data={"command": command})
+
+    def backup_to_s3(self, server_id: str) -> dict[str, Any]:
+        """Ask the agent to zip the server world and upload to S3."""
+        resp = self._post(f"/agent/servers/{server_id}/backup")
+        return resp.json()
+
+    def restore_from_s3(self, server_id: str) -> dict[str, Any]:
+        """Ask the agent to download the world zip from S3 and extract it."""
+        resp = self._post(f"/agent/servers/{server_id}/restore")
+        return resp.json()
+
+    def purge_server_data(self, server_id: str) -> dict[str, Any]:
+        """Ask the agent to stop and delete local world files for this server."""
+        resp = self._delete(f"/agent/servers/{server_id}/data")
+        return resp.json()
 
     def add_log_listener(self, server_id: str, listener: LogListener) -> None:
         with self._lock:

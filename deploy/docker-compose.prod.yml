@@ -47,7 +47,7 @@ services:
       DATABASE_URL: postgresql+psycopg://blockhost:${POSTGRES_PASSWORD:-change-me-postgres}@postgres:5432/blockhost
       REDIS_URL: redis://redis:6379/0
       PRODUCTION_MODE: "true"
-      BACKGROUND_WORKERS_IN_API: "false"
+      BACKGROUND_WORKERS_IN_API: "true"
     volumes:
       - bedrock_data:/app/data
     depends_on:

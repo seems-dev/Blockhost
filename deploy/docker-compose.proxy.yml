@@ -1,0 +1,28 @@
+# Proxy stack: runs on a dedicated tiny VM (e.g., t3.nano).
+# Routes player TCP/UDP traffic to the correct backend node.
+#
+# Usage:
+#   docker compose -f docker-compose.proxy.yml up -d
+#
+# The proxy reads routing from the same Postgres database as the control plane.
+# Set DATABASE_URL in .env to point to the control plane's Postgres.
+
+services:
+  proxy:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    restart: unless-stopped
+    command: blockhost-proxy
+    env_file:
+      - .env
+    environment:
+      PROXY_ENABLED: "true"
+    # Host networking is strongly preferred for Bedrock (UDP/RakNet).
+    # docker-proxy conntrack often breaks RakNet; published port ranges also
+    # silently drop traffic if proxy_port is outside the mapped range.
+    network_mode: host
+    # If you cannot use host networking, map the full PROXY_PORT_RANGE:
+    # ports:
+    #   - "30000-30100:30000-30100/tcp"
+    #   - "30000-30100:30000-30100/udp"

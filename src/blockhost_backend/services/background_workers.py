@@ -33,11 +33,15 @@ def start_background_workers() -> None:
         _started = True
 
     from blockhost_backend.api.nodes import start_node_watchdog_once
+    from blockhost_backend.services.node_rebalancer import start_node_rebalancer_once
+    from blockhost_backend.services.auto_sleeper import start_auto_sleeper_once
 
     start_subscription_expiration_worker_once()
     start_disk_health_monitor_once()
     start_node_watchdog_once()
     start_backup_scheduler_once()
+    start_node_rebalancer_once()
+    start_auto_sleeper_once()
     logger.info("Background workers started")
 
 

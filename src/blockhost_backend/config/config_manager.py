@@ -92,6 +92,24 @@ class Settings(BaseSettings):
     razorpay_key_secret: str = ""          # matches RAZORPAY_KEY_SECRET in .env
     razorpay_webhook_secret: str = ""     # matches RAZORPAY_WEBHOOK_SECRET in .env
 
+    # AWS S3 – world backup storage for durability & cross-node migration
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
+    aws_region: str = "ap-southeast-2"
+    s3_backup_bucket_name: str = ""
+
+    # Game Proxy – stable player-facing addresses across node migrations
+    proxy_enabled: bool = False
+    proxy_host: str = ""                # e.g., "play.blockhost.app" or the proxy VM's public IP
+    proxy_port_range_start: int = 30000
+    proxy_port_range_end: int = 39999
+    proxy_db_refresh_seconds: int = 10  # how often the proxy re-reads routing from DB
+
+    # Spend / capacity guards
+    max_servers_per_user: int = 5
+    migration_cooldown_seconds: int = 300
+    max_migrations_per_hour: int = 10
+
     # When true: require Postgres, strong secrets, Alembic-only schema (no create_all).
     production_mode: bool = False
 

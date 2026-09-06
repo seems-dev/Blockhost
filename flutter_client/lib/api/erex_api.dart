@@ -25,8 +25,8 @@ class EmailNotVerifiedException implements Exception {
   String toString() => message;
 }
 
-class BlockHostApi {
-  BlockHostApi({required this.baseUrl, required this.accessToken});
+class ErexApi {
+  ErexApi({required this.baseUrl, required this.accessToken});
 
   final String baseUrl;
   final String? accessToken;
@@ -818,8 +818,22 @@ class BlockHostApi {
   }
 
   String _err(dynamic decoded, int status) {
-    if (decoded is Map && decoded['detail'] is String)
-      return '${decoded['detail']} ($status)';
+    if (decoded is Map) {
+      final detail = decoded['detail'];
+      if (detail is String) return '$detail ($status)';
+      if (detail is Map) {
+        final message = detail['message']?.toString();
+        if (message != null && message.isNotEmpty) return '$message ($status)';
+        final error = detail['error']?.toString();
+        if (error != null && error.isNotEmpty) return '$error ($status)';
+      }
+      if (detail is List && detail.isNotEmpty) {
+        final first = detail.first;
+        if (first is Map && first['msg'] != null) {
+          return '${first['msg']} ($status)';
+        }
+      }
+    }
     return 'Request failed ($status)';
   }
 

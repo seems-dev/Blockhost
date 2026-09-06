@@ -55,24 +55,6 @@ def _get_redis_client() -> Any | None:
         return client
 
 
-class DummyLock:
-    def __init__(self):
-        self._lock = threading.Lock()
-        
-    def acquire(self, *args, **kwargs):
-        return self._lock.acquire(*args, **kwargs)
-        
-    def release(self):
-        self._lock.release()
-        
-    def __enter__(self):
-        self.acquire()
-        return self
-        
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.release()
-
-
 class ApiCache:
     def get_json(self, key: str) -> Any | None:
         client = _get_redis_client()
@@ -131,7 +113,7 @@ class ApiCache:
     def lock(self, name: str, timeout: int = 600) -> Any:
         client = _get_redis_client()
         if client is None:
-            return DummyLock()
+            return threading.Lock()
         return client.lock(name, timeout=timeout)
 
 

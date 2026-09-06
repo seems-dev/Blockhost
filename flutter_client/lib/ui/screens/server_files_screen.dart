@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-import '../../api/blockhost_api.dart';
+import '../../api/erex_api.dart';
 import '../../state/app_state.dart';
 import 'file_editor_screen.dart';
 

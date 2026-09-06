@@ -49,6 +49,16 @@ def validate_production_settings(settings: Settings) -> None:
     if not settings.minecraft_public_host or settings.minecraft_public_host in ("", "localhost", "127.0.0.1"):
         errors.append("MINECRAFT_PUBLIC_HOST must be set to your public domain or IP in production")
 
+    # S3 is required for cross-node migrate/rebalance. Warn loudly; migrate paths fail-fast.
+    if not settings.s3_backup_bucket_name or not settings.aws_access_key_id or not settings.aws_secret_access_key:
+        import logging
+        logging.getLogger(__name__).warning(
+            "S3 migration storage is incomplete "
+            "(S3_BACKUP_BUCKET_NAME / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY). "
+            "Node migrate/rebalance will fail until configured. "
+            "Also set a bucket lifecycle rule to expire prefix migrations/ after 14–30 days."
+        )
+
     if settings.rate_limit_auth_per_minute > 10:
         import logging
         logging.getLogger(__name__).warning(

@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'dart:ui';
-import '../../api/blockhost_api.dart';
+import '../../api/erex_api.dart';
 import '../../state/app_state.dart';
 
 // ── VS Code Inspired Design Tokens ────────────────────────────────────────────

@@ -2,7 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
-import '../api/blockhost_api.dart';
+import '../api/erex_api.dart';
 import '../models/backup_models.dart';
 
 /// Holds all backup-related state for a single server.
@@ -10,7 +10,7 @@ import '../models/backup_models.dart';
 class BackupState extends ChangeNotifier {
   BackupState({required this.api, required this.serverId});
 
-  final BlockHostApi api;
+  final ErexApi api;
   final String serverId;
 
   // ── Data ──────────────────────────────────────────────────────────────────

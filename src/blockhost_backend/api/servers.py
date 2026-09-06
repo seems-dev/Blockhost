@@ -1,8 +1,6 @@
 from __future__ import annotations
-#file_name = api/server.py
-from blockhost_backend.database.schema import ServerCollaborator
-from uvicorn import server
-from blockhost_backend.database.schema import Node, ServerFlavor
+
+from blockhost_backend.database.schema import Node, ServerCollaborator, ServerFlavor
 import logging
 import re
 import threading
@@ -40,7 +38,7 @@ from blockhost_backend.api.schemas import (
 from blockhost_backend.config.config_manager import get_settings
 from blockhost_backend.database import db
 from blockhost_backend.database.db import SessionLocal, get_db
-from blockhost_backend.database.schema import Ban, Server, ServerState, User, VMProvider
+from blockhost_backend.database.schema import Node, NodeState, Server, ServerState, User, VMProvider
 from blockhost_backend.minecraft.bedrock_ping import bedrock_unconnected_ping, parse_bedrock_pong_payload
 from blockhost_backend.minecraft.bedrock_properties import BedrockServerProperties, write_server_properties
 from blockhost_backend.minecraft.bedrock_download import list_remote_versions
@@ -59,7 +57,8 @@ from blockhost_backend.services.system_health import DiskProtectionError, assert
 from blockhost_backend.utils import generate_join_code
 from blockhost_backend.services.billing import BillingError
 from blockhost_backend.services.node_capacity import refresh_node_allocated_ram, select_best_node
-#file_name = servers.py
+from blockhost_backend.services.plan_limits import clamp_max_players
+from blockhost_backend.services.s3_storage import delete_migration_snapshot
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/servers", tags=["servers"])
@@ -196,7 +195,9 @@ def _server_to_out(server: Server, owner: User | None = None) -> ServerOut:
     settings = get_settings()
     host = server.vm_ipv4 or settings.minecraft_public_host
     shareable_address = None
-    if host and server.vm_port:
+    if settings.proxy_enabled and settings.proxy_host and server.proxy_port:
+        shareable_address = f"{settings.proxy_host}:{server.proxy_port}"
+    elif host and server.vm_port:
         shareable_address = f"{host}:{server.vm_port}"
     return ServerOut(
         id=server.id,
@@ -215,68 +216,6 @@ def _server_to_out(server: Server, owner: User | None = None) -> ServerOut:
         mc_version=server.mc_version,
         mc_config=server.mc_config,
     )
-
-
-def _server_to_detail(server: Server, owner: User | None = None) -> ServerDetail:
-    base = _server_to_out(server, owner=owner)
-    return ServerDetail(
-        **base.model_dump(),
-        minecraft_host=(server.vm_ipv4 or get_settings().minecraft_public_host),
-        minecraft_port=server.vm_port,
-    )
-
-
-def _ban_to_out(ban: Ban) -> BanOut:
-    return BanOut(
-        ban_id=ban.id,
-        server_id=ban.server_id,
-        xuid=ban.xuid,
-        player_name=ban.player_name,
-        reason=ban.reason,
-        active=ban.active,
-        banned_at=ban.banned_at,
-        expires_at=ban.expires_at,
-        unbanned_at=ban.unbanned_at,
-        created_by_user_id=ban.created_by_user_id,
-        unbanned_by_user_id=ban.unbanned_by_user_id,
-    )
-
-
-def _expire_ban_if_needed(ban: Ban, now: datetime) -> bool:
-    if ban.active and ban.expires_at is not None and ban.expires_at <= now:
-        ban.active = False
-        ban.unbanned_at = ban.expires_at or now
-        return True
-    return False
-
-
-def _resolve_active_ban(server_id: uuid.UUID, xuid: str, db: Session) -> Ban | None:
-    now = datetime.now(timezone.utc)
-    ban = db.scalars(
-        select(Ban)
-        .where(Ban.server_id == server_id, Ban.xuid == xuid, Ban.active == True)
-        .order_by(Ban.banned_at.desc())
-    ).one_or_none()
-    if ban and _expire_ban_if_needed(ban, now):
-        db.add(ban)
-        db.commit()
-        db.refresh(ban)
-        return None
-    return ban
-
-
-def _expire_expired_bans(server_id: uuid.UUID, db: Session) -> None:
-    now = datetime.now(timezone.utc)
-    expired_bans = db.scalars(
-        select(Ban)
-        .where(Ban.server_id == server_id, Ban.active == True, Ban.expires_at != None, Ban.expires_at <= now)
-    ).all()
-    for ban in expired_bans:
-        ban.active = False
-        ban.unbanned_at = ban.expires_at or now
-        db.add(ban)
-    if expired_bans:
-        db.commit()
 
 
 def _server_to_detail(server: Server, owner: User | None = None) -> ServerDetail:
@@ -677,14 +616,53 @@ def _allocate_port(*, db: Session, flavor: ServerFlavor, node_id: uuid.UUID | No
         return pick_free_tcp_port(port_range=port_range, used_ports=used)
 
 
-def _server_props_from_config(*, server: Server, port: int) -> BedrockServerProperties:
+def _allocate_proxy_port(db: Session) -> int | None:
+    """Allocate a globally unique proxy port from the dedicated range.
+
+    This port stays with the server forever — it is the stable address
+    players use to connect through the proxy, regardless of which node
+    the server is currently running on.
+    Returns None if the proxy feature is disabled.
+    """
+    settings = get_settings()
+    if not settings.proxy_enabled:
+        return None
+
+    start = settings.proxy_port_range_start
+    end = settings.proxy_port_range_end
+
+    # Lock to prevent races in Postgres
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(8742032)"))
+
+    used = set(
+        db.execute(
+            select(Server.proxy_port).where(
+                Server.proxy_port.is_not(None),
+                Server.proxy_port.between(start, end),
+            )
+        ).scalars().all()
+    )
+
+    for candidate in range(start, end + 1):
+        if candidate not in used:
+            return candidate
+
+    raise RuntimeError(
+        f"No free proxy port in range {start}–{end} ({len(used)} ports used)"
+    )
+
+
+def _server_props_from_config(*, server: Server, port: int, db: Session | None = None) -> BedrockServerProperties:
     cfg = dict(server.mc_config or {})
     server_name = str(cfg.get("server_name") or server.world_name)
+    max_players = clamp_max_players(cfg.get("max_players"), db=db, server=server)
     return BedrockServerProperties(
         server_name=server_name,
         gamemode=cfg.get("gamemode"),
         difficulty=cfg.get("difficulty"),
-        max_players=cfg.get("max_players"),
+        max_players=max_players,
         allow_cheats=cfg.get("allow_cheats"),
         online_mode=False,
         level_name=cfg.get("level_name") or server.world_name,
@@ -694,18 +672,14 @@ def _server_props_from_config(*, server: Server, port: int) -> BedrockServerProp
     )
 
 
-def _java_server_properties_from_config(*, server: Server, port: int) -> JavaServerProperties:
+def _java_server_properties_from_config(*, server: Server, port: int, db: Session | None = None) -> JavaServerProperties:
     cfg = dict(server.mc_config or {})
-    online_mode = cfg.get("online_mode")
-    if online_mode is None:
-        online_mode = False
-
-    import uuid
+    max_players = clamp_max_players(cfg.get("max_players"), db=db, server=server, default=20) or 1
 
     return JavaServerProperties(
         server_port=port,
         motd=cfg.get("motd") or server.world_name,
-        max_players=cfg.get("max_players") or 20,
+        max_players=max_players,
         gamemode=cfg.get("gamemode") or "survival",
         difficulty=cfg.get("difficulty") or "normal",
         online_mode=False,  # Enforced via JVM flag; property rewritten by server anyway
@@ -804,8 +778,16 @@ def create_server(
     settings = get_settings()
     _guard_disk_for_operation("create_server")
 
-    
-    
+    max_servers = settings.max_servers_per_user
+    if max_servers > 0:
+        owned = db.execute(
+            select(func.count()).select_from(Server).where(Server.owner_id == user.id)
+        ).scalar_one()
+        if owned >= max_servers:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Server limit reached ({max_servers}). Delete an existing server or contact support.",
+            )
 
     config = payload.config.model_dump(exclude_none=True) if payload.config else {}
     config.pop("bedrock_image", None)  # Docker-only field, never accepted
@@ -817,12 +799,20 @@ def create_server(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    node = select_best_node(db)
+    # Unpaid servers reserve 0 RAM until a plan is active; still place on freest node.
+    node = select_best_node(db, required_ram_mb=0)
     if settings.production_mode and not node:
-        raise HTTPException(
-            status_code=503,
-            detail="No online worker node is available. Check agent registration and heartbeat.",
-        )
+        from blockhost_backend.services.node_capacity import auto_wakeup_offline_node
+        if auto_wakeup_offline_node(db):
+            raise HTTPException(
+                status_code=503,
+                detail="Network is scaling up! A new node is booting to handle your server. Please wait 60 seconds and try again.",
+            )
+        else:
+            raise HTTPException(
+                status_code=503,
+                detail="No worker nodes are available (and none can be booted). Check agent registration.",
+            )
     node_id = node.id if node else None
 
     try:
@@ -830,6 +820,8 @@ def create_server(
     except Exception as e:
         proto = "UDP" if payload.flavor == ServerFlavor.BEDROCK else "TCP"
         raise HTTPException(status_code=503, detail=f"Failed to allocate {proto} port: {e}")
+
+    proxy_port = _allocate_proxy_port(db)
 
     server = Server(
         owner_id=user.id,
@@ -840,6 +832,7 @@ def create_server(
         vm_provider=VMProvider.local_bedrock if payload.flavor == ServerFlavor.BEDROCK else VMProvider.local_java, 
         vm_ipv4=node.ip_address if node else None,
         vm_port=port,
+        proxy_port=proxy_port,
         mc_config=config,
         flavor=payload.flavor,
         mc_version=payload.mc_version,
@@ -898,7 +891,7 @@ def _provision_java_server(server_id: str, jar_url: str, jar_path_str: str, serv
         with SessionLocal() as db:
             server = db.get(Server, server_uuid)
             if server:
-                props = _java_server_properties_from_config(server=server, port=port)
+                props = _java_server_properties_from_config(server=server, port=port, db=db)
                 props_path = server_dir / "server.properties"
                 write_java_server_properties(props_path, props)
                 set_java_server_property(props_path, "online-mode", False)
@@ -1055,87 +1048,7 @@ def switch_server_software(
     return ServerActionResponse(id=server.id, state=server.state)
 
 
-def _discover_filesystem_servers(*, servers_dir: Path, db: Session) -> list[Server]:
-    """
-    Discover server folders on the filesystem that have no database entry.
 
-    SECURITY: Orphan dirs are NOT automatically assigned to any user.
-    They are recorded with owner_id=None (or skipped if the schema requires
-    a non-null owner) so an admin can review them.  A regular user can never
-    claim a server they didn't create just by being the first to call list_servers.
-    """
-    discovered = []
-    if not servers_dir.exists():
-        return discovered
-
-    existing_ids = {
-        str(s) for s in db.execute(select(Server.id)).scalars().all()
-    }
-
-    for server_dir in servers_dir.iterdir():
-        if not server_dir.is_dir():
-            continue
-
-        server_id_str = server_dir.name
-        try:
-            server_uuid = uuid.UUID(server_id_str)
-        except (ValueError, AttributeError):
-            continue
-
-        if server_id_str in existing_ids:
-            continue
-
-        # Path traversal guard: confirm the dir is truly inside servers_dir
-        try:
-            server_dir.resolve().relative_to(servers_dir.resolve())
-        except ValueError:
-            logger.warning("Skipping suspicious server dir: %s", server_dir)
-            continue
-
-        props_file = server_dir / "server.properties"
-        world_name = "Unnamed Server"
-        port = 19132
-
-        if props_file.exists():
-            try:
-                content = props_file.read_text(encoding="utf-8")
-                for line in content.split("\n"):
-                    if line.startswith("level-name="):
-                        world_name = line.split("=", 1)[1].strip()
-                    elif line.startswith("server-port="):
-                        try:
-                            port = int(line.split("=", 1)[1].strip())
-                        except ValueError:
-                            pass
-            except Exception:
-                pass
-
-        # Record without an owner — do NOT auto-assign to requesting user.
-        # owner_id=None means only admins can see/claim this server.
-        # If your schema requires owner_id to be non-null, log and skip instead.
-        logger.warning(
-            "Discovered orphan server dir %s (id=%s) — not auto-assigned to any user",
-            server_dir, server_uuid,
-        )
-        # Uncomment below only if your schema allows nullable owner_id:
-        # new_server = Server(
-        #     id=server_uuid,
-        #     owner_id=None,
-        #     world_name=world_name,
-        #     join_code="",
-        #     state=ServerState.suspended,
-        #     vm_provider=VMProvider.local_bedrock,
-        #     vm_ipv4=get_settings().minecraft_public_host,
-        #     vm_port=port,
-        #     mc_config={"server_dir": str(server_dir)},
-        # )
-        # db.add(new_server)
-        # discovered.append(new_server)
-
-    if discovered:
-        db.commit()
-
-    return discovered
 
 
 @router.get("", response_model=list[ServerOut])
@@ -1148,11 +1061,6 @@ def list_servers(
     if cached is not None:
         return cached
 
-    # Run discovery first (logs orphans, does not assign them to this user)
-    _, servers_dir, _ = _server_dirs()
-    _discover_filesystem_servers(servers_dir=servers_dir, db=db)
-
-    # Fetch after discovery so the query reflects any newly committed rows
     servers = db.execute(
         select(Server).where(Server.owner_id == user.id)
     ).scalars().all()
@@ -1205,43 +1113,45 @@ def _provision_remote_server(server: Server, server_dir: Path, db: Session, vers
         version_dir=version_dir,
     )
 
-@router.post("/{server_id}/start", response_model=ServerActionResponse)
-def start_server(
-    server_id: str,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> ServerActionResponse:
-    server = _get_server_for_user(server_id, user, db, required_permission="start_stop")
-
-    is_actually_running = False
-    if server.state == ServerState.running:
-        is_actually_running = _ORCHESTRATOR.is_running(str(server.id))
-
-    if is_actually_running:
-        return ServerActionResponse(id=server.id, state=server.state)
-
+def _do_start_server(server: Server, db: Session) -> None:
     settings = get_settings()
 
-    # Automatic Failover: if assigned node is offline, detach the server
+    # Automatic Failover: if assigned node is offline or starting, detach the server
     if server.node_id:
         node = db.get(Node, server.node_id)
-        if not node or node.status == "offline":
+        if not node or node.status in (NodeState.offline, NodeState.starting):
             server.node_id = None
             server.vm_ipv4 = None
             server.vm_port = None
             db.commit()
 
     if not server.node_id:
-        node = select_best_node(db)
+        limits = get_effective_server_resource_limits(db=db, server=server)
+        required_ram = int(limits.get("ram_mb") or 0)
+        node = select_best_node(db, required_ram_mb=required_ram)
         if node:
             server.node_id = node.id
             server.vm_ipv4 = node.ip_address
+            server.state = ServerState.provisioning # Reserve RAM before lock release
+            refresh_node_allocated_ram(db, node.id)
+            # We must re-allocate a fresh port on the new node
+            try:
+                server.vm_port = _allocate_port(db=db, flavor=server.flavor, node_id=server.node_id)
+            except Exception as e:
+                raise HTTPException(status_code=503, detail=f"Failed to allocate port on new node: {e}")
             db.commit()
         elif settings.production_mode:
-            raise HTTPException(
-                status_code=503,
-                detail="Server is not assigned to a worker node. Recreate it after the agent is online.",
-            )
+            from blockhost_backend.services.node_capacity import auto_wakeup_offline_node
+            if auto_wakeup_offline_node(db):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Network is scaling up! A new node is booting. Please wait 60 seconds and try again.",
+                )
+            else:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Server is not assigned to a worker node. No capacity is currently available.",
+                )
     is_java = is_java_flavor(server.flavor)
 
     try:
@@ -1266,7 +1176,26 @@ def start_server(
         server.state = ServerState.suspended
         _drop_server_stats_snapshot(str(server.id))
         label = "Java" if is_java else "Bedrock"
+        logger.exception(f"Failed to start {label} process")
         raise HTTPException(status_code=503, detail=f"Failed to start {label} process: {e}")
+
+
+@router.post("/{server_id}/start", response_model=ServerActionResponse)
+def start_server(
+    server_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ServerActionResponse:
+    server = _get_server_for_user(server_id, user, db, required_permission="start_stop")
+
+    is_actually_running = False
+    if server.state == ServerState.running:
+        is_actually_running = _ORCHESTRATOR.is_running(str(server.id))
+
+    if is_actually_running:
+        return ServerActionResponse(id=server.id, state=server.state)
+
+    _do_start_server(server, db)
 
     db.commit()
     _drop_server_stats_snapshot(str(server.id))
@@ -1289,6 +1218,50 @@ def stop_server(
     return ServerActionResponse(id=server.id, state=server.state)
 
 
+@router.delete("/{server_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_server(
+    server_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    """Stop, purge agent files, remove DB row, and delete the S3 migration snapshot."""
+    server = _get_server_for_user(server_id, user, db, required_permission="start_stop")
+    sid = str(server.id)
+    server_uuid = server.id
+    node_id = server.node_id
+    owner_id = server.owner_id
+
+    try:
+        if server.state == ServerState.running:
+            _stop_server_process(server)
+    except Exception:
+        logger.exception("Failed to stop server %s before delete", sid)
+
+    if node_id:
+        node = db.get(Node, node_id)
+        if node and node.ip_address:
+            try:
+                from blockhost_backend.runtime.agent_runtime import AgentRuntime
+
+                AgentRuntime(
+                    agent_base_url=f"http://{node.ip_address}:{node.agent_port}",
+                    agent_token=get_settings().worker_agent_token,
+                ).purge_server_data(sid)
+            except Exception:
+                logger.exception("Failed to purge agent data for %s on node %s", sid, node.name)
+
+    db.delete(server)
+    db.commit()
+
+    if node_id:
+        refresh_node_allocated_ram(db, node_id)
+        db.commit()
+
+    delete_migration_snapshot(sid)
+    _drop_server_stats_snapshot(sid)
+    _invalidate_server_read_cache(owner_id, server_uuid)
+
+
 @router.post("/{server_id}/toggle", response_model=ServerActionResponse)
 def toggle_server(
     server_id: str,
@@ -1301,53 +1274,10 @@ def toggle_server(
     if server.state == ServerState.running:
         is_actually_running = _ORCHESTRATOR.is_running(str(server.id))
 
-    settings = get_settings()
     if is_actually_running:
         _stop_server_process(server)
     else:
-        # Automatic Failover: if assigned node is offline, detach the server
-        if server.node_id:
-            node = db.get(Node, server.node_id)
-            if not node or node.status == "offline":
-                server.node_id = None
-                server.vm_ipv4 = None
-                server.vm_port = None
-                db.commit()
-
-        if not server.node_id:
-            node = select_best_node(db)
-            if node:
-                server.node_id = node.id
-                server.vm_ipv4 = node.ip_address
-                db.commit()
-            elif settings.production_mode:
-                raise HTTPException(
-                    status_code=503,
-                    detail="Server is not assigned to a worker node. Recreate it after the agent is online.",
-                )
-        is_java = is_java_flavor(server.flavor)
-        try:
-            if is_java:
-                _prepare_java_server_for_start(server=server, db=db)
-            else:
-                _prepare_bedrock_server_for_start(server=server, db=db)
-            _start_server_process(server=server, settings=settings, db=db)
-        except BillingError as e:
-            server.state = ServerState.suspended
-            _drop_server_stats_snapshot(str(server.id))
-            raise HTTPException(
-                status_code=402, detail={"error": e.code, "message": e.message}
-            )
-        except HTTPException:
-            raise
-        except Exception as e:
-            server.state = ServerState.suspended
-            _drop_server_stats_snapshot(str(server.id))
-            label = "Java" if is_java else "Bedrock"
-            logger.exception(f"Failed to start {label} process")
-            raise HTTPException(
-                status_code=503, detail=f"Failed to start {label} process: {e}"
-            )
+        _do_start_server(server, db)
 
     db.commit()
     _drop_server_stats_snapshot(str(server.id))
@@ -1395,6 +1325,15 @@ def update_server_config(
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
 
+    if "max_players" in update:
+        capped = clamp_max_players(update.get("max_players"), db=db, server=server)
+        if capped is None:
+            raise HTTPException(
+                status_code=402,
+                detail="An active subscription is required to set max players.",
+            )
+        update["max_players"] = capped
+
     current.update(update)
     server.mc_config = current
 
@@ -1415,7 +1354,7 @@ def update_server_config(
             else:
                 props_dict = {
                     "motd": update.get("motd") or server.world_name,
-                    "max-players": update.get("max_players") or 20,
+                    "max-players": update.get("max_players") or clamp_max_players(None, db=db, server=server, default=20),
                     "gamemode": update.get("gamemode") or "survival",
                     "difficulty": update.get("difficulty") or "normal",
                     "level-name": update.get("level_name") or server.world_name,
@@ -1465,9 +1404,24 @@ def update_server_properties(
         raise HTTPException(status_code=400, detail=f"Cannot modify protected properties: {', '.join(sorted(blocked))}")
 
     server = _get_server_for_user(server_id, user, db, required_permission="config")
-    
+
+    sanitized = dict(props)
+    for key in ("max-players", "max_players"):
+        if key in sanitized:
+            try:
+                requested = int(sanitized[key])  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=422, detail=f"Invalid {key} value")
+            capped = clamp_max_players(requested, db=db, server=server)
+            if capped is None:
+                raise HTTPException(
+                    status_code=402,
+                    detail="An active subscription is required to set max players.",
+                )
+            sanitized[key] = capped
+
     try:
-        _ORCHESTRATOR.update_properties(str(server.id), props)
+        _ORCHESTRATOR.update_properties(str(server.id), sanitized)
         return {"status": "ok", "restart_required": True}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Failed to update properties on server node: {e}")
@@ -1572,6 +1526,10 @@ async def console_websocket(
                             command = str(msg["command"]).replace("\r", "").replace("\n", " ").strip()
                             if command and len(command) <= 512:
                                 _ORCHESTRATOR.send_command(server_id, command)
+                                from blockhost_backend.database.schema import utcnow
+                                server.last_activity = utcnow()
+                                db.add(server)
+                                db.commit()
                     except json.JSONDecodeError:
                         pass
             except WebSocketDisconnect:
@@ -1593,303 +1551,25 @@ async def console_websocket(
 
 
 
-def _require_server(server_id: str, user: User, db: Session) -> Server:
-    server = _get_server_for_user(server_id, user, db, required_permission="console")
-    return server
 
-def _send_cmd(server_id: str, cmd: str) -> dict:
+
+def _send_cmd(server: Server, cmd: str, db: Session) -> dict:
     try:
-        _ORCHESTRATOR.send_command(server_id, cmd)
+        _ORCHESTRATOR.send_command(str(server.id), cmd)
+        from blockhost_backend.database.schema import utcnow
+        server.last_activity = utcnow()
+        db.add(server)
+        db.commit()
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"status": "ok"}
 
 
-@router.post("/{server_id}/teleport")
-def command_teleport(server_id: str, req: CommandRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_server(server_id, user, db)
-    if not req.player:
-        raise HTTPException(status_code=400, detail="Target player is required")
-    return _send_cmd(server_id, f"tp {req.player} {req.x} {req.y} {req.z}")
-
-@router.post("/{server_id}/clear-inventory")
-def command_clear_inventory(server_id: str, req: CommandRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_server(server_id, user, db)
-    if not req.player:
-        raise HTTPException(status_code=400, detail="Target player is required")
-    return _send_cmd(server_id, f"clear {req.player}")
-
-@router.post("/{server_id}/ban")
-def command_ban(server_id: str, req: CommandRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_server(server_id, user, db)
-    if not req.player:
-        raise HTTPException(status_code=400, detail="Target player is required")
-    cmd = f"ban {req.player}"
-    if req.message:
-        cmd += f" {req.message}"
-    return _send_cmd(server_id, cmd)
-
-@router.post("/{server_id}/kick")
-def command_kick(server_id: str, req: CommandRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_server(server_id, user, db)
-    if not req.player:
-        raise HTTPException(status_code=400, detail="Target player is required")
-    cmd = f"kick {req.player}"
-    if req.message:
-        cmd += f" {req.message}"
-    return _send_cmd(server_id, cmd)
-
-@router.post("/{server_id}/op")
-def command_op(server_id: str, req: CommandRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_server(server_id, user, db)
-    if not req.player:
-        raise HTTPException(status_code=400, detail="Target player is required")
-    cmd = "op" if req.grant else "deop"
-    return _send_cmd(server_id, f"{cmd} {req.player}")
-
-@router.post("/{server_id}/gamemode")
-def command_gamemode(server_id: str, req: CommandRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_server(server_id, user, db)
-    if not req.player:
-        raise HTTPException(status_code=400, detail="Target player is required")
-    return _send_cmd(server_id, f"gamemode {req.mode} {req.player}")
-
-@router.post("/{server_id}/time")
-def command_time(server_id: str, req: CommandRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_server(server_id, user, db)
-    return _send_cmd(server_id, f"time set {req.value}")
-
-@router.post("/{server_id}/weather")
-def command_weather(server_id: str, req: CommandRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_server(server_id, user, db)
-    return _send_cmd(server_id, f"weather {req.weather}")
-
-@router.post("/{server_id}/say")
-def command_say(server_id: str, req: CommandRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_server(server_id, user, db)
-    return _send_cmd(server_id, f"say {req.message}")
-
-
-@router.get("/{server_id}/bans", response_model=BanListOut)
-def list_bans(server_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    server = _require_server(server_id, user, db)
-    _expire_expired_bans(server.id, db)
-    bans = db.scalars(
-        select(Ban)
-        .where(Ban.server_id == server.id, Ban.active == True)
-        .order_by(Ban.banned_at.desc())
-    ).all()
-    return BanListOut(items=[_ban_to_out(ban) for ban in bans])
-
-
-@router.get("/{server_id}/bans/history", response_model=BanListOut)
-def list_ban_history(server_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    server = _require_server(server_id, user, db)
-    _expire_expired_bans(server.id, db)
-    bans = db.scalars(
-        select(Ban)
-        .where(Ban.server_id == server.id)
-        .order_by(Ban.banned_at.desc())
-    ).all()
-    return BanListOut(items=[_ban_to_out(ban) for ban in bans])
-
-
-@router.get("/{server_id}/bans/check", response_model=BanCheckResponse)
-def check_ban(server_id: str, xuid: str = Query(..., min_length=1), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    server = _require_server(server_id, user, db)
-    ban = _resolve_active_ban(server.id, xuid, db)
-    if not ban:
-        return BanCheckResponse(banned=False)
-    return BanCheckResponse(
-        banned=True,
-        ban_id=ban.id,
-        xuid=ban.xuid,
-        player_name=ban.player_name,
-        reason=ban.reason,
-        expires_at=ban.expires_at,
-        active=ban.active,
-    )
-
-
-@router.post("/{server_id}/bans", response_model=BanOut)
-def create_ban(server_id: str, payload: BanCreateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    server = _require_server(server_id, user, db)
-    expires_at = payload.expires_at
-    if expires_at is None and payload.duration_seconds is not None:
-        expires_at = datetime.now(timezone.utc) + timedelta(seconds=payload.duration_seconds)
-    if expires_at is not None and expires_at <= datetime.now(timezone.utc):
-        raise HTTPException(status_code=400, detail="Expiration must be in the future")
-
-    existing = db.scalars(
-        select(Ban)
-        .where(Ban.server_id == server.id, Ban.xuid == payload.xuid, Ban.active == True)
-        .limit(1)
-    ).one_or_none()
-    if existing:
-        raise HTTPException(status_code=409, detail="Player is already banned")
-
-    ban = Ban(
-        server_id=server.id,
-        xuid=payload.xuid,
-        player_name=payload.player_name,
-        reason=payload.reason,
-        active=True,
-        expires_at=expires_at,
-        created_by_user_id=user.id,
-    )
-    db.add(ban)
-    db.commit()
-    db.refresh(ban)
-
-    from blockhost_backend.services.ban_service import ban_service
-    ban_service.kick_player_if_online(str(server.id), payload.xuid, payload.player_name, payload.reason, _ORCHESTRATOR)
-
-    return _ban_to_out(ban)
-
-
-@router.delete("/{server_id}/bans/{ban_id}", response_model=BanOut)
-def delete_ban(server_id: str, ban_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    server = _require_server(server_id, user, db)
-    try:
-        ban_uuid = uuid.UUID(ban_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Ban not found")
-    ban = db.get(Ban, ban_uuid)
-    if not ban or ban.server_id != server.id:
-        raise HTTPException(status_code=404, detail="Ban not found")
-    if ban.active:
-        ban.active = False
-        ban.unbanned_at = datetime.now(timezone.utc)
-        ban.unbanned_by_user_id = user.id
-        db.add(ban)
-        db.commit()
-        db.refresh(ban)
-    return _ban_to_out(ban)
 
 
 @router.get("/{server_id}/blocklist")
 def get_blocklist(server_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_server(server_id, user, db)
+    _get_server_for_user(server_id, user, db, required_permission="console")
     # Mocking blocklist for now, since vanilla BDS doesn't track this neatly via command
     return {"players": []}
 
-
-@router.post("/{server_id}/collaborators", response_model=ServerCollaboratorOut)
-def invite_collaborator(
-    server_id: str,
-    payload: ServerCollaboratorCreate,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-        
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=403, detail="Only the server owner can manage collaborators")
-        
-    target_user = db.execute(select(User).where(User.email == payload.email)).scalars().first()
-    if not target_user:
-        raise HTTPException(status_code=404, detail="User with this email not found")
-        
-    if target_user.id == user.id:
-        raise HTTPException(status_code=400, detail="Cannot invite yourself")
-        
-    collab = db.execute(
-        select(ServerCollaborator).where(
-            ServerCollaborator.server_id == server.id,
-            ServerCollaborator.user_id == target_user.id
-        )
-    ).scalars().first()
-    
-    if collab:
-        # Update existing
-        collab.permissions = payload.permissions
-    else:
-        collab = ServerCollaborator(
-            server_id=server.id,
-            user_id=target_user.id,
-            permissions=payload.permissions
-        )
-        db.add(collab)
-        
-    db.commit()
-    db.refresh(collab)
-    
-    return ServerCollaboratorOut(
-        id=collab.id,
-        server_id=collab.server_id,
-        user_id=collab.user_id,
-        nickname=target_user.nickname,
-        email=target_user.email,
-        permissions=collab.permissions,
-        created_at=collab.created_at,
-        updated_at=collab.updated_at
-    )
-
-@router.get("/{server_id}/collaborators", response_model=list[ServerCollaboratorOut])
-def list_collaborators(
-    server_id: str,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    try:
-        server_uuid = uuid.UUID(server_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Server not found")
-        
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=403, detail="Only the server owner can view collaborators")
-        
-    collabs = db.execute(
-        select(ServerCollaborator).where(ServerCollaborator.server_id == server.id)
-    ).scalars().all()
-    
-    results = []
-    for c in collabs:
-        # We need the user info, we can access c.user since we have relationship configured
-        results.append(
-            ServerCollaboratorOut(
-                id=c.id,
-                server_id=c.server_id,
-                user_id=c.user_id,
-                nickname=c.user.nickname,
-                email=c.user.email,
-                permissions=c.permissions,
-                created_at=c.created_at,
-                updated_at=c.updated_at
-            )
-        )
-    return results
-
-@router.delete("/{server_id}/collaborators/{user_id}", status_code=204)
-def remove_collaborator(
-    server_id: str,
-    user_id: str,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    try:
-        server_uuid = uuid.UUID(server_id)
-        target_user_uuid = uuid.UUID(user_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Not found")
-        
-    server = db.get(Server, server_uuid)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=403, detail="Only the server owner can manage collaborators")
-        
-    collab = db.execute(
-        select(ServerCollaborator).where(
-            ServerCollaborator.server_id == server.id,
-            ServerCollaborator.user_id == target_user_uuid
-        )
-    ).scalars().first()
-    
-    if collab:
-        db.delete(collab)
-        db.commit()
-    return None

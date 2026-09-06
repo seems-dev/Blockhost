@@ -6,13 +6,13 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from blockhost_backend.api.deps import get_admin_user
 from blockhost_backend.config.config_manager import get_settings
 from blockhost_backend.database.db import SessionLocal, get_db
-from blockhost_backend.database.schema import Node, NodeState, User, utcnow
+from blockhost_backend.database.schema import Node, NodeState, Server, User, utcnow
 from blockhost_backend.services.node_auth import (
     generate_agent_token,
     hash_agent_token,
@@ -121,7 +121,12 @@ async def node_agent_websocket(
                 db.commit()
                 db.refresh(node_obj)
             else:
-                node_obj.ip_address = node_ip
+                if node_obj.ip_address != node_ip:
+                    node_obj.ip_address = node_ip
+                    # Sync new IP to all servers on this node
+                    from sqlalchemy import update
+                    from blockhost_backend.database.schema import Server
+                    db.execute(update(Server).where(Server.node_id == node_obj.id).values(vm_ipv4=node_ip))
                 node_obj.agent_port = node_port
 
             if not verify_node_agent_token(node=node_obj, token=token):
@@ -139,7 +144,33 @@ async def node_agent_websocket(
                 await websocket.close(code=4003, reason="Node not approved")
                 return
 
+            if node_obj.status == NodeState.offline:
+                logger.warning("Node '%s' reconnecting from offline state. Initiating split-brain recovery.", node_name)
+                import httpx
+                agent_port = data.get("agent_port", 9000)
+                try:
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        resp = await client.post(
+                            f"http://{node_ip}:{agent_port}/agent/halt-all",
+                            headers={"Authorization": f"Bearer {AGENT_TOKEN}"}
+                        )
+                        resp.raise_for_status()
+                        logger.info("Split-brain recovery successful for node '%s'. Orphaned processes halted.", node_name)
+                except Exception as e:
+                    logger.error("Failed to halt orphaned processes on node '%s': %s", node_name, e)
+                    await websocket.close(code=4003, reason="Split-brain recovery failed")
+                    return
+                
+                # Update DB state for all servers on this node to suspended
+                from blockhost_backend.database.schema import ServerState
+                db.execute(
+                    update(Server)
+                    .where(Server.node_id == node_obj.id, Server.state == ServerState.running)
+                    .values(state=ServerState.suspended)
+                )
+
             node_obj.status = NodeState.online
+            node_obj.status_updated_at = utcnow()
             node_obj.last_heartbeat = utcnow()
             db.commit()
             node_id = node_obj.id
@@ -170,6 +201,37 @@ async def node_agent_websocket(
                 node_obj.cpu_cores = stats["cpu_cores"]
                 node_obj.last_heartbeat = utcnow()
                 refresh_node_allocated_ram(db, node_obj.id)
+                
+                # Update last_activity and players_online for active servers
+                running_servers = stats.get("running_servers", {})
+                
+                # First reset players_online to 0 for all servers on this node
+                db.execute(
+                    update(Server)
+                    .where(Server.node_id == node_obj.id)
+                    .values(players_online=0)
+                )
+
+                if running_servers:
+                    for sid, count in running_servers.items():
+                        try:
+                            server_uuid = uuid.UUID(sid)
+                            # Update players_online for all, but last_activity only if count > 0
+                            if count > 0:
+                                db.execute(
+                                    update(Server)
+                                    .where(Server.id == server_uuid)
+                                    .values(players_online=count, last_activity=utcnow())
+                                )
+                            else:
+                                db.execute(
+                                    update(Server)
+                                    .where(Server.id == server_uuid)
+                                    .values(players_online=0)
+                                )
+                        except ValueError:
+                            pass
+                
                 db.commit()
 
     except WebSocketDisconnect:

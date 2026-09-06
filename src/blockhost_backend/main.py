@@ -16,6 +16,10 @@ from blockhost_backend.api import legal as legal_routes
 from blockhost_backend.api import nodes as nodes_routes
 from blockhost_backend.api import mods as mods_routes
 from blockhost_backend.api import servers as server_routes
+from blockhost_backend.api import servers_commands as server_commands_routes
+from blockhost_backend.api import servers_bans as server_bans_routes
+from blockhost_backend.api import servers_collaborators as server_collaborators_routes
+from blockhost_backend.api import servers_migration as server_migration_routes
 from blockhost_backend.api import versions as versions_routes
 from blockhost_backend.api.software import router as software_router
 from blockhost_backend.config.config_manager import get_cors_origins, get_settings
@@ -67,6 +71,10 @@ def create_app() -> FastAPI:
     app.include_router(admin_routes.router)
     app.include_router(backup_routes.router)
     app.include_router(server_routes.router)
+    app.include_router(server_commands_routes.router)
+    app.include_router(server_bans_routes.router)
+    app.include_router(server_collaborators_routes.router)
+    app.include_router(server_migration_routes.router)
     app.include_router(versions_routes.router)
     app.include_router(files_routes.router)
     app.include_router(billing_routes.router)

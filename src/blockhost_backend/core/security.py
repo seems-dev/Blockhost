@@ -36,30 +36,25 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def create_access_token(*, subject: str, expires_seconds: int) -> str:
+def _create_token(*, subject: str, expires_seconds: int, token_type: str) -> str:
     settings = get_settings()
     now = _utcnow()
     payload = {
         "sub": subject,
-        "type": "access",
+        "type": token_type,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=expires_seconds)).timestamp()),
         "jti": str(uuid.uuid4()),
     }
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+
+
+def create_access_token(*, subject: str, expires_seconds: int) -> str:
+    return _create_token(subject=subject, expires_seconds=expires_seconds, token_type="access")
 
 
 def create_refresh_token(*, subject: str, expires_seconds: int) -> str:
-    settings = get_settings()
-    now = _utcnow()
-    payload = {
-        "sub": subject,
-        "type": "refresh",
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(seconds=expires_seconds)).timestamp()),
-        "jti": str(uuid.uuid4()),
-    }
-    return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+    return _create_token(subject=subject, expires_seconds=expires_seconds, token_type="refresh")
 
 
 class TokenError(Exception):

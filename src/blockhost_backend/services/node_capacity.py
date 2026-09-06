@@ -64,7 +64,7 @@ def refresh_all_nodes_allocated_ram(db: Session) -> None:
 
 
 def select_best_node(db: Session, *, required_ram_mb: int = 0) -> Node | None:
-    """Pick the online, non-draining node with the most free allocated RAM."""
+    """Pick the online, non-draining node with the most free active RAM."""
     now = utcnow()
     candidates = db.execute(
         select(Node).where(
@@ -77,7 +77,18 @@ def select_best_node(db: Session, *, required_ram_mb: int = 0) -> Node | None:
     for node in candidates:
         if not is_node_heartbeat_fresh(node, now=now):
             continue
-        free = node.total_ram_mb - node.used_ram_mb
+            
+        # ONLY calculate the RAM of active servers (running + provisioning)
+        active_servers = db.execute(
+            select(Server).where(
+                Server.node_id == node.id,
+                Server.state.in_([ServerState.running, ServerState.provisioning])
+            )
+        ).scalars().all()
+        
+        active_ram = sum(s.ram_mb for s in active_servers if s.ram_mb)
+        free = node.total_ram_mb - active_ram
+        
         if free < required_ram_mb:
             continue
         if free > best_free:

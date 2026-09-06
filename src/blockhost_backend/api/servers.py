@@ -805,8 +805,8 @@ def create_server(
         from blockhost_backend.services.node_capacity import auto_wakeup_offline_node
         if auto_wakeup_offline_node(db):
             raise HTTPException(
-                status_code=503,
-                detail="Network is scaling up! A new node is booting to handle your server. Please wait 60 seconds and try again.",
+                status_code=202,
+                detail="Network is scaling up! A new server node is booting for you. Please wait 60 seconds and try creating your server again.",
             )
         else:
             raise HTTPException(

@@ -1526,6 +1526,10 @@ async def console_websocket(
                             command = str(msg["command"]).replace("\r", "").replace("\n", " ").strip()
                             if command and len(command) <= 512:
                                 _ORCHESTRATOR.send_command(server_id, command)
+                                from blockhost_backend.database.schema import utcnow
+                                server.last_activity = utcnow()
+                                db.add(server)
+                                db.commit()
                     except json.JSONDecodeError:
                         pass
             except WebSocketDisconnect:
@@ -1549,9 +1553,13 @@ async def console_websocket(
 
 
 
-def _send_cmd(server_id: str, cmd: str) -> dict:
+def _send_cmd(server: Server, cmd: str, db: Session) -> dict:
     try:
-        _ORCHESTRATOR.send_command(server_id, cmd)
+        _ORCHESTRATOR.send_command(str(server.id), cmd)
+        from blockhost_backend.database.schema import utcnow
+        server.last_activity = utcnow()
+        db.add(server)
+        db.commit()
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"status": "ok"}

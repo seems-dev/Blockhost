@@ -51,6 +51,8 @@ class ServerState(str, enum.Enum):
     running = "running"
     syncing = "syncing"
     suspended = "suspended"
+    suspending = "suspending"
+    migrating = "migrating"
 
 
 class VMProvider(str, enum.Enum):

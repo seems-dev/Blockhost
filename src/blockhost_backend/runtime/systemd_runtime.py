@@ -151,6 +151,7 @@ class SystemdRuntime:
             "--property", f"CPUQuota={request.cpu_quota_pct}%",
             "--property", "MemoryAccounting=yes",
             "--property", "CPUAccounting=yes",
+            "--property", "IPAccounting=yes",
             "--property", "TasksMax=512",
             "--property", "Restart=on-failure",
             "--property", "StartLimitBurst=3",

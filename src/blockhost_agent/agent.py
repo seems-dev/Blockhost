@@ -118,6 +118,7 @@ class StartPayload(BaseModel):
     jdk_path: str | None = None  # NEW
     server_properties_dict: dict[str, str | int | bool] | None = None
     jar_download_url: str | None = None
+    storage_mb: int = 0
 
 
 class CommandPayload(BaseModel):
@@ -194,6 +195,19 @@ def start_server(
     _validate_server_id(server_id)
     server_dir = SERVERS_ROOT_DIR / server_id
     server_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Enforce XFS Project Quota if storage limits are provided
+    if payload.storage_mb > 0:
+        try:
+            import subprocess
+            project_id = uuid.UUID(server_id).int & 0xFFFFFFFF
+            quota_bytes = payload.storage_mb * 1024 * 1024
+            subprocess.run(["xfs_quota", "-x", "-c", f"project -s -p {server_dir} {project_id}", "/"], check=False)
+            subprocess.run(["xfs_quota", "-x", "-c", f"limit -p bsoft={quota_bytes} bhard={quota_bytes} {project_id}", "/"], check=False)
+            logger.info("Enforced XFS quota of %sMB for server %s", payload.storage_mb, server_id)
+        except Exception as e:
+            logger.warning("Failed to apply XFS quota for %s: %s", server_id, e)
+
     is_java = bool(payload.jar_download_url) or (payload.executable_path and payload.executable_path.endswith(".jar"))
 
     if payload.server_properties_dict is not None:

@@ -91,12 +91,16 @@ class Settings(BaseSettings):
     razorpay_key_id: str = ""
     razorpay_key_secret: str = ""          # matches RAZORPAY_KEY_SECRET in .env
     razorpay_webhook_secret: str = ""     # matches RAZORPAY_WEBHOOK_SECRET in .env
+    
+    stripe_secret_key: str = ""
+    stripe_webhook_secret: str = ""
 
     # AWS S3 – world backup storage for durability & cross-node migration
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
     aws_region: str = "ap-southeast-2"
     s3_backup_bucket_name: str = ""
+    aws_agent_sg_id: str = ""  # Security Group ID for Egress firewall
 
     # Game Proxy – stable player-facing addresses across node migrations
     proxy_enabled: bool = False

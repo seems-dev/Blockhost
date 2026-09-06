@@ -27,6 +27,14 @@ class AwsEc2Provider(CloudProvider):
         try:
             logger.info("Starting AWS EC2 instance: %s", instance_id)
             self.ec2.start_instances(InstanceIds=[instance_id])
+            
+            settings = get_settings()
+            if settings.aws_agent_sg_id:
+                logger.info("Enforcing Agent Security Group %s on %s", settings.aws_agent_sg_id, instance_id)
+                self.ec2.modify_instance_attribute(
+                    InstanceId=instance_id,
+                    Groups=[settings.aws_agent_sg_id]
+                )
         except Exception as e:
             logger.error("Failed to start EC2 instance %s: %s", instance_id, e)
             raise

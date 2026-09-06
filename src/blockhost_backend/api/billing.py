@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+import stripe
+
 from blockhost_backend.api.deps import get_current_user
 from blockhost_backend.config.config_manager import get_settings
 from blockhost_backend.database.db import get_db
@@ -238,6 +240,46 @@ def get_server_subscription(
             "expires_at": sub.expires_at.isoformat(),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Stripe Webhook
+# ---------------------------------------------------------------------------
+
+@router.post("/webhook/stripe")
+async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
+    settings = get_settings()
+    stripe.api_key = settings.stripe_secret_key
+    webhook_secret = settings.stripe_webhook_secret
+
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, webhook_secret
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError as e:
+        logger.warning("Stripe webhook: invalid signature")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    logger.info("Stripe webhook received event: %s", event["type"])
+    
+    # Example logic for Stripe webhooks. In reality, you'd map these to the DB.
+    if event["type"] == "customer.subscription.deleted":
+        sub = event["data"]["object"]
+        # In a real app, map stripe subscription ID to internal ID and cancel it
+        logger.info(f"Subscription deleted: {sub['id']}")
+    elif event["type"] == "invoice.payment_failed":
+        invoice = event["data"]["object"]
+        logger.info(f"Payment failed: {invoice['id']}")
+    elif event["type"] == "invoice.paid":
+        invoice = event["data"]["object"]
+        logger.info(f"Payment succeeded: {invoice['id']}")
+
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------

@@ -865,11 +865,40 @@ def create_server(
             status_code=503, detail=f"Failed to setup server config: {e}"
         )
 
-    # Server is created suspended — user must subscribe via Billing, then POST /start.
-    if server.state != ServerState.provisioning:
-        server.state = ServerState.created
-    db.commit()
-    db.refresh(server)
+    # Free Trial Logic: grant a 7-day cardless trial if there's a free plan
+    from blockhost_backend.database.schema import BillingPlan, BillingSubscription, BillingSubscriptionStatus
+    from datetime import timedelta
+    from blockhost_backend.database.schema import utcnow
+    
+    free_plan = db.execute(
+        select(BillingPlan).where(BillingPlan.price == 0, BillingPlan.active == True).limit(1)
+    ).scalar_one_or_none()
+    
+    if free_plan:
+        now = utcnow()
+        trial_sub = BillingSubscription(
+            user_id=user.id,
+            server_id=server.id,
+            plan_id=free_plan.id,
+            starts_at=now,
+            expires_at=now + timedelta(days=7),
+            status=BillingSubscriptionStatus.active,
+        )
+        db.add(trial_sub)
+        db.flush()
+        
+        # Apply limits to mc_config
+        cfg = dict(server.mc_config or {})
+        cfg["billing_plan_id"] = free_plan.id
+        cfg["resource_limits"] = {
+            "ram_mb": free_plan.ram_mb,
+            "cpu_quota_pct": free_plan.cpu_limit,
+            "storage_mb": free_plan.storage_mb,
+            "player_limit": free_plan.player_limit,
+        }
+        server.mc_config = cfg
+        db.commit()
+
     if server.node_id:
         refresh_node_allocated_ram(db, server.node_id)
         db.commit()
@@ -1115,6 +1144,14 @@ def _provision_remote_server(server: Server, server_dir: Path, db: Session, vers
 
 def _do_start_server(server: Server, db: Session) -> None:
     settings = get_settings()
+    
+    from blockhost_backend.services.billing import ensure_active_subscription_for_start, BillingError
+    try:
+        ensure_active_subscription_for_start(db=db, server=server)
+    except BillingError as e:
+        server.state = ServerState.suspended
+        _drop_server_stats_snapshot(str(server.id))
+        raise HTTPException(status_code=402, detail={"error": e.code, "message": e.message})
 
     # Automatic Failover: if assigned node is offline or starting, detach the server
     if server.node_id:

@@ -14,7 +14,7 @@ from blockhost_backend.orchestrator.resources import get_effective_server_resour
 
 logger = logging.getLogger(__name__)
 
-HEARTBEAT_STALE_SECONDS = 30
+HEARTBEAT_STALE_SECONDS = 120
 
 # Server states that reserve RAM on a node (Active RAM).
 _RAM_RESERVING_STATES = (

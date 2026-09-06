@@ -124,7 +124,6 @@ async def node_agent_websocket(
                 if node_obj.ip_address != node_ip:
                     node_obj.ip_address = node_ip
                     # Sync new IP to all servers on this node
-                    from sqlalchemy import update
                     from blockhost_backend.database.schema import Server
                     db.execute(update(Server).where(Server.node_id == node_obj.id).values(vm_ipv4=node_ip))
                 node_obj.agent_port = node_port

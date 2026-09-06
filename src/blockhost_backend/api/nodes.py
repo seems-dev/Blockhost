@@ -12,7 +12,8 @@ from sqlalchemy.orm import Session
 from blockhost_backend.api.deps import get_admin_user
 from blockhost_backend.config.config_manager import get_settings
 from blockhost_backend.database.db import SessionLocal, get_db
-from blockhost_backend.database.schema import Node, NodeState, Server, User, utcnow
+from blockhost_backend.database.schema import Node, NodeState, Server, ServerState, User, utcnow
+import httpx
 from blockhost_backend.services.node_auth import (
     generate_agent_token,
     hash_agent_token,
@@ -124,7 +125,6 @@ async def node_agent_websocket(
                 if node_obj.ip_address != node_ip:
                     node_obj.ip_address = node_ip
                     # Sync new IP to all servers on this node
-                    from blockhost_backend.database.schema import Server
                     db.execute(update(Server).where(Server.node_id == node_obj.id).values(vm_ipv4=node_ip))
                 node_obj.agent_port = node_port
 
@@ -145,7 +145,6 @@ async def node_agent_websocket(
 
             if node_obj.status == NodeState.offline:
                 logger.warning("Node '%s' reconnecting from offline state. Initiating split-brain recovery.", node_name)
-                import httpx
                 agent_port = register_data.get("agent_port", 9000)
                 try:
                     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -161,7 +160,6 @@ async def node_agent_websocket(
                     return
                 
                 # Update DB state for all active servers on this node to suspended
-                from blockhost_backend.database.schema import ServerState
                 db.execute(
                     update(Server)
                     .where(

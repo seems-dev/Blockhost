@@ -86,7 +86,12 @@ def select_best_node(db: Session, *, required_ram_mb: int = 0) -> Node | None:
             )
         ).scalars().all()
         
-        active_ram = sum(s.ram_mb for s in active_servers if s.ram_mb)
+        # FIX: Use get_effective_server_resource_limits instead of s.ram_mb
+        active_ram = 0
+        for s in active_servers:
+            limits = get_effective_server_resource_limits(db=db, server=s)
+            active_ram += limits.get("ram_mb", 0)
+            
         free = node.total_ram_mb - active_ram
         
         if free < required_ram_mb:
@@ -94,6 +99,11 @@ def select_best_node(db: Session, *, required_ram_mb: int = 0) -> Node | None:
         if free > best_free:
             best_free = free
             best = node
+
+    # Optional: ensure it has at least 512MB free
+    if best_free < 512:
+        return None
+        
     return best
 
 

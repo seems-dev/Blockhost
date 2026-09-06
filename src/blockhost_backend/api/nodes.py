@@ -200,10 +200,10 @@ async def node_agent_websocket(
                 node_obj.cpu_usage_percent = stats["cpu_usage_percent"]
                 node_obj.cpu_cores = stats["cpu_cores"]
                 node_obj.last_heartbeat = utcnow()
-                refresh_node_allocated_ram(db, node_obj.id)
                 
                 # Update last_activity and players_online for active servers
                 running_servers = stats.get("running_servers", {})
+                running_uuids = []
                 
                 # First reset players_online to 0 for all servers on this node
                 db.execute(
@@ -216,6 +216,7 @@ async def node_agent_websocket(
                     for sid, count in running_servers.items():
                         try:
                             server_uuid = uuid.UUID(sid)
+                            running_uuids.append(server_uuid)
                             # Update players_online for all, but last_activity only if count > 0
                             if count > 0:
                                 db.execute(
@@ -231,7 +232,30 @@ async def node_agent_websocket(
                                 )
                         except ValueError:
                             pass
+                            
+                # Suspend any server that DB thinks is running but agent says is not
+                if running_uuids:
+                    db.execute(
+                        update(Server)
+                        .where(
+                            Server.node_id == node_obj.id,
+                            Server.state == ServerState.running,
+                            Server.id.notin_(running_uuids)
+                        )
+                        .values(state=ServerState.suspended)
+                    )
+                else:
+                    db.execute(
+                        update(Server)
+                        .where(
+                            Server.node_id == node_obj.id,
+                            Server.state == ServerState.running,
+                        )
+                        .values(state=ServerState.suspended)
+                    )
                 
+                # Now that states are reconciled, refresh RAM
+                refresh_node_allocated_ram(db, node_obj.id)
                 db.commit()
 
     except WebSocketDisconnect:

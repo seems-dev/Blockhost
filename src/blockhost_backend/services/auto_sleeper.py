@@ -48,6 +48,9 @@ def _auto_sleeper_cycle() -> None:
                 
                 # 3. Mark as suspended in the database
                 server.state = ServerState.suspended
+                if server.node_id:
+                    from blockhost_backend.services.node_capacity import refresh_node_allocated_ram
+                    refresh_node_allocated_ram(db, server.node_id)
                 db.commit()
                 
             except Exception as e:

@@ -800,19 +800,22 @@ def create_server(
         raise HTTPException(status_code=422, detail=str(e))
 
     # Unpaid servers reserve 0 RAM until a plan is active; still place on freest node.
-    node = select_best_node(db, required_ram_mb=0)
-    if settings.production_mode and not node:
+    node = select_best_node(db)
+    if not node:
+        # All online nodes are full! Try to wake up an offline node.
         from blockhost_backend.services.node_capacity import auto_wakeup_offline_node
-        if auto_wakeup_offline_node(db):
+        woken = auto_wakeup_offline_node(db)
+        if woken:
             raise HTTPException(
                 status_code=202,
-                detail="Network is scaling up! A new server node is booting for you. Please wait 60 seconds and try creating your server again.",
+                detail="Network is scaling up! A new server node is booting for you. Please wait 60 seconds and try creating your server again."
             )
-        else:
+        elif settings.production_mode:
             raise HTTPException(
                 status_code=503,
-                detail="No worker nodes are available (and none can be booted). Check agent registration.",
+                detail="All server nodes are full and no offline nodes are available to scale up.",
             )
+            
     node_id = node.id if node else None
 
     try:
@@ -1235,6 +1238,11 @@ def start_server(
     _do_start_server(server, db)
 
     db.commit()
+    if server.node_id:
+        from blockhost_backend.services.node_capacity import refresh_node_allocated_ram
+        refresh_node_allocated_ram(db, server.node_id)
+        db.commit()
+        
     _drop_server_stats_snapshot(str(server.id))
     _invalidate_server_read_cache(user.id, server.id)
     return ServerActionResponse(id=server.id, state=server.state)
@@ -1250,6 +1258,11 @@ def stop_server(
 
     _stop_server_process(server)
     db.commit()
+    if server.node_id:
+        from blockhost_backend.services.node_capacity import refresh_node_allocated_ram
+        refresh_node_allocated_ram(db, server.node_id)
+        db.commit()
+        
     _drop_server_stats_snapshot(str(server.id))
     _invalidate_server_read_cache(user.id, server.id)
     return ServerActionResponse(id=server.id, state=server.state)

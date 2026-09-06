@@ -161,11 +161,14 @@ async def node_agent_websocket(
                     await websocket.close(code=4003, reason="Split-brain recovery failed")
                     return
                 
-                # Update DB state for all servers on this node to suspended
+                # Update DB state for all active servers on this node to suspended
                 from blockhost_backend.database.schema import ServerState
                 db.execute(
                     update(Server)
-                    .where(Server.node_id == node_obj.id, Server.state == ServerState.running)
+                    .where(
+                        Server.node_id == node_obj.id,
+                        Server.state.in_([ServerState.running, ServerState.provisioning, ServerState.syncing])
+                    )
                     .values(state=ServerState.suspended)
                 )
 
@@ -233,13 +236,13 @@ async def node_agent_websocket(
                         except ValueError:
                             pass
                             
-                # Suspend any server that DB thinks is running but agent says is not
+                # Suspend any server that DB thinks is active but agent says is not running
                 if running_uuids:
                     db.execute(
                         update(Server)
                         .where(
                             Server.node_id == node_obj.id,
-                            Server.state == ServerState.running,
+                            Server.state.in_([ServerState.running, ServerState.provisioning, ServerState.syncing]),
                             Server.id.notin_(running_uuids)
                         )
                         .values(state=ServerState.suspended)
@@ -249,7 +252,7 @@ async def node_agent_websocket(
                         update(Server)
                         .where(
                             Server.node_id == node_obj.id,
-                            Server.state == ServerState.running,
+                            Server.state.in_([ServerState.running, ServerState.provisioning, ServerState.syncing]),
                         )
                         .values(state=ServerState.suspended)
                     )

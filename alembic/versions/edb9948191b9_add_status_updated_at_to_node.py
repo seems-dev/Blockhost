@@ -26,8 +26,7 @@ def upgrade():
 
     with op.batch_alter_table('servers', schema=None) as batch_op:
         batch_op.add_column(sa.Column('players_online', sa.Integer(), nullable=False, server_default='0'))
-        batch_op.drop_index(batch_op.f('uq_servers_proxy_port'))
-        batch_op.create_unique_constraint('uq_servers_proxy_port', ['proxy_port'])
+
 
     # ### end Alembic commands ###
 

@@ -83,6 +83,9 @@ def create_app() -> FastAPI:
     app.include_router(mods_routes.router)
     app.include_router(software_router)
 
+    from blockhost_backend.api import internal as internal_routes
+    app.include_router(internal_routes.router, prefix="/api")
+
     return app
 
 

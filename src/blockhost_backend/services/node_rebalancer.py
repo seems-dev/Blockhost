@@ -114,22 +114,11 @@ def _migrate_server(
     to_node: Node,
     db: Session,
 ) -> bool:
-    """Execute a migration: stop → S3 backup → reassign → S3 restore → start.
-
-    Returns True on success, False on any failure.
-    """
     sid = str(server.id)
     was_running = (server.state == ServerState.running)
 
-    try:
-        require_s3_configured()
-    except RuntimeError as e:
-        logger.error("[rebalancer] Skipping migrate for %s: %s", sid, e)
-        return False
-
     from_agent = _agent_for_node(from_node)
-    to_agent = _agent_for_node(to_node)
-
+    
     logger.info(
         "[rebalancer] Migrating server %s from %s → %s",
         sid, from_node.name, to_node.name,
@@ -144,14 +133,7 @@ def _migrate_server(
     server.state = ServerState.suspended
     db.commit()
 
-    # 2. Backup to S3
-    try:
-        from_agent.backup_to_s3(sid)
-    except Exception as e:
-        logger.error("[rebalancer] Backup failed for %s: %s", sid, e)
-        return False
-
-    # 3. Reassign
+    # 2. Reassign
     old_node_id = server.node_id
     old_ip = server.vm_ipv4
     server.node_id = to_node.id
@@ -161,17 +143,6 @@ def _migrate_server(
     # Invalidate routing cache
     from blockhost_backend.orchestrator.lifecycle_manager import get_server_lifecycle_orchestrator
     get_server_lifecycle_orchestrator().invalidate_server(sid)
-
-    # 4. Restore on new node
-    try:
-        to_agent.restore_from_s3(sid)
-    except Exception as e:
-        logger.error("[rebalancer] Restore failed for %s, rolling back: %s", sid, e)
-        server.node_id = old_node_id
-        server.vm_ipv4 = old_ip
-        db.commit()
-        get_server_lifecycle_orchestrator().invalidate_server(sid)
-        return False
 
     # 5. Start on new node if it was running
     if was_running:
@@ -190,17 +161,8 @@ def _migrate_server(
         db.commit()
 
     record_migration()
-    delete_migration_snapshot(sid)
-
-    # Drop orphaned world files on the source node (best-effort).
-    try:
-        from_agent.purge_server_data(sid)
-    except Exception as e:
-        logger.warning(
-            "[rebalancer] Failed to purge source data for %s on %s: %s",
-            sid, from_node.name, e,
-        )
-
+    
+    # EFS Migration is instant, no data to purge from source.
     logger.info(
         "[rebalancer] Migration complete: %s → %s (node %s)",
         sid, to_node.name, to_node.ip_address,
@@ -220,134 +182,179 @@ def _pick_migratable_server(servers: list[Server]) -> Server | None:
     return None
 
 
+def _node_active_ram_mb(node: Node, db: Session) -> int:
+    """Return total RAM used by active (running/provisioning/syncing) servers on this node."""
+    active_states = (ServerState.running, ServerState.provisioning, ServerState.syncing)
+    active_servers = db.execute(
+        select(Server).where(
+            Server.node_id == node.id,
+            Server.state.in_(active_states),
+        )
+    ).scalars().all()
+
+    total = 0
+    from blockhost_backend.orchestrator.resources import get_effective_server_resource_limits
+    for s in active_servers:
+        limits = get_effective_server_resource_limits(db=db, server=s)
+        total += limits["ram_mb"]
+    return total
+
+
+def _server_ram_mb(server: Server, db: Session) -> int:
+    """Return this server's RAM allocation from its billing plan."""
+    from blockhost_backend.orchestrator.resources import get_effective_server_resource_limits
+    limits = get_effective_server_resource_limits(db=db, server=server)
+    return limits.get("ram_mb", 0)
+
+
+def _backup_server_to_s3(server: Server, node: Node) -> bool:
+    """Backup a server's world files to S3 before unassigning it. Returns True on success."""
+    sid = str(server.id)
+    try:
+        require_s3_configured()
+    except RuntimeError:
+        logger.warning("[rebalancer] S3 not configured, skipping backup for %s", sid)
+        return False
+
+    try:
+        agent = _agent_for_node(node)
+        agent.backup_to_s3(sid)
+        logger.info("[rebalancer] Backed up server %s to S3 from node %s", sid, node.name)
+        return True
+    except Exception as e:
+        logger.error("[rebalancer] Failed to backup server %s to S3: %s", sid, e)
+        return False
+
+
 def _rebalance_cycle() -> None:
-    """Run one rebalance evaluation cycle."""
+    """Run one rebalance evaluation cycle.
+
+    Three phases, executed in order:
+      Phase 1 — Consolidation: Pack running servers onto the fewest possible nodes.
+      Phase 2 — Cold Storage: Backup & unassign suspended servers from nodes with 0 running.
+      Phase 3 — Shutdown: Power off any node with 0 assigned servers.
+    """
     with SessionLocal() as db:
-        # ── Scenario 0: Auto-Shutdown Empty Nodes ────────────────────────
-        # Shut down any node (healthy or not) that is online but has no servers.
-        # This handles nodes that were recently emptied, or nodes with stale heartbeats.
-        all_online_nodes = db.execute(
+        nodes = _healthy_online_nodes(db)
+        if not nodes:
+            return
+
+        # ── Phase 1: Consolidate running servers ─────────────────────────
+        # Goal: If node-2 has 1 running server but node-1 has spare capacity,
+        # migrate that server to node-1 so node-2 becomes empty.
+        if len(nodes) >= 2 and can_run_migration_now():
+            # Sort by active RAM ascending — emptiest node is the migration source
+            sorted_nodes = sorted(nodes, key=lambda n: _node_active_ram_mb(n, db))
+            source_node = sorted_nodes[0]
+            source_running = _running_servers_on_node(db, source_node.id)
+
+            if source_running:
+                # Try to move the least-active running server to a node with capacity
+                for server in source_running:
+                    if server_in_migration_cooldown(server):
+                        continue
+
+                    server_ram = _server_ram_mb(server, db)
+
+                    # Find a target with enough free ACTIVE RAM
+                    best_target: Node | None = None
+                    best_free = -1
+                    for candidate in sorted_nodes:
+                        if candidate.id == source_node.id:
+                            continue
+                        active_ram = _node_active_ram_mb(candidate, db)
+                        free = candidate.total_ram_mb - active_ram
+                        if free >= server_ram and free > best_free:
+                            best_free = free
+                            best_target = candidate
+
+                    if best_target:
+                        logger.info(
+                            "[rebalancer] Consolidating: server %s (%dMB) from %s → %s (free: %dMB)",
+                            server.id, server_ram, source_node.name, best_target.name, best_free,
+                        )
+                        _migrate_server(server, source_node, best_target, db)
+                        return  # One migration per cycle to avoid thrashing
+
+        # ── Phase 2: Overflow Protection ─────────────────────────────────
+        # If a node's active RAM exceeds 85%, shed its least-active server.
+        if can_run_migration_now():
+            for node in nodes:
+                ratio = _node_active_ram_ratio(node, db)
+                if ratio < NODE_OVERLOADED_RATIO:
+                    continue
+
+                logger.info(
+                    "[rebalancer] Node %s is overloaded (%.0f%% active RAM)",
+                    node.name, ratio * 100,
+                )
+
+                # Find target with most free active RAM
+                best_target: Node | None = None
+                best_free = -1
+                for candidate in nodes:
+                    if candidate.id == node.id:
+                        continue
+                    active_ram = _node_active_ram_mb(candidate, db)
+                    free = candidate.total_ram_mb - active_ram
+                    if free > best_free and _node_active_ram_ratio(candidate, db) < NODE_OVERLOADED_RATIO:
+                        best_free = free
+                        best_target = candidate
+
+                if not best_target:
+                    # No room anywhere — boot a new node
+                    from blockhost_backend.services.node_capacity import auto_wakeup_offline_node
+                    if auto_wakeup_offline_node(db):
+                        logger.info("[rebalancer] Auto-Wakeup: booting offline node due to overflow on %s", node.name)
+                    return
+
+                victim = _pick_migratable_server(_running_servers_on_node(db, node.id))
+                if not victim:
+                    continue
+
+                _migrate_server(victim, node, best_target, db)
+                return  # One migration per cycle
+
+        # ── Phase 3: Cold Storage + Shutdown ─────────────────────────────
+        # For any node with 0 running servers:
+        #   a) Backup all suspended servers to S3
+        #   b) Unassign them (node_id = None → cold storage)
+        #   c) Shut down the EC2
+        # Keep at least 1 node online for instant server creation.
+        all_online = db.execute(
             select(Node).where(Node.status == NodeState.online)
         ).scalars().all()
-        
-        for node in all_online_nodes:
-            servers = _all_servers_on_node(db, node.id)
-            if not servers and node.provider and node.provider_instance_id:
-                logger.info("[rebalancer] Auto-Shutdown: Node %s is completely empty. Shutting down.", node.name)
-                try:
-                    provider = get_cloud_provider(node.provider)
-                    provider.stop_instance(node.provider_instance_id)
-                    node.status = NodeState.offline
-                    db.commit()
-                except Exception as e:
-                    logger.error("[rebalancer] Failed to shut down provider for node %s: %s", node.name, e)
-                
-                # Mark as offline so we don't attempt to shut it down again next cycle
-                
 
-        # Fetch only healthy nodes for the actual migrations
-        nodes = _healthy_online_nodes(db)
+        for node in all_online:
+            if not node.provider or not node.provider_instance_id:
+                continue
 
-        if not can_run_migration_now():
-            return
-
-        # ── Scenario 1: Evacuate "Empty" Nodes ──────────────────────────
-        # If a node has 0 running servers but has suspended servers, migrate them
-        # so the node can eventually be shut down.
-        for node in nodes:
             running = _running_servers_on_node(db, node.id)
-            if len(running) == 0:
-                all_servers = _all_servers_on_node(db, node.id)
-                if len(all_servers) > 0:
-                    candidates = [n for n in nodes if n.id != node.id]
-                    if not candidates:
-                        continue
-                    # Sort by used_ram_mb descending to pack tightly
-                    target_node = sorted(candidates, key=lambda n: n.used_ram_mb, reverse=True)[0]
-                    victim = _pick_migratable_server(all_servers)
-                    if victim:
-                        logger.info("[rebalancer] Evacuating suspended server from node %s with 0 running servers to %s", node.name, target_node.name)
-                        # We skip RAM capacity checks because the server is suspended!
-                        _migrate_server(victim, node, target_node, db)
-                        return  # one migration per cycle
+            if running:
+                continue  # Node has active servers — don't touch it
 
-        # ── Scenario 2: Overflow Protection ──────────────────────────
-        # Find overloaded nodes and shed their least-active server to
-        # the node with the most free RAM.
-        for node in nodes:
-            ratio = _node_ram_ratio(node)
-            if ratio < NODE_OVERLOADED_RATIO:
+            # Keep at least 1 node online
+            remaining = [n for n in all_online if n.status == NodeState.online and n.id != node.id]
+            if not remaining:
                 continue
 
-            logger.info(
-                "[rebalancer] Node %s is overloaded (%.0f%% RAM used)",
-                node.name, ratio * 100,
-            )
+            # Unassign all suspended servers (files remain on EFS)
+            suspended = _all_servers_on_node(db, node.id)
+            for s in suspended:
+                s.node_id = None
+                s.vm_ipv4 = None
+                s.vm_port = None
 
-            # Find the target node with the most free capacity
-            best_target: Node | None = None
-            best_free = -1
-            for candidate in nodes:
-                if candidate.id == node.id:
-                    continue
-                free = candidate.total_ram_mb - candidate.used_ram_mb
-                if free > best_free and _node_ram_ratio(candidate) < NODE_OVERLOADED_RATIO:
-                    best_free = free
-                    best_target = candidate
-
-            if not best_target:
-                logger.warning("[rebalancer] No suitable target node for overflow from %s", node.name)
-                # Auto-Wakeup: Try to start an offline node
-                from blockhost_backend.services.node_capacity import auto_wakeup_offline_node
-                if auto_wakeup_offline_node(db):
-                    logger.info("[rebalancer] Auto-Wakeup: Triggering start for offline node due to overflow on %s", node.name)
-                return
-
-            # Pick the least-active running server not in cooldown
-            victim = _pick_migratable_server(_running_servers_on_node(db, node.id))
-            if not victim:
-                continue
-
-            _migrate_server(victim, node, best_target, db)
-            return  # one migration per cycle to avoid thrashing
-
-        if len(nodes) < 2:
-            return  # nothing to consolidate with a single node
-
-        # ── Scenario 3: Consolidation ────────────────────────────────
-        # If ALL nodes are below the idle threshold (based on ACTIVE servers),
-        # pack servers from the least-loaded node onto the most-loaded one.
-        all_idle = all(_node_active_ram_ratio(n, db) < NODE_IDLE_RATIO for n in nodes)
-        if not all_idle:
-            return
-
-        # Sort by used_ram ascending — the "emptiest" node is the source
-        sorted_nodes = sorted(nodes, key=lambda n: n.used_ram_mb)
-        source_node = sorted_nodes[0]
-        target_node = sorted_nodes[-1]
-
-        if source_node.id == target_node.id:
-            return
-
-        servers = _all_servers_on_node(db, source_node.id)
-        if not servers:
-            return  # handled by Scenario 0 now
-
-        victim = _pick_migratable_server(servers)
-        if not victim:
-            return
-
-        if victim.state == ServerState.running:
-            # Check that the target has enough room ONLY for running servers
-            free_on_target = target_node.total_ram_mb - target_node.used_ram_mb
-            if free_on_target < 512:  # need at least 512 MB free to accept a transfer
-                return
-
-        logger.info(
-            "[rebalancer] Consolidating: moving server from %s → %s (all nodes idle)",
-            source_node.name, target_node.name,
-        )
-        _migrate_server(victim, source_node, target_node, db)
+            # All servers backed up and unassigned — shut down the node
+            logger.info("[rebalancer] Shutting down node %s (0 running servers, %d suspended → cold storage)", node.name, len(suspended))
+            try:
+                provider = get_cloud_provider(node.provider)
+                provider.stop_instance(node.provider_instance_id)
+                node.status = NodeState.offline
+                db.commit()
+            except Exception as e:
+                logger.error("[rebalancer] Failed to shut down node %s: %s", node.name, e)
+                db.rollback()
 
 
 def _rebalancer_loop() -> None:

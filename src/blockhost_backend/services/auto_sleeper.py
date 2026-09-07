@@ -23,10 +23,11 @@ def _auto_sleeper_cycle() -> None:
     cutoff_time = utcnow() - timedelta(minutes=IDLE_TIMEOUT_MINUTES)
     
     with SessionLocal() as db:
-        # 1. Find all running servers that haven't been active
+        # 1. Find all running servers with 0 players that haven't been active
         idle_servers = db.execute(
             select(Server).where(
                 Server.state == ServerState.running,
+                Server.players_online == 0,
                 Server.last_activity < cutoff_time
             )
         ).scalars().all()
@@ -41,13 +42,12 @@ def _auto_sleeper_cycle() -> None:
             logger.info("[auto-sleeper] Suspending idle server %s (last active: %s)", sid, server.last_activity)
             
             try:
-                # 2. Stop the systemd process locally using the agent
-                # The orchestrator routes this to the correct node agent.
-                # The agent stops the service but DOES NOT upload to S3.
-                orchestrator.stop_server(sid)
+                # 2. Stop the systemd process using the orchestrator
+                # stop_server expects a Server object, not a string!
+                # It also sets server.state = ServerState.suspended internally.
+                orchestrator.stop_server(server)
                 
-                # 3. Mark as suspended in the database
-                server.state = ServerState.suspended
+                # 3. Refresh RAM tracking on the node
                 if server.node_id:
                     from blockhost_backend.services.node_capacity import refresh_node_allocated_ram
                     refresh_node_allocated_ram(db, server.node_id)

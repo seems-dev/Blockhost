@@ -47,27 +47,32 @@ class RouteTarget:
 
 _waking_servers: set[str] = set()
 
-def _sync_trigger_wakeup(server_id: str) -> None:
-    """Synchronous function to wake up a server."""
+async def _trigger_wakeup(server_id: str) -> None:
     if server_id in _waking_servers:
         return
     _waking_servers.add(server_id)
     try:
-        from blockhost_backend.api.servers import _do_start_server
-        with SessionLocal() as db:
-            server = db.get(Server, uuid.UUID(server_id))
-            if server and server.state == ServerState.suspended:
-                logger.info("Wake-on-Connect triggered for %s", server_id)
-                _do_start_server(server, db)
-                db.commit()
+        from blockhost_backend.config.config_manager import get_settings
+        import httpx
+        
+        settings = get_settings()
+        token = settings.worker_agent_token
+        
+        # Make internal API call to wake the server
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"http://127.0.0.1:8000/api/internal/servers/{server_id}/wake",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=5.0
+            )
+            if resp.status_code == 202:
+                logger.info("Wake-on-Connect triggered for %s via internal API", server_id)
+            else:
+                logger.warning("Wake-on-Connect failed for %s: %s %s", server_id, resp.status_code, resp.text)
     except Exception as e:
-        logger.error("Wake-on-Connect failed for %s: %s", server_id, e)
+        logger.error("Wake-on-Connect request failed for %s: %s", server_id, e)
     finally:
         _waking_servers.discard(server_id)
-
-async def _trigger_wakeup(server_id: str) -> None:
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _sync_trigger_wakeup, server_id)
 
 
 def _load_routing_table(*, log_routes: bool = False) -> dict[int, RouteTarget]:
@@ -176,6 +181,57 @@ async def _handle_tcp_client(
         logger.info("TCP proxy %d: Server suspended, triggering Wake-on-Connect", proxy_port)
         if route.server_id:
             asyncio.create_task(_trigger_wakeup(route.server_id))
+        
+        # Read the handshake packet to ensure the client is ready to receive a disconnect
+        try:
+            await asyncio.wait_for(client_reader.read(BUFFER_SIZE), timeout=1.0)
+        except (asyncio.TimeoutError, OSError):
+            pass
+
+        # Construct Minecraft Disconnect Packet (Packet ID 0x00 in Login state)
+        import json
+        
+        # Helper to encode VarInt
+        def encode_varint(value: int) -> bytes:
+            encoded = b''
+            while True:
+                temp = value & 0x7F
+                value >>= 7
+                if value != 0:
+                    temp |= 0x80
+                encoded += bytes([temp])
+                if value == 0:
+                    break
+            return encoded
+            
+        def encode_string(value: str) -> bytes:
+            encoded = value.encode('utf-8')
+            return encode_varint(len(encoded)) + encoded
+
+        message = {
+            "text": "",
+            "extra": [
+                {"text": "Server is waking up!\nClick here to view progress: ", "color": "yellow"},
+                {
+                    "text": f"panel.blockhost.app/servers/{route.server_id}",
+                    "color": "aqua",
+                    "clickEvent": {"action": "open_url", "value": f"https://panel.blockhost.app/servers/{route.server_id}"},
+                    "hoverEvent": {"action": "show_text", "value": "Click to open panel"}
+                }
+            ]
+        }
+        
+        # Packet ID 0x00 + String payload
+        payload = b'\x00' + encode_string(json.dumps(message))
+        # Total packet = VarInt(length of payload) + payload
+        packet = encode_varint(len(payload)) + payload
+        
+        try:
+            client_writer.write(packet)
+            await client_writer.drain()
+        except OSError:
+            pass
+            
         client_writer.close()
         return
 

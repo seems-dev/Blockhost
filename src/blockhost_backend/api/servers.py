@@ -1180,6 +1180,8 @@ def _do_start_server(server: Server, db: Session) -> None:
             except Exception as e:
                 raise HTTPException(status_code=503, detail=f"Failed to allocate port on new node: {e}")
             db.commit()
+            # EFS handles file availability across nodes, so no S3 restore is needed here.
+            logger.info("Assigned server %s to node %s (EFS storage)", server.id, node.name)
         elif settings.production_mode:
             from blockhost_backend.services.node_capacity import auto_wakeup_offline_node
             if auto_wakeup_offline_node(db):

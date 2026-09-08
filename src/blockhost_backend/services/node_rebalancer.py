@@ -133,11 +133,20 @@ def _migrate_server(
     server.state = ServerState.suspended
     db.commit()
 
-    # 2. Reassign
+    # 2. Reassign with a fresh port on the new node
     old_node_id = server.node_id
     old_ip = server.vm_ipv4
     server.node_id = to_node.id
     server.vm_ipv4 = to_node.ip_address
+    try:
+        from blockhost_backend.api.servers import _allocate_port
+        server.vm_port = _allocate_port(db=db, flavor=server.flavor, node_id=to_node.id)
+    except Exception as e:
+        logger.error("[rebalancer] Port allocation failed for %s on %s: %s", sid, to_node.name, e)
+        server.node_id = old_node_id
+        server.vm_ipv4 = old_ip
+        db.commit()
+        return False
     db.commit()
 
     # Invalidate routing cache
@@ -257,13 +266,24 @@ def _rebalance_cycle() -> None:
         ).scalars().all()
 
         if orphaned:
+            from blockhost_backend.api.servers import _allocate_port
+            rescued = 0
             for s in orphaned:
                 old = s.node_id
                 s.node_id = online_node.id
                 s.vm_ipv4 = online_node.ip_address
-                logger.info("[rebalancer] Rescued orphaned server %s (was node=%s) → %s", s.id, old, online_node.name)
-            db.commit()
-            logger.info("[rebalancer] Rescued %d orphaned server(s)", len(orphaned))
+                # Allocate a fresh port to avoid UniqueViolation on (node_id, vm_port)
+                try:
+                    s.vm_port = _allocate_port(db=db, flavor=s.flavor, node_id=online_node.id)
+                except Exception as e:
+                    logger.error("[rebalancer] Failed to allocate port for orphaned server %s: %s", s.id, e)
+                    db.rollback()
+                    continue
+                logger.info("[rebalancer] Rescued orphaned server %s (was node=%s) → %s port=%d", s.id, old, online_node.name, s.vm_port)
+                rescued += 1
+            if rescued:
+                db.commit()
+                logger.info("[rebalancer] Rescued %d orphaned server(s)", rescued)
 
         # ── Phase 1: Consolidate running servers ─────────────────────────
         # Goal: If node-2 has 1 running server but node-1 has spare capacity,
@@ -365,12 +385,25 @@ def _rebalance_cycle() -> None:
                 continue
 
             # Reassign all suspended servers to another online node (EFS = files are already there)
+            from blockhost_backend.api.servers import _allocate_port
             suspended = _all_servers_on_node(db, node.id)
             target_node = remaining[0]  # Pick the first remaining online node
+            reassign_failed = False
             for s in suspended:
                 s.node_id = target_node.id
                 s.vm_ipv4 = target_node.ip_address
-                logger.info("[rebalancer] Reassigned suspended server %s → %s (EFS)", s.id, target_node.name)
+                # Allocate a fresh port to avoid UniqueViolation on (node_id, vm_port)
+                try:
+                    s.vm_port = _allocate_port(db=db, flavor=s.flavor, node_id=target_node.id)
+                except Exception as e:
+                    logger.error("[rebalancer] Failed to allocate port for server %s on %s: %s", s.id, target_node.name, e)
+                    reassign_failed = True
+                    break
+                logger.info("[rebalancer] Reassigned suspended server %s → %s port=%d (EFS)", s.id, target_node.name, s.vm_port)
+
+            if reassign_failed:
+                db.rollback()
+                continue
 
             # All servers reassigned — shut down the node
             logger.info("[rebalancer] Shutting down node %s (0 running servers, %d suspended → reassigned to %s)", node.name, len(suspended), target_node.name)

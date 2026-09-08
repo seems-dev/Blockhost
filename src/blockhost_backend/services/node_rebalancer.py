@@ -239,6 +239,32 @@ def _rebalance_cycle() -> None:
         if not nodes:
             return
 
+        # ── Phase 0: Rescue orphaned servers ─────────────────────────────
+        # Reassign servers stuck on offline nodes (or node_id=NULL) to an online node.
+        # With EFS, files are shared, so we just update the DB pointer.
+        online_node = nodes[0]
+        offline_nodes = db.execute(
+            select(Node).where(Node.status != NodeState.online)
+        ).scalars().all()
+        offline_ids = [n.id for n in offline_nodes]
+
+        orphaned = db.execute(
+            select(Server).where(
+                (Server.node_id.is_(None)) | (Server.node_id.in_(offline_ids))
+            )
+        ).scalars().all() if offline_ids else db.execute(
+            select(Server).where(Server.node_id.is_(None))
+        ).scalars().all()
+
+        if orphaned:
+            for s in orphaned:
+                old = s.node_id
+                s.node_id = online_node.id
+                s.vm_ipv4 = online_node.ip_address
+                logger.info("[rebalancer] Rescued orphaned server %s (was node=%s) → %s", s.id, old, online_node.name)
+            db.commit()
+            logger.info("[rebalancer] Rescued %d orphaned server(s)", len(orphaned))
+
         # ── Phase 1: Consolidate running servers ─────────────────────────
         # Goal: If node-2 has 1 running server but node-1 has spare capacity,
         # migrate that server to node-1 so node-2 becomes empty.
@@ -338,14 +364,16 @@ def _rebalance_cycle() -> None:
             if not remaining:
                 continue
 
-            # Unassign all suspended servers (files remain on EFS)
+            # Reassign all suspended servers to another online node (EFS = files are already there)
             suspended = _all_servers_on_node(db, node.id)
+            target_node = remaining[0]  # Pick the first remaining online node
             for s in suspended:
-                s.node_id = None
-                s.vm_ipv4 = None
+                s.node_id = target_node.id
+                s.vm_ipv4 = target_node.ip_address
+                logger.info("[rebalancer] Reassigned suspended server %s → %s (EFS)", s.id, target_node.name)
 
-            # All servers backed up and unassigned — shut down the node
-            logger.info("[rebalancer] Shutting down node %s (0 running servers, %d suspended → cold storage)", node.name, len(suspended))
+            # All servers reassigned — shut down the node
+            logger.info("[rebalancer] Shutting down node %s (0 running servers, %d suspended → reassigned to %s)", node.name, len(suspended), target_node.name)
             try:
                 provider = get_cloud_provider(node.provider)
                 provider.stop_instance(node.provider_instance_id)

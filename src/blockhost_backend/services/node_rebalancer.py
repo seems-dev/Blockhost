@@ -343,7 +343,6 @@ def _rebalance_cycle() -> None:
             for s in suspended:
                 s.node_id = None
                 s.vm_ipv4 = None
-                s.vm_port = None
 
             # All servers backed up and unassigned — shut down the node
             logger.info("[rebalancer] Shutting down node %s (0 running servers, %d suspended → cold storage)", node.name, len(suspended))

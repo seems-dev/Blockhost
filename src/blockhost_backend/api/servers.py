@@ -1162,7 +1162,6 @@ def _do_start_server(server: Server, db: Session) -> None:
         if not node or node.status in (NodeState.offline, NodeState.starting):
             server.node_id = None
             server.vm_ipv4 = None
-            server.vm_port = None
             db.commit()
 
     if not server.node_id:

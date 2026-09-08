@@ -1156,34 +1156,58 @@ def _do_start_server(server: Server, db: Session) -> None:
         _drop_server_stats_snapshot(str(server.id))
         raise HTTPException(status_code=402, detail={"error": e.code, "message": e.message})
 
-    # Automatic Failover: if assigned node is offline or starting, detach the server
+    # Automatic Failover: find the right node to start this server on
+    needs_node_assignment = False
+
     if server.node_id:
         node = db.get(Node, server.node_id)
         if not node or node.status in (NodeState.offline, NodeState.starting):
-            server.node_id = None
-            server.vm_ipv4 = None
-            db.commit()
+            # Node is gone or not ready — need a new one
+            needs_node_assignment = True
+        else:
+            # Node is online — check if it has enough free RAM
+            limits = get_effective_server_resource_limits(db=db, server=server)
+            required_ram = int(limits.get("ram_mb") or 0)
+            active_servers = db.execute(
+                select(Server).where(
+                    Server.node_id == node.id,
+                    Server.state.in_([ServerState.running, ServerState.provisioning]),
+                )
+            ).scalars().all()
+            active_ram = sum(
+                get_effective_server_resource_limits(db=db, server=s).get("ram_mb", 0)
+                for s in active_servers
+            )
+            free_ram = node.total_ram_mb - active_ram
+            if required_ram > 0 and free_ram < required_ram:
+                logger.info(
+                    "Node %s is full (free=%dMB, need=%dMB) for server %s, looking for another node",
+                    node.name, free_ram, required_ram, server.id,
+                )
+                needs_node_assignment = True
+    else:
+        needs_node_assignment = True
 
-    if not server.node_id:
+    if needs_node_assignment:
         limits = get_effective_server_resource_limits(db=db, server=server)
         required_ram = int(limits.get("ram_mb") or 0)
-        node = select_best_node(db, required_ram_mb=required_ram)
-        if node:
-            server.node_id = node.id
-            server.vm_ipv4 = node.ip_address
-            server.state = ServerState.provisioning # Reserve RAM before lock release
-            refresh_node_allocated_ram(db, node.id)
-            # We must re-allocate a fresh port on the new node
+        new_node = select_best_node(db, required_ram_mb=required_ram)
+        if new_node:
+            server.node_id = new_node.id
+            server.vm_ipv4 = new_node.ip_address
+            server.state = ServerState.provisioning
+            refresh_node_allocated_ram(db, new_node.id)
             try:
                 server.vm_port = _allocate_port(db=db, flavor=server.flavor, node_id=server.node_id)
             except Exception as e:
                 raise HTTPException(status_code=503, detail=f"Failed to allocate port on new node: {e}")
             db.commit()
-            # EFS handles file availability across nodes, so no S3 restore is needed here.
-            logger.info("Assigned server %s to node %s (EFS storage)", server.id, node.name)
+            logger.info("Assigned server %s to node %s (EFS storage)", server.id, new_node.name)
         elif settings.production_mode:
             from blockhost_backend.services.node_capacity import auto_wakeup_offline_node
             if auto_wakeup_offline_node(db):
+                # Keep the server on its current node (don't set to None!)
+                # Phase 0 or the next retry will handle it once the new node is online.
                 raise HTTPException(
                     status_code=503,
                     detail="Network is scaling up! A new node is booting. Please wait 60 seconds and try again.",
@@ -1191,7 +1215,7 @@ def _do_start_server(server: Server, db: Session) -> None:
             else:
                 raise HTTPException(
                     status_code=503,
-                    detail="Server is not assigned to a worker node. No capacity is currently available.",
+                    detail="No capacity is currently available. Please try again shortly.",
                 )
     is_java = is_java_flavor(server.flavor)
 

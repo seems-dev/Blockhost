@@ -45,34 +45,36 @@ class RouteTarget:
     server_id: str | None = None
     is_suspended: bool = False
 
-_waking_servers: set[str] = set()
+_waking_servers: dict[str, float] = {}  # server_id → timestamp of last attempt
+_WAKE_COOLDOWN_SECONDS = 60.0
+
+def _sync_trigger_wakeup(server_id: str) -> None:
+    """Wake a suspended server directly via DB (proxy has its own DB connection)."""
+    import time as _time
+
+    now = _time.monotonic()
+    last_attempt = _waking_servers.get(server_id, 0)
+    if now - last_attempt < _WAKE_COOLDOWN_SECONDS:
+        return  # Already attempted recently, don't spam
+    _waking_servers[server_id] = now
+
+    try:
+        from blockhost_backend.api.servers import _do_start_server
+        with SessionLocal() as db:
+            server = db.get(Server, uuid.UUID(server_id))
+            if server and server.state == ServerState.suspended:
+                logger.info("Wake-on-Connect triggered for %s", server_id)
+                _do_start_server(server, db)
+                db.commit()
+                logger.info("Wake-on-Connect completed for %s (state=%s)", server_id, server.state.value)
+            elif server:
+                logger.debug("Wake-on-Connect skipped for %s (state=%s)", server_id, server.state.value)
+    except Exception as e:
+        logger.error("Wake-on-Connect failed for %s: %s", server_id, e)
 
 async def _trigger_wakeup(server_id: str) -> None:
-    if server_id in _waking_servers:
-        return
-    _waking_servers.add(server_id)
-    try:
-        from blockhost_backend.config.config_manager import get_settings
-        import httpx
-        
-        settings = get_settings()
-        token = settings.worker_agent_token
-        
-        # Make internal API call to wake the server
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"http://127.0.0.1:8000/api/internal/servers/{server_id}/wake",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=5.0
-            )
-            if resp.status_code == 202:
-                logger.info("Wake-on-Connect triggered for %s via internal API", server_id)
-            else:
-                logger.warning("Wake-on-Connect failed for %s: %s %s", server_id, resp.status_code, resp.text)
-    except Exception as e:
-        logger.error("Wake-on-Connect request failed for %s: %s", server_id, e)
-    finally:
-        _waking_servers.discard(server_id)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _sync_trigger_wakeup, server_id)
 
 
 def _load_routing_table(*, log_routes: bool = False) -> dict[int, RouteTarget]:

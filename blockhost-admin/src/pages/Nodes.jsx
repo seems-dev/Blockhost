@@ -23,6 +23,11 @@ export default function Nodes() {
 
   if (loading) return <div className="text-white">Loading nodes...</div>;
 
+  const formatRam = (mb) => {
+    if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
+    return `${Math.round(mb)} MB`;
+  };
+
   return (
     <div>
       <h2 className="text-2xl font-bold mb-6 text-white">Worker Nodes</h2>
@@ -48,7 +53,7 @@ export default function Nodes() {
               <div>
                 <div className="flex justify-between mb-1">
                   <span className="text-slate-500">RAM Usage:</span>
-                  <span>{Math.round(node.used_ram_mb / 1024)}GB / {Math.round(node.total_ram_mb / 1024)}GB</span>
+                  <span>{formatRam(node.used_ram_mb)} / {formatRam(node.total_ram_mb)}</span>
                 </div>
                 <div className="w-full bg-slate-700 rounded-full h-2">
                   <div 

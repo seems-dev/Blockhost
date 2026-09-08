@@ -1593,6 +1593,7 @@ async def console_websocket(
 
         async def receive_commands():
             try:
+                from blockhost_backend.services.rate_limit import _redis_check, _local_check
                 while True:
                     data = await websocket.receive_text()
                     try:
@@ -1600,6 +1601,11 @@ async def console_websocket(
                         if msg.get("type") == "command" and "command" in msg:
                             command = str(msg["command"]).replace("\r", "").replace("\n", " ").strip()
                             if command and len(command) <= 512:
+                                allowed = _redis_check(f"cmd_{user.id}", limit=5, window_seconds=1)
+                                if allowed is None:
+                                    allowed = _local_check(f"cmd_{user.id}", limit=5, window_seconds=1)
+                                if not allowed:
+                                    continue
                                 _ORCHESTRATOR.send_command(server_id, command)
                                 from blockhost_backend.database.schema import utcnow
                                 server.last_activity = utcnow()

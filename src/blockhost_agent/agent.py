@@ -1307,15 +1307,32 @@ def agent_download_file(
     )
 
 
+def _get_dir_size(path: Path) -> int:
+    total = 0
+    try:
+        for entry in os.scandir(path):
+            if entry.is_file(follow_symlinks=False):
+                total += entry.stat().st_size
+            elif entry.is_dir(follow_symlinks=False):
+                total += _get_dir_size(Path(entry.path))
+    except OSError:
+        pass
+    return total
+
+
 @app.post("/agent/servers/{server_id}/files/upload")
 async def agent_upload_file(
     server_id: str,
     path: str,
     allowed_roots: str | None = None,
     allowed_files: str | None = None,
+    storage_limit_mb: int | None = Query(default=None),
     file: UploadFile = File(...),
     _token: str = Depends(verify_token),
 ) -> Any:
+    if storage_limit_mb is None:
+        raise HTTPException(status_code=403, detail="No active subscription: storage limit is undefined.")
+
     _validate_server_id(server_id)
     server_root = SERVERS_ROOT_DIR / server_id
     roots = _parse_allowed_csv(allowed_roots, ALLOWED_ROOTS)
@@ -1327,6 +1344,9 @@ async def agent_upload_file(
         allowed_files=files,
         allow_root_file=False,
     )
+
+    current_dir_size = _get_dir_size(server_root) if server_root.exists() else 0
+    limit_bytes = storage_limit_mb * 1024 * 1024
 
     if target_dir.exists() and not target_dir.is_dir():
         raise HTTPException(status_code=400, detail="Target is not a directory")
@@ -1340,12 +1360,17 @@ async def agent_upload_file(
     target_file = target_dir / filename
     _validate_safe_path(server_root, target_file.relative_to(server_root).as_posix(), allowed_roots=roots, allowed_files=files)
 
+    if target_file.is_file():
+        current_dir_size -= target_file.stat().st_size
+
     fd, tmp_path = tempfile.mkstemp(dir=target_dir, suffix=".upload")
     try:
         total_size = 0
         with os.fdopen(fd, "wb") as buffer:
             while chunk := await file.read(1024 * 1024):
                 total_size += len(chunk)
+                if (current_dir_size + total_size) > limit_bytes:
+                    raise HTTPException(status_code=413, detail="Disk quota exceeded for this server.")
                 if total_size > MAX_UPLOAD_SIZE:
                     raise HTTPException(status_code=413, detail="File too large")
                 buffer.write(chunk)

@@ -1161,30 +1161,26 @@ def _do_start_server(server: Server, db: Session) -> None:
 
     if server.node_id:
         node = db.get(Node, server.node_id)
-        if not node or node.status in (NodeState.offline, NodeState.starting):
-            # Node is gone or not ready — need a new one
-            needs_node_assignment = True
-        else:
-            # Node is online — check if it has enough free RAM
+        # Check if node is dead
+        is_dead = not node or node.status in (NodeState.offline, NodeState.starting)
+        
+        # Check if node is full
+        is_full = False
+        if node:
+            from blockhost_backend.services.node_capacity import compute_node_allocated_ram_mb
+            active_ram = compute_node_allocated_ram_mb(db, node.id)
             limits = get_effective_server_resource_limits(db=db, server=server)
             required_ram = int(limits.get("ram_mb") or 0)
-            active_servers = db.execute(
-                select(Server).where(
-                    Server.node_id == node.id,
-                    Server.state.in_([ServerState.running, ServerState.provisioning]),
-                )
-            ).scalars().all()
-            active_ram = sum(
-                get_effective_server_resource_limits(db=db, server=s).get("ram_mb", 0)
-                for s in active_servers
-            )
-            free_ram = node.total_ram_mb - active_ram
-            if required_ram > 0 and free_ram < required_ram:
-                logger.info(
-                    "Node %s is full (free=%dMB, need=%dMB) for server %s, looking for another node",
-                    node.name, free_ram, required_ram, server.id,
-                )
-                needs_node_assignment = True
+            if node.total_ram_mb - active_ram < required_ram:
+                is_full = True
+                
+        if is_dead or is_full:
+            logger.info(f"Node {node.name if node else 'Unknown'} is dead or full. Detaching server {server.id} to find a new node.")
+            server.node_id = None
+            server.vm_ipv4 = None
+            # DO NOT set server.vm_port = None because the DB schema enforces NOT NULL on vm_port.
+            db.commit()
+            needs_node_assignment = True
     else:
         needs_node_assignment = True
 

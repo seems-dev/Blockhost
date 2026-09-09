@@ -1231,6 +1231,12 @@ def _do_start_server(server: Server, db: Session) -> None:
         detail = "Failed to prepare Java server" if is_java else "Failed to materialize Bedrock server folder"
         raise HTTPException(status_code=503, detail=f"{detail}: {e}")
 
+    # Update activity so Auto-Sleeper doesn't instantly kill it
+    from blockhost_backend.database.schema import utcnow
+    server.last_activity = utcnow()
+    db.add(server)
+    db.commit()
+
     try:
         _start_server_process(server=server, settings=settings, db=db)
     except BillingError as e:
@@ -1352,7 +1358,12 @@ def toggle_server(
     if is_actually_running:
         _stop_server_process(server)
     else:
-        _do_start_server(server, db)
+        try:
+            from sqlalchemy.exc import IntegrityError
+            _do_start_server(server, db)
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="Port allocation conflict. Please try again in 2 seconds.")
 
     db.commit()
     _drop_server_stats_snapshot(str(server.id))

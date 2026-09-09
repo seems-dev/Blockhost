@@ -1262,7 +1262,12 @@ def start_server(
     if is_actually_running:
         return ServerActionResponse(id=server.id, state=server.state)
 
-    _do_start_server(server, db)
+    try:
+        from sqlalchemy.exc import IntegrityError
+        _do_start_server(server, db)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Port allocation conflict. Please try again in 2 seconds.")
 
     db.commit()
     if server.node_id:

@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+import hmac
+import hashlib
+import httpx
 from decimal import Decimal
 
 import razorpay
@@ -19,9 +22,11 @@ from blockhost_backend.database.db import get_db
 from blockhost_backend.database.schema import (
     BillingPlan,
     BillingSubscription,
+    BillingSubscriptionStatus,
     BillingTransaction,
     BillingTransactionStatus,
     Server,
+    ServerState,
     User,
 )
 from blockhost_backend.services.billing import (
@@ -361,5 +366,190 @@ async def razorpay_webhook(request: Request, db: Session = Depends(get_db)):
             )
         except Exception:
             logger.exception("Razorpay webhook unexpected error for order %s", provider_order_id)
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Paddle Billing
+# ---------------------------------------------------------------------------
+
+def verify_paddle_signature(signature_header: str, body: bytes, secret: str) -> bool:
+    if not signature_header or not secret:
+        return False
+    
+    parts = signature_header.split(';')
+    ts = ""
+    h1_hashes = []
+    
+    for part in parts:
+        if part.startswith('ts='):
+            ts = part[3:]
+        elif part.startswith('h1='):
+            h1_hashes.append(part[3:])
+            
+    if not ts or not h1_hashes:
+        return False
+        
+    payload = f"{ts}:{body.decode('utf-8')}"
+    
+    mac = hmac.new(secret.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256)
+    computed_hash = mac.hexdigest()
+    
+    return computed_hash in h1_hashes
+
+@router.post("/paddle/webhook")
+async def paddle_webhook(request: Request, db: Session = Depends(get_db)):
+    settings = get_settings()
+    secret = settings.paddle_webhook_secret
+    
+    body = await request.body()
+    signature_header = request.headers.get("Paddle-Signature")
+    
+    if not signature_header or not verify_paddle_signature(signature_header, body, secret):
+        logger.warning("Paddle webhook: invalid signature")
+        raise HTTPException(status_code=401, detail="Invalid signature")
+        
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        
+    event_type = payload.get("event_type")
+    data = payload.get("data", {})
+    
+    logger.info("Paddle webhook received event: %s", event_type)
+    
+    if event_type in ["subscription.created", "subscription.updated", "subscription.canceled"]:
+        subscription_id = data.get("id")
+        status = data.get("status") # active, canceled, etc.
+        custom_data = data.get("custom_data", {})
+        server_id_str = custom_data.get("server_id")
+        
+        if not subscription_id or not server_id_str:
+            return {"status": "ok"}
+            
+        try:
+            server_id = uuid.UUID(server_id_str)
+        except ValueError:
+            return {"status": "ok"}
+            
+        # Get server and subscription
+        server = db.get(Server, server_id)
+        if not server:
+            return {"status": "ok"}
+            
+        sub = db.execute(
+            select(BillingSubscription).where(
+                BillingSubscription.provider_subscription_id == subscription_id
+            )
+        ).scalars().first()
+        
+        if not sub:
+            # Try finding by server if no provider_subscription_id matches
+            sub = db.execute(
+                select(BillingSubscription).where(
+                    BillingSubscription.server_id == server_id
+                ).order_by(BillingSubscription.created_at.desc())
+            ).scalars().first()
+            
+        if event_type == "subscription.canceled" or status == "canceled":
+            if sub:
+                sub.status = BillingSubscriptionStatus.cancelled
+                sub.provider_subscription_id = subscription_id
+            server.state = ServerState.suspended
+        else:
+            # active or trialing
+            if sub:
+                sub.status = BillingSubscriptionStatus.active
+                sub.provider_subscription_id = subscription_id
+            server.state = ServerState.created
+            
+        db.commit()
+        
+    elif event_type == "transaction.completed":
+        custom_data = data.get("custom_data", {})
+        server_id_str = custom_data.get("server_id")
+        subscription_id = data.get("subscription_id")
+        
+        if not server_id_str:
+            return {"status": "ok"}
+            
+        try:
+            server_id = uuid.UUID(server_id_str)
+        except ValueError:
+            return {"status": "ok"}
+            
+        server = db.get(Server, server_id)
+        if server:
+            server.state = ServerState.created
+            if subscription_id:
+                sub = db.execute(
+                    select(BillingSubscription).where(
+                        BillingSubscription.provider_subscription_id == subscription_id
+                    )
+                ).scalars().first()
+                if not sub:
+                    sub = db.execute(
+                        select(BillingSubscription).where(
+                            BillingSubscription.server_id == server_id
+                        ).order_by(BillingSubscription.created_at.desc())
+                    ).scalars().first()
+                
+                if sub:
+                    sub.status = BillingSubscriptionStatus.active
+                    sub.provider_subscription_id = subscription_id
+                    
+            db.commit()
 
     return {"status": "ok"}
+
+
+@router.get("/paddle/checkout/{server_id}")
+async def generate_paddle_checkout(
+    server_id: uuid.UUID,
+    plan_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    settings = get_settings()
+    server = db.get(Server, server_id)
+    if not server or server.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Server not found")
+        
+    plan = db.get(BillingPlan, plan_id)
+    if not plan or not plan.active:
+        raise HTTPException(status_code=404, detail="Plan not found")
+        
+    base_url = "https://sandbox-api.paddle.com" if settings.paddle_env == "sandbox" else "https://api.paddle.com"
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{base_url}/transactions",
+            headers={
+                "Authorization": f"Bearer {settings.paddle_api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "items": [
+                    {
+                        "price_id": plan.id,
+                        "quantity": 1
+                    }
+                ],
+                "custom_data": {
+                    "server_id": str(server.id)
+                }
+            }
+        )
+        
+        if response.status_code >= 400:
+            logger.error("Paddle API error: %s", response.text)
+            raise HTTPException(status_code=400, detail="Failed to generate checkout")
+            
+        data = response.json()
+        checkout_url = data.get("data", {}).get("checkout", {}).get("url")
+        
+        if not checkout_url:
+            raise HTTPException(status_code=500, detail="No checkout URL returned from Paddle")
+            
+        return {"checkout_url": checkout_url}

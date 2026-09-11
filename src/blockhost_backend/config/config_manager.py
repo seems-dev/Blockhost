@@ -94,6 +94,10 @@ class Settings(BaseSettings):
     
     stripe_secret_key: str = ""
     stripe_webhook_secret: str = ""
+    
+    paddle_env: str = "sandbox"
+    paddle_webhook_secret: str = ""
+    paddle_api_key: str = ""
 
     # AWS S3 – world backup storage for durability & cross-node migration
     aws_access_key_id: str = ""

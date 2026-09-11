@@ -1189,14 +1189,16 @@ def _do_start_server(server: Server, db: Session) -> None:
         required_ram = int(limits.get("ram_mb") or 0)
         new_node = select_best_node(db, required_ram_mb=required_ram)
         if new_node:
+            try:
+                new_port = _allocate_port(db=db, flavor=server.flavor, node_id=new_node.id)
+            except Exception as e:
+                raise HTTPException(status_code=503, detail=f"Failed to allocate port on new node: {e}")
+                
+            server.vm_port = new_port
             server.node_id = new_node.id
             server.vm_ipv4 = new_node.ip_address
             server.state = ServerState.provisioning
             refresh_node_allocated_ram(db, new_node.id)
-            try:
-                server.vm_port = _allocate_port(db=db, flavor=server.flavor, node_id=server.node_id)
-            except Exception as e:
-                raise HTTPException(status_code=503, detail=f"Failed to allocate port on new node: {e}")
             db.commit()
             logger.info("Assigned server %s to node %s (EFS storage)", server.id, new_node.name)
         elif settings.production_mode:

@@ -4,7 +4,6 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repo root: .../blockhost (parent of src/)
@@ -99,13 +98,6 @@ class Settings(BaseSettings):
     paddle_env: str = "sandbox"
     paddle_webhook_secret: str = ""
     paddle_api_key: str = ""
-    
-    # Paddle Price IDs mapped by RAM (matches the 512_MB, 1_GB, etc. from .env)
-    paddle_price_512_mb: str = Field(default="", alias="512_MB")
-    paddle_price_1_gb: str = Field(default="", alias="1_GB")
-    paddle_price_2_gb: str = Field(default="", alias="2_GB")
-    paddle_price_4_gb: str = Field(default="", alias="4_GB")
-    paddle_price_8_gb: str = Field(default="", alias="8_GB")
 
     # AWS S3 – world backup storage for durability & cross-node migration
     aws_access_key_id: str = ""

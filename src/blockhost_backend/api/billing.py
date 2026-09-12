@@ -525,22 +525,6 @@ async def generate_paddle_checkout(
     if not settings.paddle_api_key:
         logger.error("Paddle API key is not configured.")
         raise HTTPException(status_code=500, detail="Billing is not configured on this server")
-        
-    paddle_price_id = plan.id
-    if plan.ram_mb <= 512 and settings.paddle_price_512_mb:
-        paddle_price_id = settings.paddle_price_512_mb
-    elif plan.ram_mb <= 1024 and settings.paddle_price_1_gb:
-        paddle_price_id = settings.paddle_price_1_gb
-    elif plan.ram_mb <= 2048 and settings.paddle_price_2_gb:
-        paddle_price_id = settings.paddle_price_2_gb
-    elif plan.ram_mb <= 4096 and settings.paddle_price_4_gb:
-        paddle_price_id = settings.paddle_price_4_gb
-    elif plan.ram_mb > 4096 and settings.paddle_price_8_gb:
-        paddle_price_id = settings.paddle_price_8_gb
-        
-    if not paddle_price_id.startswith("pri_"):
-        logger.error("Invalid paddle_price_id derived: %s", paddle_price_id)
-        raise HTTPException(status_code=500, detail="Invalid Paddle price configuration.")
     
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -552,7 +536,7 @@ async def generate_paddle_checkout(
             json={
                 "items": [
                     {
-                        "price_id": paddle_price_id,
+                        "price_id": plan.id,
                         "quantity": 1
                     }
                 ],

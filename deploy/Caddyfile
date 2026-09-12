@@ -3,4 +3,4 @@
 blockhost.sryze.cc {
 	encode zstd gzip
 	reverse_proxy api:8000
-}
+} 

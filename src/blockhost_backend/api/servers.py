@@ -1167,7 +1167,7 @@ def _do_start_server(server: Server, db: Session) -> None:
             logger.info(f"Node {node.name if node else 'Unknown'} is dead or full. Detaching server {server.id} to find a new node.")
             server.node_id = None
             server.vm_ipv4 = None
-            # DO NOT set server.vm_port = None because the DB schema enforces NOT NULL on vm_port.
+            server.vm_port = None  # <--- ADD THIS LINE! It forces a fresh port allocation on the new node.
             db.commit()
             needs_node_assignment = True
     else:

@@ -32,6 +32,7 @@ DEFAULT_BILLING_PLANS: tuple[dict[str, object], ...] = (
         "price": "199.00",
         "duration_days": 30,
         "active": True,
+        "provider_price_id": "pri_01m2a30sd71pwp2rpqxjqzdbay",
     },
     {
         "id": "pro",
@@ -43,6 +44,7 @@ DEFAULT_BILLING_PLANS: tuple[dict[str, object], ...] = (
         "price": "399.00",
         "duration_days": 30,
         "active": True,
+        "provider_price_id": "pri_01m2a2z6s8j3h1e6jmpg6z8ay4",
     },
     {
         "id": "ultra",
@@ -54,6 +56,31 @@ DEFAULT_BILLING_PLANS: tuple[dict[str, object], ...] = (
         "price": "799.00",
         "duration_days": 30,
         "active": True,
+        "provider_price_id": "pri_01m2a2w94p4ptb9pkktfsxaymm",
+    },
+    {
+        "id": "mega",
+        "name": "Mega",
+        "ram_mb": 4096,
+        "cpu_limit": 300,
+        "storage_mb": 40960,
+        "player_limit": 75,
+        "price": "1499.00",
+        "duration_days": 30,
+        "active": True,
+        "provider_price_id": "pri_01m28wxe05yva8az0vb6jymxmz",
+    },
+    {
+        "id": "titan",
+        "name": "Titan",
+        "ram_mb": 8192,
+        "cpu_limit": 400,
+        "storage_mb": 81920,
+        "player_limit": 100,
+        "price": "2499.00",
+        "duration_days": 30,
+        "active": True,
+        "provider_price_id": "pri_01m2a32b1e7tayar7w8vej83hg",
     },
 )
 
@@ -65,6 +92,12 @@ def seed_default_billing_plans(db: Session) -> None:
         if plan is None:
             db.add(BillingPlan(**plan_data))
             changed = True
+        else:
+            # Update existing plans with any new/changed fields
+            for key, value in plan_data.items():
+                if key != "id" and getattr(plan, key, None) != value:
+                    setattr(plan, key, value)
+                    changed = True
     if changed:
         db.commit()
 

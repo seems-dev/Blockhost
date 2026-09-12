@@ -459,7 +459,23 @@ async def paddle_webhook(request: Request, db: Session = Depends(get_db)):
             server.state = ServerState.suspended
         else:
             # active or trialing
-            if sub:
+            if not sub:
+                plan = db.execute(select(BillingPlan).where(BillingPlan.active == True).limit(1)).scalars().first()
+                if plan:
+                    from blockhost_backend.database.schema import utcnow
+                    from datetime import timedelta
+                    now = utcnow()
+                    sub = BillingSubscription(
+                        user_id=server.owner_id,
+                        server_id=server.id,
+                        plan_id=plan.id,
+                        status=BillingSubscriptionStatus.active,
+                        provider_subscription_id=subscription_id,
+                        starts_at=now,
+                        expires_at=now + timedelta(days=plan.duration_days)
+                    )
+                    db.add(sub)
+            else:
                 sub.status = BillingSubscriptionStatus.active
                 sub.provider_subscription_id = subscription_id
             server.state = ServerState.created
@@ -495,7 +511,23 @@ async def paddle_webhook(request: Request, db: Session = Depends(get_db)):
                         ).order_by(BillingSubscription.created_at.desc())
                     ).scalars().first()
                 
-                if sub:
+                if not sub:
+                    plan = db.execute(select(BillingPlan).where(BillingPlan.active == True).limit(1)).scalars().first()
+                    if plan:
+                        from blockhost_backend.database.schema import utcnow
+                        from datetime import timedelta
+                        now = utcnow()
+                        sub = BillingSubscription(
+                            user_id=server.owner_id,
+                            server_id=server.id,
+                            plan_id=plan.id,
+                            status=BillingSubscriptionStatus.active,
+                            provider_subscription_id=subscription_id,
+                            starts_at=now,
+                            expires_at=now + timedelta(days=plan.duration_days)
+                        )
+                        db.add(sub)
+                else:
                     sub.status = BillingSubscriptionStatus.active
                     sub.provider_subscription_id = subscription_id
                     

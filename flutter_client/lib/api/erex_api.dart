@@ -201,36 +201,13 @@ class ErexApi {
     throw ApiException('Unexpected response');
   }
 
-  Future<Map<String, dynamic>> createUpgradeOrder({
+  Future<Map<String, dynamic>> generatePaddleCheckout({
     required String serverId,
-    required String targetPlanId,
+    required String planId,
   }) async {
-    final res = await http.post(
-      _u('/api/billing/upgrade'),
-      headers: _headers(auth: true),
-      body: jsonEncode({
-        'server_id': serverId,
-        'target_plan_id': targetPlanId,
-      }),
-    );
-    final body = _decodeJson(res.body);
-    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
-    return body;
-  }
-
-  Future<Map<String, dynamic>> verifyPayment({
-    required String providerOrderId,
-    required String providerPaymentId,
-    required String signature,
-  }) async {
-    final res = await http.post(
-      _u('/api/billing/verify'),
-      headers: _headers(auth: true),
-      body: jsonEncode({
-        'provider_order_id': providerOrderId,
-        'provider_payment_id': providerPaymentId,
-        'signature': signature,
-      }),
+    final res = await http.get(
+      _u('/api/billing/paddle/checkout/$serverId?plan_id=$planId'),
+      headers: _headers(json: false, auth: true),
     );
     final body = _decodeJson(res.body);
     if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));

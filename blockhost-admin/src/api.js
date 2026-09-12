@@ -1,7 +1,7 @@
 import axios from 'axios';
 
 const api = axios.create({
-    baseURL: 'http://54.66.183.201:80',
+    baseURL: 'https://blockhost.sryze.cc',
 });
 
 // Automatically attach JWT token if logged in

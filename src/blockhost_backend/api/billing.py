@@ -522,6 +522,10 @@ async def generate_paddle_checkout(
         
     base_url = "https://sandbox-api.paddle.com" if settings.paddle_env == "sandbox" else "https://api.paddle.com"
     
+    if not settings.paddle_api_key:
+        logger.error("Paddle API key is not configured.")
+        raise HTTPException(status_code=500, detail="Billing is not configured on this server")
+    
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{base_url}/transactions",

@@ -29,9 +29,16 @@ def upgrade():
                server_default=None,
                existing_nullable=False)
 
+    bind = op.get_bind()
+    insp = sa.inspect(bind)
+    has_provider_sub = False
+    if 'subscriptions' in insp.get_table_names():
+        has_provider_sub = any(c['name'] == 'provider_subscription_id' for c in insp.get_columns('subscriptions'))
+
     with op.batch_alter_table('subscriptions', schema=None) as batch_op:
-        batch_op.add_column(sa.Column('provider_subscription_id', sa.String(length=128), nullable=True))
-        batch_op.create_index(batch_op.f('ix_subscriptions_provider_subscription_id'), ['provider_subscription_id'], unique=True)
+        if not has_provider_sub:
+            batch_op.add_column(sa.Column('provider_subscription_id', sa.String(length=128), nullable=True))
+            batch_op.create_index(batch_op.f('ix_subscriptions_provider_subscription_id'), ['provider_subscription_id'], unique=True)
 
     # ### end Alembic commands ###
 

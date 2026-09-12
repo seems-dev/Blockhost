@@ -534,12 +534,8 @@ def _collect_reserved_ports(
         server_flavor = row.flavor
         if port is None:
             continue
-        if is_bedrock:
-            if server_flavor != ServerFlavor.BEDROCK:
-                continue
-        elif not is_java_flavor(server_flavor):
-            continue
         reserved.add(port)
+        # Bedrock allocates two ports (port and port+1 for IPv6), so reserve the next one too
         if server_flavor == ServerFlavor.BEDROCK and port + 1 <= port_range.end:
             reserved.add(port + 1)
     return reserved
@@ -554,7 +550,6 @@ def _validate_server_port_pairs(
 ) -> None:
     port_map: dict[int, list[str]] = {}
     errors: list[str] = []
-    is_bedrock = flavor == ServerFlavor.BEDROCK
 
     query = select(Server.id, Server.vm_port, Server.flavor).where(Server.vm_port.between(port_range.start, port_range.end))
     if node_id:
@@ -562,12 +557,6 @@ def _validate_server_port_pairs(
     for row in db.execute(query).all():
         server_id, port, server_flavor = row.id, row.vm_port, row.flavor
         if port is None:
-            continue
-
-        if is_bedrock:
-            if server_flavor != ServerFlavor.BEDROCK:
-                continue
-        elif not is_java_flavor(server_flavor):
             continue
 
         if port < port_range.start or port > port_range.end:

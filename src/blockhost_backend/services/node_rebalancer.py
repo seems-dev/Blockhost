@@ -279,6 +279,7 @@ def _rebalance_cycle() -> None:
                     logger.error("[rebalancer] Failed to allocate port for orphaned server %s: %s", s.id, e)
                     db.rollback()
                     continue
+                db.flush()  # Make the port visible to the next _allocate_port call
                 logger.info("[rebalancer] Rescued orphaned server %s (was node=%s) → %s port=%d", s.id, old, online_node.name, s.vm_port)
                 rescued += 1
             if rescued:
@@ -399,6 +400,7 @@ def _rebalance_cycle() -> None:
                     logger.error("[rebalancer] Failed to allocate port for server %s on %s: %s", s.id, target_node.name, e)
                     reassign_failed = True
                     break
+                db.flush()  # Make the port visible to the next _allocate_port call
                 logger.info("[rebalancer] Reassigned suspended server %s → %s port=%d (EFS)", s.id, target_node.name, s.vm_port)
 
             if reassign_failed:

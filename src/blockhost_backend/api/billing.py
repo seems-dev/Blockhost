@@ -531,11 +531,12 @@ async def paddle_webhook(request: Request, background_tasks: BackgroundTasks, db
                     
                     background_tasks.add_task(provision_resource, resource_type, resource_id)
             else:
+                was_active = (sub.status == BillingSubscriptionStatus.active)
                 sub.status = BillingSubscriptionStatus.active
                 sub.provider_subscription_id = subscription_id
                 
                 # Check if it was previously not active and provision if needed
-                if sub.status != BillingSubscriptionStatus.active:
+                if not was_active:
                     background_tasks.add_task(provision_resource, resource_type, resource_id)
                 
         db.commit()

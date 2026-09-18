@@ -69,6 +69,11 @@ VERSIONS_ROOT_DIR = Path(
 ).resolve()
 VERSIONS_ROOT_DIR.mkdir(parents=True, exist_ok=True)
 
+DEPLOYMENTS_ROOT_DIR = Path(
+    os.environ.get("DEPLOYMENTS_ROOT_DIR", str(SERVERS_ROOT_DIR.parent / "deployments"))
+).resolve()
+DEPLOYMENTS_ROOT_DIR.mkdir(parents=True, exist_ok=True)
+
 _BINARY_NAMES = ("bedrock_server", "bedrock_server.exe", "bedrock_server_symbols.debug")
 _SO_RE = re.compile(r"^lib.*\.so(?:\..*)?$")
 
@@ -1660,13 +1665,24 @@ def start_deployment(
 ) -> Any:
     """Pull image and start a Docker container for the given deployment."""
     _validate_server_id(deployment_id)  # reuse UUID validation
+    
+    # Securely derive host volume path from deployment_id
+    safe_volume_path = None
+    if payload.volume_mount_path:
+        dep_dir = (DEPLOYMENTS_ROOT_DIR / deployment_id).resolve()
+        # Prevent path traversal
+        if not dep_dir.is_relative_to(DEPLOYMENTS_ROOT_DIR.resolve()):
+            raise HTTPException(status_code=403, detail="Path traversal detected")
+        dep_dir.mkdir(parents=True, exist_ok=True)
+        safe_volume_path = str(dep_dir)
+        
     try:
         result = docker_runtime.start_deployment(
             deployment_id=deployment_id,
             docker_image=payload.docker_image,
             internal_port=payload.internal_port,
             env_vars=payload.env_vars,
-            volume_path=payload.volume_path,
+            volume_path=safe_volume_path,
             volume_mount_path=payload.volume_mount_path,
             ram_limit_mb=payload.ram_limit_mb,
             cpu_limit=payload.cpu_limit,

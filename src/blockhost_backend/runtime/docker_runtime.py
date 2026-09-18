@@ -130,7 +130,8 @@ class DockerRuntime:
 
         logger.info("Starting container %s (image=%s, port=%d)", container_name, docker_image, internal_port)
 
-        bind_address = "0.0.0.0"
+        import os
+        bind_address = os.environ.get("AGENT_BIND_IP", "127.0.0.1")
         container = self.client.containers.run(
             image=docker_image,
             name=container_name,

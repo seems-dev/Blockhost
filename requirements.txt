@@ -12,6 +12,7 @@ charset-normalizer==3.4.7
 click==8.4.1
 cryptography==48.0.0
 dnspython==2.8.0
+docker==7.1.0
 ecdsa==0.19.2
 email-validator==2.3.0
 fastapi==0.136.1

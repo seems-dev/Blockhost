@@ -35,6 +35,7 @@ import shutil
 
 from blockhost_backend.api.files import download_file
 from blockhost_backend.runtime.systemd_runtime import SystemdRuntime
+from blockhost_backend.runtime.docker_runtime import DockerRuntime
 from blockhost_backend.runtime.interface import RuntimeStartRequest
 
 logging.basicConfig(
@@ -76,6 +77,7 @@ _LOG_STREAM_QUEUE_SIZE = 1000
 
 # Shared systemd runtime instance for this agent
 runtime = SystemdRuntime(servers_root=SERVERS_ROOT_DIR)
+docker_runtime = DockerRuntime()
 
 # Track background tasks for graceful shutdown
 _background_tasks: set[asyncio.Task] = set()
@@ -127,6 +129,16 @@ class CommandPayload(BaseModel):
 
 class WritePayload(BaseModel):
     content: str
+
+
+class DeploymentStartPayload(BaseModel):
+    docker_image: str
+    internal_port: int
+    env_vars: dict[str, str] = {}
+    volume_path: str | None = None
+    volume_mount_path: str = "/data"
+    ram_limit_mb: int = 512
+    cpu_limit: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -1633,6 +1645,81 @@ def agent_delete_mod(
     target.unlink()
     logger.info("Deleted mod %s/%s for server %s", subdir, safe_filename, server_id)
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Deployment Lifecycle (Docker-based PaaS)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/agent/deployments/{deployment_id}/start")
+def start_deployment(
+    deployment_id: str,
+    payload: DeploymentStartPayload,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Pull image and start a Docker container for the given deployment."""
+    _validate_server_id(deployment_id)  # reuse UUID validation
+    try:
+        result = docker_runtime.start_deployment(
+            deployment_id=deployment_id,
+            docker_image=payload.docker_image,
+            internal_port=payload.internal_port,
+            env_vars=payload.env_vars,
+            volume_path=payload.volume_path,
+            volume_mount_path=payload.volume_mount_path,
+            ram_limit_mb=payload.ram_limit_mb,
+            cpu_limit=payload.cpu_limit,
+        )
+        return {
+            "status": "running",
+            "container_id": result.container_id,
+            "container_name": result.container_name,
+            "host_port": result.host_port,
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/agent/deployments/{deployment_id}/stop")
+def stop_deployment(
+    deployment_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Stop and remove the Docker container for the given deployment."""
+    _validate_server_id(deployment_id)
+    docker_runtime.stop_deployment(deployment_id)
+    return {"status": "ok"}
+
+
+@app.get("/agent/deployments/{deployment_id}/status")
+def get_deployment_status(
+    deployment_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Return the current status of a deployment container."""
+    _validate_server_id(deployment_id)
+    status = docker_runtime.get_status(deployment_id)
+    return {
+        "running": status.running,
+        "container_id": status.container_id,
+        "state": status.state,
+        "host_port": status.host_port,
+        "started_at": status.started_at,
+        "exit_code": status.exit_code,
+    }
+
+
+@app.get("/agent/deployments/{deployment_id}/logs")
+def get_deployment_logs(
+    deployment_id: str,
+    tail: int = Query(default=200, ge=1, le=5000),
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Return the last N log lines from the deployment container."""
+    _validate_server_id(deployment_id)
+    lines = docker_runtime.get_logs(deployment_id, tail=tail)
+    return {"lines": lines}
 
 
 # ---------------------------------------------------------------------------

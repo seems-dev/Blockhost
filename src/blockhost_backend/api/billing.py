@@ -9,7 +9,7 @@ import httpx
 from decimal import Decimal
 
 import razorpay
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -28,7 +28,10 @@ from blockhost_backend.database.schema import (
     Server,
     ServerState,
     User,
+    ProcessedWebhookEvent,
+    AppDeployment,
 )
+from blockhost_backend.services.provisioning import provision_resource
 from blockhost_backend.services.billing import (
     BillingError,
     create_upgrade_transaction,
@@ -398,7 +401,7 @@ def verify_paddle_signature(signature_header: str, body: bytes, secret: str) -> 
     return computed_hash in h1_hashes
 
 @router.post("/paddle/webhook")
-async def paddle_webhook(request: Request, db: Session = Depends(get_db)):
+async def paddle_webhook(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     settings = get_settings()
     secret = settings.paddle_webhook_secret
     
@@ -414,29 +417,63 @@ async def paddle_webhook(request: Request, db: Session = Depends(get_db)):
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
         
+    event_id = payload.get("event_id")
     event_type = payload.get("event_type")
+    
+    if not event_id or not event_type:
+        return {"status": "ok"}
+        
+    # Idempotency check
+    existing_event = db.get(ProcessedWebhookEvent, event_id)
+    if existing_event:
+        logger.info("Paddle webhook: event %s already processed. Skipping.", event_id)
+        return {"status": "ok"}
+        
+    # Claim the event immediately
+    from blockhost_backend.database.schema import utcnow
+    processed_event = ProcessedWebhookEvent(
+        event_id=event_id,
+        provider="paddle",
+        event_type=event_type,
+        processed_at=utcnow()
+    )
+    db.add(processed_event)
+    
     data = payload.get("data", {})
     
-    logger.info("Paddle webhook received event: %s", event_type)
+    logger.info("Paddle webhook received event: %s (%s)", event_type, event_id)
     
     if event_type in ["subscription.created", "subscription.updated", "subscription.canceled"]:
         subscription_id = data.get("id")
         status = data.get("status") # active, canceled, etc.
         custom_data = data.get("custom_data", {})
-        server_id_str = custom_data.get("server_id")
         
-        if not subscription_id or not server_id_str:
+        resource_type = custom_data.get("resource_type", "minecraft_server")
+        resource_id_str = custom_data.get("deployment_id") if resource_type == "app_deployment" else custom_data.get("server_id")
+        
+        if not subscription_id or not resource_id_str:
+            db.commit()
             return {"status": "ok"}
             
         try:
-            server_id = uuid.UUID(server_id_str)
+            resource_id = uuid.UUID(resource_id_str)
         except ValueError:
+            db.commit()
             return {"status": "ok"}
             
-        # Get server and subscription
-        server = db.get(Server, server_id)
-        if not server:
+        # Get resource
+        resource = None
+        if resource_type == "minecraft_server":
+            resource = db.get(Server, resource_id)
+        elif resource_type == "app_deployment":
+            resource = db.get(AppDeployment, resource_id)
+            
+        if not resource:
+            logger.warning("Paddle webhook: %s %s not found.", resource_type, resource_id)
+            db.commit()
             return {"status": "ok"}
+            
+        owner_id = resource.owner_id
             
         sub = db.execute(
             select(BillingSubscription).where(
@@ -445,18 +482,31 @@ async def paddle_webhook(request: Request, db: Session = Depends(get_db)):
         ).scalars().first()
         
         if not sub:
-            # Try finding by server if no provider_subscription_id matches
-            sub = db.execute(
-                select(BillingSubscription).where(
-                    BillingSubscription.server_id == server_id
-                ).order_by(BillingSubscription.created_at.desc())
-            ).scalars().first()
+            # Try finding by resource if no provider_subscription_id matches
+            sub_query = select(BillingSubscription).where(
+                BillingSubscription.resource_id == resource_id,
+                BillingSubscription.resource_type == resource_type
+            )
+            # fallback for older rows
+            if resource_type == "minecraft_server":
+                sub_query = select(BillingSubscription).where(
+                    (BillingSubscription.server_id == resource_id) |
+                    ((BillingSubscription.resource_id == resource_id) & (BillingSubscription.resource_type == resource_type))
+                )
+            
+            sub = db.execute(sub_query.order_by(BillingSubscription.created_at.desc())).scalars().first()
             
         if event_type == "subscription.canceled" or status == "canceled":
             if sub:
                 sub.status = BillingSubscriptionStatus.cancelled
                 sub.provider_subscription_id = subscription_id
-            server.state = ServerState.suspended
+            
+            if resource_type == "minecraft_server":
+                resource.state = ServerState.suspended
+            elif resource_type == "app_deployment":
+                from blockhost_backend.database.schema import DeploymentState
+                resource.state = DeploymentState.stopped
+                
         else:
             # active or trialing
             if not sub:
@@ -465,51 +515,73 @@ async def paddle_webhook(request: Request, db: Session = Depends(get_db)):
                     from blockhost_backend.database.schema import utcnow
                     from datetime import timedelta
                     now = utcnow()
+                    
                     sub = BillingSubscription(
-                        user_id=server.owner_id,
-                        server_id=server.id,
+                        user_id=owner_id,
                         plan_id=plan.id,
                         status=BillingSubscriptionStatus.active,
                         provider_subscription_id=subscription_id,
                         starts_at=now,
-                        expires_at=now + timedelta(days=plan.duration_days)
+                        expires_at=now + timedelta(days=plan.duration_days),
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        server_id=resource_id if resource_type == "minecraft_server" else None
                     )
                     db.add(sub)
+                    
+                    background_tasks.add_task(provision_resource, resource_type, resource_id)
             else:
                 sub.status = BillingSubscriptionStatus.active
                 sub.provider_subscription_id = subscription_id
-            server.state = ServerState.created
-            
+                
+                # Check if it was previously not active and provision if needed
+                if sub.status != BillingSubscriptionStatus.active:
+                    background_tasks.add_task(provision_resource, resource_type, resource_id)
+                
         db.commit()
         
     elif event_type == "transaction.completed":
         custom_data = data.get("custom_data", {})
-        server_id_str = custom_data.get("server_id")
+        resource_type = custom_data.get("resource_type", "minecraft_server")
+        resource_id_str = custom_data.get("deployment_id") if resource_type == "app_deployment" else custom_data.get("server_id")
+        
         subscription_id = data.get("subscription_id")
         
-        if not server_id_str:
+        if not resource_id_str:
+            db.commit()
             return {"status": "ok"}
             
         try:
-            server_id = uuid.UUID(server_id_str)
+            resource_id = uuid.UUID(resource_id_str)
         except ValueError:
+            db.commit()
             return {"status": "ok"}
             
-        server = db.get(Server, server_id)
-        if server:
-            server.state = ServerState.created
+        resource = None
+        if resource_type == "minecraft_server":
+            resource = db.get(Server, resource_id)
+        elif resource_type == "app_deployment":
+            resource = db.get(AppDeployment, resource_id)
+            
+        if resource:
             if subscription_id:
                 sub = db.execute(
                     select(BillingSubscription).where(
                         BillingSubscription.provider_subscription_id == subscription_id
                     )
                 ).scalars().first()
+                
                 if not sub:
-                    sub = db.execute(
-                        select(BillingSubscription).where(
-                            BillingSubscription.server_id == server_id
-                        ).order_by(BillingSubscription.created_at.desc())
-                    ).scalars().first()
+                    sub_query = select(BillingSubscription).where(
+                        BillingSubscription.resource_id == resource_id,
+                        BillingSubscription.resource_type == resource_type
+                    )
+                    if resource_type == "minecraft_server":
+                        sub_query = select(BillingSubscription).where(
+                            (BillingSubscription.server_id == resource_id) |
+                            ((BillingSubscription.resource_id == resource_id) & (BillingSubscription.resource_type == resource_type))
+                        )
+                    sub = db.execute(sub_query.order_by(BillingSubscription.created_at.desc())).scalars().first()
                 
                 if not sub:
                     plan = db.execute(select(BillingPlan).where(BillingPlan.active == True).limit(1)).scalars().first()
@@ -518,35 +590,50 @@ async def paddle_webhook(request: Request, db: Session = Depends(get_db)):
                         from datetime import timedelta
                         now = utcnow()
                         sub = BillingSubscription(
-                            user_id=server.owner_id,
-                            server_id=server.id,
+                            user_id=resource.owner_id,
                             plan_id=plan.id,
                             status=BillingSubscriptionStatus.active,
                             provider_subscription_id=subscription_id,
                             starts_at=now,
-                            expires_at=now + timedelta(days=plan.duration_days)
+                            expires_at=now + timedelta(days=plan.duration_days),
+                            resource_type=resource_type,
+                            resource_id=resource_id,
+                            server_id=resource_id if resource_type == "minecraft_server" else None
                         )
                         db.add(sub)
                 else:
                     sub.status = BillingSubscriptionStatus.active
                     sub.provider_subscription_id = subscription_id
-                    
+            
+            # Start provisioning in background
+            background_tasks.add_task(provision_resource, resource_type, resource_id)
+            db.commit()
+        else:
             db.commit()
 
     return {"status": "ok"}
 
 
-@router.get("/paddle/checkout/{server_id}")
-async def generate_paddle_checkout(
-    server_id: uuid.UUID,
+@router.get("/paddle/checkout/{resource_type}/{resource_id}")
+async def generate_paddle_checkout_unified(
+    resource_type: str,
+    resource_id: uuid.UUID,
     plan_id: str,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     settings = get_settings()
-    server = db.get(Server, server_id)
-    if not server or server.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="Server not found")
+    
+    # Validate resource exists and belongs to user
+    if resource_type == "minecraft_server":
+        resource = db.get(Server, resource_id)
+    elif resource_type == "app_deployment":
+        resource = db.get(AppDeployment, resource_id)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid resource type")
+        
+    if not resource or resource.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Resource not found")
         
     plan = db.get(BillingPlan, plan_id)
     if not plan or not plan.active:
@@ -563,6 +650,14 @@ async def generate_paddle_checkout(
     if not paddle_price_id.startswith("pri_"):
         logger.error("Invalid paddle_price_id derived: %s", paddle_price_id)
         raise HTTPException(status_code=500, detail="Invalid Paddle price configuration.")
+        
+    custom_data = {
+        "resource_type": resource_type
+    }
+    if resource_type == "minecraft_server":
+        custom_data["server_id"] = str(resource.id)
+    elif resource_type == "app_deployment":
+        custom_data["deployment_id"] = str(resource.id)
     
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -578,9 +673,7 @@ async def generate_paddle_checkout(
                         "quantity": 1
                     }
                 ],
-                "custom_data": {
-                    "server_id": str(server.id)
-                }
+                "custom_data": custom_data
             }
         )
         
@@ -595,3 +688,20 @@ async def generate_paddle_checkout(
             raise HTTPException(status_code=500, detail="No checkout URL returned from Paddle")
             
         return {"checkout_url": checkout_url}
+
+
+@router.get("/paddle/checkout/{server_id}")
+async def generate_paddle_checkout_legacy(
+    server_id: uuid.UUID,
+    plan_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Deprecated legacy route. Redirects to the polymorphic route.
+    """
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(
+        url=f"/api/billing/paddle/checkout/minecraft_server/{server_id}?plan_id={plan_id}",
+        status_code=307
+    )

@@ -135,6 +135,20 @@ class ServerFlavor(str, enum.Enum):
     NEOFORGE = "neoforge"
 
 
+class DeploymentState(str, enum.Enum):
+    created = "created"
+    building = "building"
+    running = "running"
+    stopped = "stopped"
+    error = "error"
+
+
+class DomainStatus(str, enum.Enum):
+    pending_dns = "pending_dns"
+    active = "active"
+    failed = "failed"
+
+
 
 class User(Base):
     __tablename__ = "users"
@@ -163,6 +177,7 @@ class User(Base):
 
     refresh_tokens: Mapped[list["RefreshToken"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     servers: Mapped[list["Server"]] = relationship(back_populates="owner", cascade="all, delete-orphan")
+    deployments: Mapped[list["AppDeployment"]] = relationship(back_populates="owner", cascade="all, delete-orphan")
 
 
 class RefreshToken(Base):
@@ -270,7 +285,9 @@ class BillingSubscription(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
-    server_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=False)
+    server_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=True)
+    resource_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resource_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, index=True, nullable=True)
     plan_id: Mapped[str] = mapped_column(String(64), ForeignKey("plans.id"), index=True, nullable=False)
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
@@ -289,7 +306,9 @@ class BillingTransaction(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
-    server_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=False)
+    server_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=True)
+    resource_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resource_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, index=True, nullable=True)
     subscription_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("subscriptions.id"), nullable=True)
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     provider_order_id: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
@@ -315,11 +334,22 @@ class BillingAuditLog(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
-    server_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=False)
+    server_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=True)
+    resource_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resource_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, index=True, nullable=True)
     transaction_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("transactions.id"), nullable=True)
     action: Mapped[str] = mapped_column(String(64), nullable=False)
     details: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class ProcessedWebhookEvent(Base):
+    __tablename__ = "processed_webhook_events"
+
+    event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    processed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
 class Ban(Base):
@@ -510,6 +540,7 @@ class Node(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
     servers: Mapped[list["Server"]] = relationship(back_populates="node")
+    deployments: Mapped[list["AppDeployment"]] = relationship(back_populates="node")
 
 
 class RuntimeBinary(Base):
@@ -528,3 +559,56 @@ class RuntimeBinary(Base):
     installed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class AppDeployment(Base):
+    __tablename__ = "app_deployments"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    owner_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
+    node_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("nodes.id"), index=True, nullable=True)
+
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    docker_image: Mapped[str] = mapped_column(String(512), nullable=False)
+    internal_port: Mapped[int] = mapped_column(Integer, nullable=False)
+    host_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    state: Mapped[DeploymentState] = mapped_column(
+        Enum(DeploymentState), nullable=False, default=DeploymentState.created
+    )
+
+    env_vars: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    volume_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    volume_mount_path: Mapped[str] = mapped_column(String(512), nullable=False, default="/data")
+    container_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    ram_limit_mb: Mapped[int] = mapped_column(Integer, nullable=False, default=512)
+    cpu_limit: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+    owner: Mapped[User] = relationship(back_populates="deployments")
+    node: Mapped["Node"] = relationship(back_populates="deployments")
+    custom_domains: Mapped[list["CustomDomain"]] = relationship(back_populates="deployment", cascade="all, delete-orphan")
+
+
+class CustomDomain(Base):
+    __tablename__ = "custom_domains"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    deployment_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("app_deployments.id"), index=True, nullable=False)
+
+    domain: Mapped[str] = mapped_column(String(253), unique=True, index=True, nullable=False)
+    status: Mapped[DomainStatus] = mapped_column(
+        Enum(DomainStatus), nullable=False, default=DomainStatus.pending_dns
+    )
+    verification_token: Mapped[str] = mapped_column(String(64), nullable=False, default=lambda: uuid.uuid4().hex)
+    ssl_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+    deployment: Mapped[AppDeployment] = relationship(back_populates="custom_domains")

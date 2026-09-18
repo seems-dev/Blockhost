@@ -1,89 +1,197 @@
-import React, { useState, useEffect } from 'react';
-import { getNodes } from '../api';
+import React, { useState, useEffect, useCallback } from 'react';
+import { getNodes, evacuateNode } from '../api';
+import StatusBadge from '../components/StatusBadge';
+import { Modal } from '../components/Modal';
+import { RefreshCw, Cpu, MemoryStick, Server, Activity } from 'lucide-react';
+
+const fmt = (mb) => mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+
+function RamBar({ used, total, suspended }) {
+  const t = Math.max(1, total);
+  const activePct = Math.min(100, (used / t) * 100);
+  const suspPct = Math.min(100 - activePct, (suspended / t) * 100);
+  return (
+    <div title={`${fmt(used)} used / ${fmt(total)} total`}>
+      <div className="ram-bar" style={{ width: 120 }}>
+        <div className="ram-bar-segment" style={{ width: `${activePct}%`, background: activePct > 85 ? 'var(--red)' : activePct > 70 ? 'var(--amber)' : 'var(--green)' }} />
+        <div className="ram-bar-segment" style={{ width: `${suspPct}%`, background: 'var(--amber)', opacity: 0.5 }} />
+      </div>
+      <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2, fontFamily: 'var(--mono)' }}>
+        {activePct.toFixed(0)}%
+      </div>
+    </div>
+  );
+}
+
+const PROVIDER_LABEL = {
+  oracle_free: 'Oracle Free',
+  hetzner: 'Hetzner',
+  aws: 'AWS',
+  contabo: 'Contabo',
+  local: 'Local',
+  unknown: '—',
+};
 
 export default function Nodes() {
   const [nodes, setNodes] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [modal, setModal] = useState(null); // { type, node }
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState(null);
 
-  useEffect(() => {
-    loadNodes();
+  const showToast = (msg, ok = true) => {
+    setToast({ msg, ok });
+    setTimeout(() => setToast(null), 3000);
+  };
+
+  const load = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
+    try { setNodes(await getNodes()); } catch { }
+    setLoading(false);
   }, []);
 
-  const loadNodes = async () => {
-    setLoading(true);
+  useEffect(() => {
+    load();
+    const id = setInterval(() => load(true), 5000);
+    return () => clearInterval(id);
+  }, [load]);
+
+  const handleEvacuate = async () => {
+    setBusy(true);
     try {
-      const data = await getNodes();
-      setNodes(data);
+      await evacuateNode(modal.node.id);
+      showToast(`Node "${modal.node.name}" set to draining`);
+      load(true);
     } catch (err) {
-      console.error(err);
-      alert('Failed to load nodes');
-    }
-    setLoading(false);
+      showToast(err.response?.data?.detail || 'Failed', false);
+    } finally { setBusy(false); setModal(null); }
   };
 
-  if (loading) return <div className="text-white">Loading nodes...</div>;
+  if (loading) return <div style={{ color: 'var(--text-muted)' }}>Loading nodes…</div>;
 
-  const formatRam = (mb) => {
-    if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
-    return `${Math.round(mb)} MB`;
-  };
+  const totalRam = nodes.reduce((s, n) => s + n.total_ram_mb, 0);
+  const usedRam = nodes.reduce((s, n) => s + n.used_ram_mb, 0);
+  const onlineCount = nodes.filter(n => n.status === 'online').length;
 
   return (
-    <div>
-      <h2 className="text-2xl font-bold mb-6 text-white">Worker Nodes</h2>
-      
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        {nodes.map(node => (
-          <div key={node.id} className="bg-slate-800 rounded-lg p-6 border border-slate-700">
-            <div className="flex justify-between items-start mb-4">
-              <h3 className="text-lg font-bold text-white">{node.name}</h3>
-              <span className={`px-2 py-1 text-xs rounded font-bold ${
-                node.status === 'online' ? 'bg-emerald-900 text-emerald-400' : 'bg-red-900 text-red-400'
-              }`}>
-                {node.status.toUpperCase()}
-              </span>
-            </div>
-            
-            <div className="space-y-4 text-sm text-slate-300">
-              <div className="flex justify-between">
-                <span className="text-slate-500">IP Address:</span>
-                <span className="font-mono text-cyan-400">{node.ip_address}</span>
-              </div>
-              
-              <div>
-                <div className="flex justify-between mb-1">
-                  <span className="text-slate-500">RAM Usage:</span>
-                  <span>{formatRam(node.used_ram_mb)} / {formatRam(node.total_ram_mb)}</span>
-                </div>
-                <div className="w-full bg-slate-700 rounded-full h-2">
-                  <div 
-                    className="bg-cyan-500 h-2 rounded-full" 
-                    style={{ width: `${Math.min(100, (node.used_ram_mb / Math.max(1, node.total_ram_mb)) * 100)}%` }}
-                  ></div>
-                </div>
-              </div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      {/* Toast */}
+      {toast && (
+        <div style={{
+          position: 'fixed', top: 16, right: 16, zIndex: 999,
+          background: toast.ok ? 'var(--green-bg)' : 'var(--red-bg)',
+          border: `1px solid ${toast.ok ? 'var(--green)' : 'var(--red)'}`,
+          color: toast.ok ? 'var(--green)' : 'var(--red)',
+          padding: '10px 16px', borderRadius: 8, fontSize: 13, fontWeight: 500,
+        }}>{toast.msg}</div>
+      )}
 
-              <div>
-                <div className="flex justify-between mb-1">
-                  <span className="text-slate-500">CPU Usage:</span>
-                  <span>{node.cpu_usage_percent.toFixed(1)}%</span>
-                </div>
-                <div className="w-full bg-slate-700 rounded-full h-2">
-                  <div 
-                    className="bg-purple-500 h-2 rounded-full" 
-                    style={{ width: `${Math.min(100, node.cpu_usage_percent)}%` }}
-                  ></div>
-                </div>
-              </div>
-            </div>
-          </div>
-        ))}
-        {nodes.length === 0 && (
-          <div className="col-span-full p-12 text-center text-slate-500 bg-slate-800 rounded-lg border border-slate-700">
-            No worker nodes registered.
-          </div>
-        )}
+      {/* Header */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 }}>
+        <div>
+          <h2 style={{ fontSize: 18, marginBottom: 2 }}>Infrastructure Nodes</h2>
+          <p style={{ color: 'var(--text-secondary)', fontSize: 12 }}>
+            {onlineCount}/{nodes.length} online · {fmt(usedRam)} / {fmt(totalRam)} RAM used globally
+          </p>
+        </div>
+        <button className="btn btn-outline btn-sm" onClick={() => load(true)}>
+          <RefreshCw size={12} /> Refresh
+        </button>
       </div>
+
+      {/* Table */}
+      <div className="kpi-card" style={{ padding: 0, overflow: 'auto' }}>
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Node</th>
+              <th>IP Address</th>
+              <th>Provider</th>
+              <th>Status</th>
+              <th>RAM</th>
+              <th>CPU</th>
+              <th>Servers</th>
+              <th>Last Heartbeat</th>
+              <th style={{ textAlign: 'right' }}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {nodes.map(node => (
+              <tr key={node.id}>
+                <td>
+                  <div style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{node.name}</div>
+                  {!node.approved && <div style={{ fontSize: 10, color: 'var(--amber)', marginTop: 2 }}>⚠ Not approved</div>}
+                </td>
+                <td className="cell-mono">{node.ip_address}:{node.agent_port}</td>
+                <td>
+                  <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                    {PROVIDER_LABEL[node.provider] || node.provider || '—'}
+                  </span>
+                </td>
+                <td><StatusBadge status={node.status} /></td>
+                <td>
+                  <RamBar used={node.used_ram_mb} total={node.total_ram_mb} />
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: 'var(--mono)', marginTop: 2 }}>
+                    {fmt(node.used_ram_mb)} / {fmt(node.total_ram_mb)}
+                  </div>
+                </td>
+                <td>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <div className="ram-bar" style={{ width: 60 }}>
+                      <div className="ram-bar-segment" style={{
+                        width: `${node.cpu_usage_percent}%`,
+                        background: node.cpu_usage_percent > 85 ? 'var(--red)' : 'var(--accent)',
+                      }} />
+                    </div>
+                    <span style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--text-secondary)' }}>
+                      {node.cpu_usage_percent.toFixed(1)}%
+                    </span>
+                  </div>
+                </td>
+                <td>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
+                    <Server size={11} color="var(--text-muted)" />
+                    <span>{node.running_count}</span>
+                    <span style={{ color: 'var(--text-muted)' }}>/ {node.server_count}</span>
+                  </div>
+                </td>
+                <td style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                  {node.last_heartbeat
+                    ? new Date(node.last_heartbeat).toLocaleTimeString()
+                    : <span style={{ color: 'var(--red)' }}>Never</span>}
+                </td>
+                <td style={{ textAlign: 'right' }}>
+                  <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                    <button
+                      className="btn btn-outline btn-xs"
+                      onClick={() => setModal({ type: 'evacuate', node })}
+                      disabled={node.status === 'draining'}
+                      title="Move all servers off this node"
+                    >
+                      Evacuate
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+            {nodes.length === 0 && (
+              <tr><td colSpan={9} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 40 }}>No nodes registered.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Confirm Modal */}
+      {modal?.type === 'evacuate' && (
+        <Modal
+          title={`Evacuate Node "${modal.node.name}"`}
+          message={`This will set the node to DRAINING mode and trigger the rebalancer to migrate all ${modal.node.server_count} server(s) to other nodes. The node will not receive new server assignments until reactivated.`}
+          confirmText="Evacuate Node"
+          confirmDanger={false}
+          onConfirm={handleEvacuate}
+          onCancel={() => setModal(null)}
+        />
+      )}
     </div>
   );
 }

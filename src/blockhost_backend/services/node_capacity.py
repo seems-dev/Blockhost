@@ -37,7 +37,8 @@ def is_node_heartbeat_fresh(node: Node, *, now=None) -> bool:
 
 
 def compute_node_allocated_ram_mb(db: Session, node_id: uuid.UUID) -> int:
-    """Sum of plan RAM for all servers assigned to this node."""
+    from blockhost_backend.database.schema import AppDeployment, DeploymentState
+    
     total = 0
     servers = db.execute(
         select(Server).where(
@@ -48,6 +49,16 @@ def compute_node_allocated_ram_mb(db: Session, node_id: uuid.UUID) -> int:
     for server in servers:
         limits = get_effective_server_resource_limits(db=db, server=server)
         total += limits["ram_mb"]
+        
+    deployments = db.execute(
+        select(AppDeployment).where(
+            AppDeployment.node_id == node_id,
+            AppDeployment.state.in_([DeploymentState.building, DeploymentState.running])
+        )
+    ).scalars().all()
+    for dep in deployments:
+        total += dep.ram_limit_mb
+        
     return total
 
 
@@ -86,11 +97,20 @@ def select_best_node(db: Session, *, required_ram_mb: int = 0) -> Node | None:
             )
         ).scalars().all()
         
-        # FIX: Use get_effective_server_resource_limits instead of s.ram_mb
         active_ram = 0
         for s in active_servers:
             limits = get_effective_server_resource_limits(db=db, server=s)
             active_ram += limits.get("ram_mb", 0)
+            
+        from blockhost_backend.database.schema import AppDeployment, DeploymentState
+        active_deployments = db.execute(
+            select(AppDeployment).where(
+                AppDeployment.node_id == node.id,
+                AppDeployment.state.in_([DeploymentState.building, DeploymentState.running])
+            )
+        ).scalars().all()
+        for dep in active_deployments:
+            active_ram += dep.ram_limit_mb
             
         free = node.total_ram_mb - active_ram
         

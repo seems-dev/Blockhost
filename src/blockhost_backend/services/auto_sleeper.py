@@ -116,6 +116,26 @@ def _auto_sleeper_cycle() -> None:
                 logger.warning("[auto-sleeper] Failed to check/sleep deployment %s: %s", did, e)
                 db.rollback()
 
+        # 5. Check if any node became very empty (<10% active RAM) to trigger consolidation
+        from blockhost_backend.database.schema import Node, NodeState
+        from blockhost_backend.services.node_rebalancer import _node_active_ram_ratio, _rebalance_cycle
+        
+        online_nodes = db.execute(select(Node).where(Node.status == NodeState.online)).scalars().all()
+        needs_rebalance = False
+        for node in online_nodes:
+            ratio = _node_active_ram_ratio(node, db)
+            if 0 < ratio < 0.10:
+                logger.info("[auto-sleeper] Node %s active RAM ratio is %.1f%% — triggering rebalancer for consolidation", node.name, ratio * 100)
+                needs_rebalance = True
+                break
+                
+        if needs_rebalance:
+            try:
+                # Trigger it in a new thread so we don't block the sleeper loop
+                threading.Thread(target=_rebalance_cycle, name="auto-triggered-rebalance").start()
+            except Exception as e:
+                logger.error("[auto-sleeper] Failed to trigger rebalance cycle: %s", e)
+
 
 def _auto_sleeper_loop() -> None:
     """Background daemon loop."""

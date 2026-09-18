@@ -58,20 +58,7 @@ def _node_active_ram_ratio(node: Node, db: Session) -> float:
     """Return the fraction of RAM currently used by active servers (running/provisioning)."""
     if node.total_ram_mb <= 0:
         return 1.0
-    active_states = (ServerState.running, ServerState.provisioning, ServerState.syncing)
-    active_servers = db.execute(
-        select(Server).where(
-            Server.node_id == node.id,
-            Server.state.in_(active_states),
-        )
-    ).scalars().all()
-    
-    active_ram = 0
-    from blockhost_backend.orchestrator.resources import get_effective_server_resource_limits
-    for s in active_servers:
-        limits = get_effective_server_resource_limits(db=db, server=s)
-        active_ram += limits["ram_mb"]
-        
+    active_ram = _node_active_ram_mb(node, db)
     return active_ram / node.total_ram_mb
 
 
@@ -206,6 +193,17 @@ def _node_active_ram_mb(node: Node, db: Session) -> int:
     for s in active_servers:
         limits = get_effective_server_resource_limits(db=db, server=s)
         total += limits["ram_mb"]
+        
+    from blockhost_backend.database.schema import AppDeployment, DeploymentState
+    active_deployments = db.execute(
+        select(AppDeployment).where(
+            AppDeployment.node_id == node.id,
+            AppDeployment.state.in_([DeploymentState.building, DeploymentState.running])
+        )
+    ).scalars().all()
+    for dep in active_deployments:
+        total += dep.ram_limit_mb
+        
     return total
 
 
@@ -377,17 +375,32 @@ def _rebalance_cycle() -> None:
                 continue
 
             running = _running_servers_on_node(db, node.id)
-            if running:
-                continue  # Node has active servers — don't touch it
+            from blockhost_backend.database.schema import AppDeployment, DeploymentState
+            running_deployments = db.execute(
+                select(AppDeployment).where(
+                    AppDeployment.node_id == node.id,
+                    AppDeployment.state.in_([DeploymentState.building, DeploymentState.running])
+                )
+            ).scalars().all()
+            
+            if running or running_deployments:
+                continue  # Node has active workloads — don't touch it
 
             # Keep at least 1 node online
             remaining = [n for n in all_online if n.status == NodeState.online and n.id != node.id]
             if not remaining:
                 continue
 
-            # Reassign all suspended servers to another online node (EFS = files are already there)
+            # Reassign all suspended servers and deployments to another online node (EFS = files are already there)
             from blockhost_backend.api.servers import _allocate_port
             suspended = _all_servers_on_node(db, node.id)
+            
+            suspended_deployments = db.execute(
+                select(AppDeployment).where(
+                    AppDeployment.node_id == node.id
+                )
+            ).scalars().all()
+            
             target_node = remaining[0]  # Pick the first remaining online node
             reassign_failed = False
             for s in suspended:
@@ -403,12 +416,16 @@ def _rebalance_cycle() -> None:
                 db.flush()  # Make the port visible to the next _allocate_port call
                 logger.info("[rebalancer] Reassigned suspended server %s → %s port=%d (EFS)", s.id, target_node.name, s.vm_port)
 
+            for dep in suspended_deployments:
+                dep.node_id = target_node.id
+                logger.info("[rebalancer] Reassigned suspended deployment %s → %s", dep.id, target_node.name)
+
             if reassign_failed:
                 db.rollback()
                 continue
 
             # All servers reassigned — shut down the node
-            logger.info("[rebalancer] Shutting down node %s (0 running servers, %d suspended → reassigned to %s)", node.name, len(suspended), target_node.name)
+            logger.info("[rebalancer] Shutting down node %s (0 running workloads, %d servers and %d deployments reassigned to %s)", node.name, len(suspended), len(suspended_deployments), target_node.name)
             try:
                 provider = get_cloud_provider(node.provider)
                 provider.stop_instance(node.provider_instance_id)

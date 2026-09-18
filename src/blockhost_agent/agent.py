@@ -1710,6 +1710,17 @@ def get_deployment_status(
     }
 
 
+@app.get("/agent/deployments/{deployment_id}/network-rx")
+def get_deployment_network_rx(
+    deployment_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Return the current network rx bytes of a deployment container."""
+    _validate_server_id(deployment_id)
+    rx_bytes = docker_runtime.get_network_rx_bytes(deployment_id)
+    return {"rx_bytes": rx_bytes}
+
+
 @app.get("/agent/deployments/{deployment_id}/logs")
 def get_deployment_logs(
     deployment_id: str,

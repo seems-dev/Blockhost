@@ -80,6 +80,56 @@ class IngressService:
         except Exception as exc:
             logger.warning("Failed to connect to Caddy Admin API at %s: %s (Simulating route registration for dev)", self.admin_url, exc)
             # Return True in dev environment fallback so application logic succeeds without live Caddy container
+    async def register_fallback_route(self, domain: str) -> bool:
+        """Register a Caddy route that proxies to the Control Plane's wake-proxy."""
+        # Use an environment variable or default for the control plane internal address
+        control_plane_dial = os.getenv("CONTROL_PLANE_DIAL", "control-plane:8000")
+        logger.info("Registering Caddy fallback route for domain %s -> %s", domain, control_plane_dial)
+
+        route_payload: dict[str, Any] = {
+            "@id": f"domain-{domain}",
+            "match": [
+                {"host": [domain]}
+            ],
+            "handle": [
+                {
+                    "handler": "subroute",
+                    "routes": [
+                        {
+                            "handle": [
+                                # Rewrite the URI so the control plane knows it's the wake proxy
+                                {
+                                    "handler": "rewrite",
+                                    "uri": f"/api/public/wake-proxy/{domain}"
+                                },
+                                {
+                                    "handler": "reverse_proxy",
+                                    "upstreams": [{"dial": control_plane_dial}]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ],
+            "terminal": True
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                url = f"{self.admin_url}/config/apps/http/servers/srv0/routes"
+                # To update an existing route, we delete it first then post (or use PUT /id/domain-x)
+                # But Caddy allows PUT /id/...
+                put_url = f"{self.admin_url}/id/domain-{domain}"
+                # Let's just DELETE and POST to be safe and avoid id conflicts if it doesn't exist
+                await client.delete(put_url)
+                resp = await client.post(url, json=route_payload)
+                if resp.status_code in (200, 201):
+                    logger.info("Successfully registered Caddy fallback route for %s", domain)
+                    return True
+                logger.warning("Caddy API returned status %d on fallback route: %s", resp.status_code, resp.text)
+                return False
+        except Exception as exc:
+            logger.warning("Failed to connect to Caddy Admin API: %s", exc)
             return True
 
     async def unregister_route(self, domain: str) -> bool:

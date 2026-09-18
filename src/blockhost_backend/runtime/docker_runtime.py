@@ -219,6 +219,20 @@ class DockerRuntime:
             exit_code=state_info.get("ExitCode"),
         )
 
+    def get_network_rx_bytes(self, deployment_id: str) -> int:
+        """Return the network rx_bytes for the container."""
+        container = self._find_container(deployment_id)
+        if container is None:
+            return 0
+        try:
+            stats = container.stats(stream=False)
+            networks = stats.get("networks", {})
+            rx_bytes = sum(net.get("rx_bytes", 0) for net in networks.values())
+            return rx_bytes
+        except docker.errors.APIError as exc:
+            logger.warning("Failed to read stats for deployment %s: %s", deployment_id, exc)
+            return 0
+
     def get_logs(self, deployment_id: str, tail: int = 200) -> list[str]:
         """Return the last *tail* log lines from the container."""
         container = self._find_container(deployment_id)

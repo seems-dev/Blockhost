@@ -139,6 +139,7 @@ class DeploymentState(str, enum.Enum):
     created = "created"
     building = "building"
     running = "running"
+    suspended = "suspended"
     stopped = "stopped"
     error = "error"
 
@@ -583,6 +584,7 @@ class AppDeployment(Base):
 
     ram_limit_mb: Mapped[int] = mapped_column(Integer, nullable=False, default=512)
     cpu_limit: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    last_network_rx: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 

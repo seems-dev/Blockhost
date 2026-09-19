@@ -149,7 +149,7 @@ def stop_deployment(
     if dep.state in (DeploymentState.building, DeploymentState.stopped):
         raise HTTPException(status_code=400, detail="Deployment is currently mutating state")
 
-    dep.state = DeploymentState.stopping
+    dep.state = DeploymentState.stopped
     db.commit()
 
     if dep.node_id:

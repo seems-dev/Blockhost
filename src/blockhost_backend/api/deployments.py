@@ -107,7 +107,6 @@ def create_deployment(
 @router.post("/{deployment_id}/start", response_model=DeploymentOut)
 def start_deployment(
     deployment_id: uuid.UUID,
-    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -115,9 +114,6 @@ def start_deployment(
     
     if dep.state == DeploymentState.running:
         return dep
-
-    if dep.state in (DeploymentState.building, DeploymentState.stopping):
-        raise HTTPException(status_code=400, detail="Deployment is currently mutating state")
 
     dep.state = DeploymentState.building
     db.commit()
@@ -132,7 +128,9 @@ def start_deployment(
         dep.node_id = node.id
         db.commit()
 
-    background_tasks.add_task(provision_resource, "app_deployment", dep.id)
+    # Run synchronously so we can see the error in the logs
+    provision_resource("app_deployment", str(dep.id))
+    
     db.refresh(dep)
     return dep
 

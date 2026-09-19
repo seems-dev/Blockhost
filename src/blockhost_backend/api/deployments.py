@@ -81,7 +81,9 @@ def create_deployment(
     if not node:
         raise HTTPException(status_code=503, detail="No capacity available")
 
+    dep_id = uuid.uuid4()
     dep = AppDeployment(
+        id=dep_id,
         owner_id=user.id,
         node_id=node.id,
         name=payload.name,
@@ -90,6 +92,7 @@ def create_deployment(
         ram_limit_mb=payload.ram_limit_mb,
         cpu_limit=payload.cpu_limit,
         state=DeploymentState.created,
+        volume_path=f"/var/lib/blockhost/deployments/{dep_id}",
     )
     db.add(dep)
     db.commit()

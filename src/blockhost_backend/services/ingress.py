@@ -14,7 +14,7 @@ import logging
 import os
 import socket
 from typing import Any
-
+import dns.resolver
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -149,30 +149,24 @@ class IngressService:
             return True
 
     @staticmethod
-    async def verify_dns_cname(domain: str, expected_target: str = INGRESS_HOST) -> bool:
-        """Verify that *domain* resolves to *expected_target* via DNS lookups."""
-        logger.info("Verifying DNS resolution for domain %s against target %s", domain, expected_target)
-
+    def verify_dns(domain: str, expected_ip: str) -> bool:
+        """Verify that *domain* A-record resolves to *expected_ip*."""
+        logger.info("Verifying DNS A record for %s against target IP %s", domain, expected_ip)
+        
         # In non-production or test mode, bypass live DNS resolution for local/test domains
         if domain.endswith(".test") or domain.endswith(".local") or os.getenv("TESTING") == "1":
             logger.info("Test/Local domain detected (%s) — passing DNS check", domain)
             return True
 
-        loop = asyncio.get_running_loop()
         try:
-            # Resolve domain IPv4 / IPv6 addresses
-            addr_info = await loop.getaddrinfo(domain, None, family=socket.AF_UNSPEC)
-            resolved_ips = {item[4][0] for item in addr_info}
-
-            # Resolve expected target addresses
-            target_info = await loop.getaddrinfo(expected_target, None, family=socket.AF_UNSPEC)
-            target_ips = {item[4][0] for item in target_info}
-
-            # Domain is valid if resolved IPs intersect with target IPs
-            matching = bool(resolved_ips.intersection(target_ips))
-            logger.info("DNS verification for %s: resolved=%s target=%s match=%s", domain, resolved_ips, target_ips, matching)
-            return matching
-        except socket.gaierror as exc:
+            answers = dns.resolver.resolve(domain, 'A')
+            for rdata in answers:
+                if str(rdata) == expected_ip:
+                    logger.info("DNS verification successful for %s", domain)
+                    return True
+            logger.warning("DNS verification failed for %s. Found: %s", domain, [str(r) for r in answers])
+            return False
+        except Exception as exc:
             logger.warning("DNS lookup failed for %s: %s", domain, exc)
             return False
 

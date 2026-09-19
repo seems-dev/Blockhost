@@ -146,8 +146,8 @@ async def verify_custom_domain(
 
     deployment = _get_deployment_for_user(domain_rec.deployment_id, user, db)
 
-    # Verify DNS CNAME pointing
-    dns_valid = await ingress_service.verify_dns_cname(domain_rec.domain)
+    # Verify DNS A record pointing
+    dns_valid = ingress_service.verify_dns(domain_rec.domain, "13.211.137.42")
     if not dns_valid:
         domain_rec.status = DomainStatus.failed
         domain_rec.error_message = f"DNS record for {domain_rec.domain} does not point to ingress host."

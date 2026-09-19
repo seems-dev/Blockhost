@@ -9,10 +9,11 @@ services:
       POSTGRES_USER: blockhost
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-postgres}
       POSTGRES_DB: blockhost
+      POSTGRES_HOST_AUTH_METHOD: trust
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "127.0.0.1:5432:5432"
+      - "0.0.0.0:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U blockhost -d blockhost"]
       interval: 30s

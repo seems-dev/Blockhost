@@ -146,7 +146,7 @@ def stop_deployment(
     if dep.state == DeploymentState.suspended:
         return dep
 
-    if dep.state in (DeploymentState.building, DeploymentState.stopping):
+    if dep.state in (DeploymentState.building, DeploymentState.stopped):
         raise HTTPException(status_code=400, detail="Deployment is currently mutating state")
 
     dep.state = DeploymentState.stopping

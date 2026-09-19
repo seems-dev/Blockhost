@@ -53,6 +53,11 @@ export const forceStartServer = (serverId) => api.post(`/api/admin/servers/${ser
 export const getNodes = () => api.get('/api/admin/nodes').then(r => r.data);
 export const evacuateNode = (nodeId) => api.post(`/api/admin/nodes/${nodeId}/evacuate`).then(r => r.data);
 
+// Deployments (Apps & DBs)
+export const getDeployments = (params = {}) => api.get('/api/admin/deployments', { params }).then(r => r.data);
+export const forceStopDeployment = (deploymentId) => api.post(`/api/admin/deployments/${deploymentId}/force-stop`).then(r => r.data);
+export const forceStartDeployment = (deploymentId) => api.post(`/api/admin/deployments/${deploymentId}/force-start`).then(r => r.data);
+
 // Transactions
 export const getTransactions = (params = {}) => api.get('/api/admin/transactions', { params }).then(r => r.data);
 

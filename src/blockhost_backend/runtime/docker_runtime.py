@@ -249,6 +249,53 @@ class DockerRuntime:
             logger.warning("Failed to read logs for deployment %s: %s", deployment_id, exc)
             return []
 
+    def build_from_github(self, repo_url: str, branch: str, deployment_id: str) -> str:
+        """
+        Clone a GitHub repository and build a Docker image locally.
+        Returns the new image tag.
+        """
+        import subprocess
+        import tempfile
+        import shutil
+        from pathlib import Path
+
+        tag = f"blockhost-build-{deployment_id}"
+        logger.info("Starting GitHub build for %s (branch: %s) -> %s", repo_url, branch, tag)
+
+        build_dir = Path(tempfile.mkdtemp(prefix=f"build-{deployment_id}-"))
+        try:
+            # 1. Clone repo
+            logger.info("Cloning %s into %s", repo_url, build_dir)
+            result = subprocess.run(
+                ["git", "clone", "--depth", "1", "-b", branch, repo_url, str(build_dir)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                logger.error("Git clone failed:\nSTDOUT:\n%s\nSTDERR:\n%s", result.stdout, result.stderr)
+                raise RuntimeError(f"Git clone failed: {result.stderr}")
+
+            # 2. Build Docker image
+            logger.info("Building Docker image %s from %s", tag, build_dir)
+            try:
+                # The python docker SDK build method streams logs or returns image tuple
+                image, build_logs = self.client.images.build(path=str(build_dir), tag=tag, rm=True)
+                logger.info("Successfully built image %s", tag)
+            except docker.errors.BuildError as exc:
+                build_log_text = "\n".join([line.get('stream', '') for line in exc.build_log if 'stream' in line])
+                logger.error("Docker build failed for %s:\n%s", tag, build_log_text)
+                raise RuntimeError(f"Docker build failed: {exc}")
+            except docker.errors.APIError as exc:
+                logger.error("Docker API error during build for %s: %s", tag, exc)
+                raise RuntimeError(f"Docker API error: {exc}")
+
+            return tag
+        finally:
+            # 3. Cleanup temp dir
+            shutil.rmtree(build_dir, ignore_errors=True)
+
+
     def remove_deployment(self, deployment_id: str) -> None:
         """Force-remove the container (even if running)."""
         container = self._find_container(deployment_id)

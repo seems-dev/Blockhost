@@ -23,12 +23,22 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/deployments", tags=["deployments"])
 
+from pydantic import BaseModel, Field, model_validator
+
 class CreateDeploymentRequest(BaseModel):
     name: str = Field(..., max_length=100)
-    docker_image: str = Field(..., max_length=200)
+    docker_image: str | None = Field(None, max_length=200)
     internal_port: int = Field(..., ge=1, le=65535)
     ram_limit_mb: int = Field(..., ge=128)
     cpu_limit: float = Field(0.5, ge=0.1)
+    github_repo_url: str | None = Field(None, max_length=512)
+    github_branch: str = Field("main", max_length=128)
+
+    @model_validator(mode='after')
+    def check_image_or_repo(self) -> "CreateDeploymentRequest":
+        if bool(self.docker_image) == bool(self.github_repo_url):
+            raise ValueError("Must provide exactly one of docker_image or github_repo_url")
+        return self
 
 
 class DeploymentOut(BaseModel):
@@ -49,6 +59,8 @@ class DeploymentOut(BaseModel):
     volume_path: str | None = None
     volume_mount_path: str | None = None
     last_network_rx: int | None = None
+    github_repo_url: str | None = None
+    github_branch: str = "main"
     created_at: datetime
     updated_at: datetime
 
@@ -82,17 +94,24 @@ def create_deployment(
         raise HTTPException(status_code=503, detail="No capacity available")
 
     dep_id = uuid.uuid4()
+    
+    resolved_image = payload.docker_image
+    if payload.github_repo_url:
+        resolved_image = f"blockhost-build-{dep_id}"
+
     dep = AppDeployment(
         id=dep_id,
         owner_id=user.id,
         node_id=node.id,
         name=payload.name,
-        docker_image=payload.docker_image,
+        docker_image=resolved_image,
         internal_port=payload.internal_port,
         ram_limit_mb=payload.ram_limit_mb,
         cpu_limit=payload.cpu_limit,
         state=DeploymentState.created,
         volume_path=f"/var/lib/blockhost/deployments/{dep_id}",
+        github_repo_url=payload.github_repo_url,
+        github_branch=payload.github_branch,
     )
     db.add(dep)
     db.commit()

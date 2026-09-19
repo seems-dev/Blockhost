@@ -11,7 +11,7 @@ from blockhost_backend.database.db import get_db
 from blockhost_backend.database.schema import (
     User, Server, BillingTransaction, BillingSubscription,
     ServerState, BlockcoinTransaction, BlockcoinReason, Node, NodeState,
-    BillingTransactionStatus, BillingAuditLog,
+    BillingTransactionStatus, BillingAuditLog, AppDeployment, DeploymentState
 )
 from blockhost_backend.database.schema import utcnow
 
@@ -29,6 +29,10 @@ def get_global_stats(
     total_servers = db.scalar(select(func.count(Server.id))) or 0
     running_servers = db.scalar(select(func.count(Server.id)).where(Server.state == ServerState.running)) or 0
     suspended_servers = db.scalar(select(func.count(Server.id)).where(Server.state == ServerState.suspended)) or 0
+
+    total_deployments = db.scalar(select(func.count(AppDeployment.id))) or 0
+    running_deployments = db.scalar(select(func.count(AppDeployment.id)).where(AppDeployment.state == DeploymentState.running)) or 0
+    suspended_deployments = db.scalar(select(func.count(AppDeployment.id)).where(AppDeployment.state == DeploymentState.suspended)) or 0
 
     total_revenue = db.scalar(
         select(func.sum(BillingTransaction.amount)).where(
@@ -103,6 +107,9 @@ def get_global_stats(
         "total_servers": total_servers,
         "running_servers": running_servers,
         "suspended_servers": suspended_servers,
+        "total_deployments": total_deployments,
+        "running_deployments": running_deployments,
+        "suspended_deployments": suspended_deployments,
         "total_revenue": float(total_revenue),
         "mrr": float(mrr),
         "total_nodes": total_nodes,
@@ -192,6 +199,59 @@ def list_all_servers(
             needle = search.lower()
             if not (
                 needle in row["world_name"].lower()
+                or needle in row["owner_email"].lower()
+                or (node_name and needle in node_name.lower())
+            ):
+                continue
+        if state and row["state"] != state:
+            continue
+
+        result.append(row)
+
+    return result
+
+
+@router.get("/deployments")
+def list_all_deployments(
+    search: Optional[str] = None,
+    state: Optional[str] = None,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """See all app deployments across all users with owner + node enrichment."""
+    query = select(AppDeployment).options(
+        joinedload(AppDeployment.owner),
+        joinedload(AppDeployment.node),
+    ).order_by(desc(AppDeployment.created_at)).limit(200)
+
+    deployments = db.execute(query).unique().scalars().all()
+
+    result = []
+    for d in deployments:
+        owner_email = d.owner.email if d.owner else str(d.owner_id)
+        node_name = d.node.name if d.node else None
+        node_ip = d.node.ip_address if d.node else None
+
+        row = {
+            "id": str(d.id),
+            "owner_id": str(d.owner_id),
+            "owner_email": owner_email,
+            "name": d.name,
+            "docker_image": d.docker_image,
+            "state": d.state.value,
+            "node_name": node_name,
+            "node_ip": node_ip,
+            "internal_port": d.internal_port,
+            "host_port": d.host_port,
+            "ram_limit_mb": d.ram_limit_mb,
+            "cpu_limit": float(d.cpu_limit),
+            "created_at": d.created_at.isoformat(),
+        }
+
+        if search:
+            needle = search.lower()
+            if not (
+                needle in row["name"].lower()
                 or needle in row["owner_email"].lower()
                 or (node_name and needle in node_name.lower())
             ):
@@ -344,6 +404,71 @@ def admin_force_start_server(
         orchestrator.start_server(server=server)
         server.state = ServerState.running
         db.commit()
+        return {"status": "started"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/deployments/{deployment_id}/force-stop")
+def admin_force_stop_deployment(
+    deployment_id: str,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Force stop an app deployment."""
+    import httpx
+    from blockhost_backend.config.config_manager import get_settings
+    
+    deployment = db.get(AppDeployment, deployment_id)
+    if not deployment:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+
+    if not deployment.node_id:
+        raise HTTPException(status_code=400, detail="Deployment is not assigned to a node")
+        
+    node = db.get(Node, deployment.node_id)
+    if not node:
+        raise HTTPException(status_code=400, detail="Node not found")
+        
+    settings = get_settings()
+    agent_url = f"http://{node.ip_address}:{node.agent_port}/agent/deployments/{deployment.id}/stop"
+    
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.post(
+                agent_url,
+                headers={"Authorization": f"Bearer {settings.worker_agent_token}"}
+            )
+            resp.raise_for_status()
+            
+        deployment.state = DeploymentState.suspended
+        db.commit()
+        return {"status": "stopped"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to communicate with agent: {str(e)}")
+
+
+@router.post("/deployments/{deployment_id}/force-start")
+def admin_force_start_deployment(
+    deployment_id: str,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Force start an app deployment."""
+    from blockhost_backend.services.provisioning import provision_resource
+    from fastapi import BackgroundTasks
+    
+    deployment = db.get(AppDeployment, deployment_id)
+    if not deployment:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+        
+    deployment.state = DeploymentState.starting
+    db.commit()
+    
+    # We run this synchronously so it fails fast if agent is down, or we could use background tasks.
+    # Let's just use provision_resource synchronously since admin is waiting
+    try:
+        provision_resource("app_deployment", deployment.id)
         return {"status": "started"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

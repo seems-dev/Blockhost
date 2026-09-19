@@ -15,6 +15,7 @@ final _templates = [
   _AppTemplate('Redis', 'redis:latest', 6379),
   _AppTemplate('Nginx Web Server', 'nginx:latest', 80),
   _AppTemplate('Node.js 18', 'node:18', 3000),
+  _AppTemplate('GitHub Repository', '', 80),
   _AppTemplate('Custom', '', 80),
 ];
 
@@ -30,6 +31,8 @@ class _CreateDeploymentScreenState extends State<CreateDeploymentScreen> {
   final _nameCtrl = TextEditingController();
   final _imageCtrl = TextEditingController();
   final _portCtrl = TextEditingController();
+  final _githubRepoCtrl = TextEditingController();
+  final _githubBranchCtrl = TextEditingController(text: 'main');
 
   _AppTemplate _selectedTemplate = _templates.first;
   int _selectedRamMb = 512;
@@ -42,7 +45,7 @@ class _CreateDeploymentScreenState extends State<CreateDeploymentScreen> {
   }
 
   void _applyTemplate() {
-    if (_selectedTemplate.label != 'Custom') {
+    if (_selectedTemplate.label != 'Custom' && _selectedTemplate.label != 'GitHub Repository') {
       _imageCtrl.text = _selectedTemplate.image;
       _portCtrl.text = _selectedTemplate.port.toString();
     }
@@ -52,8 +55,12 @@ class _CreateDeploymentScreenState extends State<CreateDeploymentScreen> {
     final name = _nameCtrl.text.trim();
     final image = _imageCtrl.text.trim();
     final port = int.tryParse(_portCtrl.text.trim()) ?? 0;
+    final githubRepo = _githubRepoCtrl.text.trim();
+    final githubBranch = _githubBranchCtrl.text.trim();
 
-    if (name.isEmpty || image.isEmpty || port <= 0) {
+    final isGithub = _selectedTemplate.label == 'GitHub Repository';
+
+    if (name.isEmpty || port <= 0 || (isGithub ? githubRepo.isEmpty : image.isEmpty)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Please fill all fields correctly')),
       );
@@ -64,9 +71,11 @@ class _CreateDeploymentScreenState extends State<CreateDeploymentScreen> {
     try {
       await widget.state.api.createDeployment(
         name: name,
-        dockerImage: image,
+        dockerImage: isGithub ? null : image,
         internalPort: port,
         ramLimitMb: _selectedRamMb,
+        githubRepoUrl: isGithub ? githubRepo : null,
+        githubBranch: isGithub ? githubBranch : null,
       );
       if (mounted) {
         Navigator.pop(context, true);
@@ -131,9 +140,15 @@ class _CreateDeploymentScreenState extends State<CreateDeploymentScreen> {
                             },
                           ),
                           const SizedBox(height: 16),
-                          _buildTextField('Docker Image', _imageCtrl, 'e.g., postgres:16', enabled: _selectedTemplate.label == 'Custom'),
+                          if (_selectedTemplate.label == 'GitHub Repository') ...[
+                            _buildTextField('GitHub Repository URL', _githubRepoCtrl, 'e.g., https://github.com/user/repo'),
+                            const SizedBox(height: 16),
+                            _buildTextField('Branch', _githubBranchCtrl, 'e.g., main'),
+                          ] else ...[
+                            _buildTextField('Docker Image', _imageCtrl, 'e.g., postgres:16', enabled: _selectedTemplate.label == 'Custom'),
+                          ],
                           const SizedBox(height: 16),
-                          _buildTextField('Internal Port', _portCtrl, 'e.g., 5432', keyboardType: TextInputType.number, enabled: _selectedTemplate.label == 'Custom'),
+                          _buildTextField('Internal Port', _portCtrl, 'e.g., 5432', keyboardType: TextInputType.number, enabled: _selectedTemplate.label == 'Custom' || _selectedTemplate.label == 'GitHub Repository'),
                           const SizedBox(height: 16),
                           const Text('RAM Limit', style: TextStyle(color: Colors.white70, fontSize: 12)),
                           const SizedBox(height: 8),

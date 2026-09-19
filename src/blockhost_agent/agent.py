@@ -1656,6 +1656,44 @@ def agent_delete_mod(
 # Deployment Lifecycle (Docker-based PaaS)
 # ---------------------------------------------------------------------------
 
+_build_status: dict[str, str] = {}
+
+class BuildGithubPayload(BaseModel):
+    repo_url: str
+    branch: str = "main"
+
+def _run_github_build(deployment_id: str, repo_url: str, branch: str) -> None:
+    try:
+        _build_status[deployment_id] = "building"
+        docker_runtime.build_from_github(repo_url, branch, deployment_id)
+        _build_status[deployment_id] = "success"
+    except Exception as exc:
+        logger.error("GitHub build failed for %s: %s", deployment_id, exc)
+        _build_status[deployment_id] = "error"
+
+@app.post("/agent/deployments/{deployment_id}/build-github")
+def build_github(
+    deployment_id: str,
+    payload: BuildGithubPayload,
+    background_tasks: BackgroundTasks,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Clone a GitHub repository and build a Docker image in the background."""
+    _validate_server_id(deployment_id)
+    background_tasks.add_task(_run_github_build, deployment_id, payload.repo_url, payload.branch)
+    return {"status": "accepted"}
+
+@app.get("/agent/deployments/{deployment_id}/build-status")
+def get_build_status(
+    deployment_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Return the current GitHub build status."""
+    _validate_server_id(deployment_id)
+    status = _build_status.get(deployment_id, "unknown")
+    return {"status": status}
+
+
 
 @app.post("/agent/deployments/{deployment_id}/start")
 def start_deployment(

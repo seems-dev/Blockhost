@@ -807,9 +807,11 @@ class ErexApi {
 
   Future<AppDeployment> createDeployment({
     required String name,
-    required String dockerImage,
+    String? dockerImage,
     required int internalPort,
     required int ramLimitMb,
+    String? githubRepoUrl,
+    String? githubBranch,
   }) async {
     final res = await http.post(
       _u('/api/deployments'),
@@ -819,6 +821,8 @@ class ErexApi {
         'docker_image': dockerImage,
         'internal_port': internalPort,
         'ram_limit_mb': ramLimitMb,
+        if (githubRepoUrl != null) 'github_repo_url': githubRepoUrl,
+        if (githubBranch != null) 'github_branch': githubBranch,
       }),
     );
     final body = _decodeJson(res.body);

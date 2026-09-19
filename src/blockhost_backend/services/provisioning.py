@@ -87,9 +87,55 @@ def _provision_app_deployment(db: Session, deployment_id: uuid.UUID) -> None:
             if not node:
                 raise RuntimeError(f"Assigned node {deployment.node_id} no longer exists")
 
-        # Step 2: Make HTTP call to Agent
-        agent_url = f"http://{node.ip_address}:{node.agent_port}/agent/deployments/{deployment.id}/start"
+        # Step 1.5: Trigger GitHub Build if needed
         settings = get_settings()
+        if deployment.github_repo_url:
+            logger.info("Triggering GitHub build for %s on node %s", deployment.id, node.id)
+            build_url = f"http://{node.ip_address}:{node.agent_port}/agent/deployments/{deployment.id}/build-github"
+            build_payload = {
+                "repo_url": deployment.github_repo_url,
+                "branch": deployment.github_branch
+            }
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(
+                    build_url,
+                    headers={"Authorization": f"Bearer {settings.worker_agent_token}"},
+                    json=build_payload
+                )
+                resp.raise_for_status()
+
+            # Poll for build status
+            status_url = f"http://{node.ip_address}:{node.agent_port}/agent/deployments/{deployment.id}/build-status"
+            import time
+            while True:
+                # Ensure the UI knows we are building
+                if deployment.state != DeploymentState.building:
+                    deployment.state = DeploymentState.building
+                    db.commit()
+
+                with httpx.Client(timeout=10.0) as client:
+                    resp = client.get(
+                        status_url,
+                        headers={"Authorization": f"Bearer {settings.worker_agent_token}"}
+                    )
+                    resp.raise_for_status()
+                    status_data = resp.json()
+                    build_status = status_data.get("status")
+
+                if build_status == "success":
+                    logger.info("GitHub build succeeded for %s", deployment.id)
+                    break
+                elif build_status == "error":
+                    raise RuntimeError("GitHub build failed on the agent. Check agent logs.")
+                elif build_status == "unknown":
+                    raise RuntimeError("GitHub build status unknown.")
+                
+                logger.info("Build for %s still in progress... waiting 5 seconds.", deployment.id)
+                time.sleep(5)
+
+
+        # Step 2: Make HTTP call to Agent to start container
+        agent_url = f"http://{node.ip_address}:{node.agent_port}/agent/deployments/{deployment.id}/start"
         
         logger.info("Sending start request to agent at %s for deployment %s", agent_url, deployment.id)
         

@@ -586,6 +586,9 @@ class AppDeployment(Base):
     cpu_limit: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
     last_network_rx: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
+    github_repo_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    github_branch: Mapped[str] = mapped_column(String(128), nullable=False, default="main")
+
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)

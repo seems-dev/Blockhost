@@ -606,6 +606,42 @@ async def paddle_webhook(request: Request, background_tasks: BackgroundTasks, db
                     sub.status = BillingSubscriptionStatus.active
                     sub.provider_subscription_id = subscription_id
             
+            # Create a BillingTransaction record for this payment
+            transaction_id_str = data.get("id", "txn_unknown_" + str(uuid.uuid4())[:8])
+            # Check if transaction already exists
+            existing_tx = db.execute(
+                select(BillingTransaction).where(BillingTransaction.provider_order_id == transaction_id_str)
+            ).scalars().first()
+            
+            if not existing_tx:
+                amount_str = "0"
+                currency = "USD"
+                try:
+                    currency = data.get("currency_code", "USD")
+                    totals = data.get("details", {}).get("totals", {})
+                    grand_total = totals.get("grand_total", "0")
+                    # Paddle usually sends totals in minor units (cents) as strings or ints
+                    amount = Decimal(grand_total) / Decimal(100)
+                except Exception:
+                    amount = Decimal("0")
+                    
+                tx = BillingTransaction(
+                    user_id=resource.owner_id,
+                    server_id=resource_id if resource_type == "minecraft_server" else None,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    subscription_id=sub.id if sub else None,
+                    provider="paddle",
+                    provider_order_id=transaction_id_str,
+                    provider_payment_id=transaction_id_str,
+                    amount=amount,
+                    currency=currency,
+                    status=BillingTransactionStatus.success,
+                    completed_at=utcnow(),
+                    target_plan_id=sub.plan_id if sub else (plan.id if 'plan' in locals() else "unknown")
+                )
+                db.add(tx)
+
             # Start provisioning in background
             background_tasks.add_task(provision_resource, resource_type, resource_id)
             db.commit()

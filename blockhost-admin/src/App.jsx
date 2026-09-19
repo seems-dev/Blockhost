@@ -3,7 +3,7 @@ import { BrowserRouter, Routes, Route, NavLink, useLocation } from 'react-router
 import {
   LayoutDashboard, Server, Users, Network, CreditCard,
   ScrollText, LogOut, Menu, X, RefreshCw, Shield,
-  ChevronLeft,
+  ChevronLeft, AppWindow
 } from 'lucide-react';
 import Dashboard from './pages/Dashboard';
 import Servers from './pages/Servers';
@@ -11,13 +11,15 @@ import Transactions from './pages/Transactions';
 import UsersPage from './pages/Users';
 import Nodes from './pages/Nodes';
 import AuditLogs from './pages/AuditLogs';
+import Deployments from './pages/Deployments';
 import { loginAdmin, logoutAdmin } from './api';
 
 const NAV = [
   { to: '/',            icon: LayoutDashboard, label: 'Overview' },
   { to: '/nodes',       icon: Network,         label: 'Nodes' },
   { to: '/users',       icon: Users,           label: 'Users' },
-  { to: '/servers',     icon: Server,          label: 'Servers' },
+  { to: '/servers',     icon: Server,          label: 'Minecraft' },
+  { to: '/deployments', icon: AppWindow,       label: 'Apps & DBs' },
   { to: '/transactions',icon: CreditCard,      label: 'Billing' },
   { to: '/audit',       icon: ScrollText,      label: 'Audit Logs' },
 ];
@@ -217,6 +219,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/servers" element={<Servers />} />
+          <Route path="/deployments" element={<Deployments />} />
           <Route path="/transactions" element={<Transactions />} />
           <Route path="/users" element={<UsersPage />} />
           <Route path="/nodes" element={<Nodes />} />

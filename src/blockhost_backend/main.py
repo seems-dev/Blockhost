@@ -86,6 +86,9 @@ def create_app() -> FastAPI:
     from blockhost_backend.api import domains as domains_routes
     from blockhost_backend.api import internal as internal_routes
     from blockhost_backend.api import wake_proxy as wake_proxy_routes
+    from blockhost_backend.api import deployments as deployments_routes
+    
+    app.include_router(deployments_routes.router)
     app.include_router(domains_routes.router)
     app.include_router(internal_routes.router, prefix="/api")
     app.include_router(wake_proxy_routes.router, prefix="/api")

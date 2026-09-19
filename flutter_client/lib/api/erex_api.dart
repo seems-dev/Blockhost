@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 
 import '../models/backup_models.dart';
 import '../models/ban_models.dart';
+import '../models/deployment_models.dart';
 import '../models/mod_models.dart';
 
 class ApiException implements Exception {
@@ -787,6 +788,84 @@ class ErexApi {
       final decoded = _decodeJson(res.body);
       throw ApiException(_err(decoded, res.statusCode));
     }
+  }
+
+  // ─── Deployments (PaaS) ──────────────────────────────────────────────────
+
+  Future<List<AppDeployment>> getDeployments() async {
+    final res = await http.get(
+      _u('/api/deployments'),
+      headers: _headers(json: false, auth: true),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+    if (body is List) {
+      return body.map((e) => AppDeployment.fromJson(e as Map<String, dynamic>)).toList();
+    }
+    throw ApiException('Unexpected response');
+  }
+
+  Future<AppDeployment> createDeployment({
+    required String name,
+    required String dockerImage,
+    required int internalPort,
+    required int ramLimitMb,
+  }) async {
+    final res = await http.post(
+      _u('/api/deployments'),
+      headers: _headers(auth: true),
+      body: jsonEncode({
+        'name': name,
+        'docker_image': dockerImage,
+        'internal_port': internalPort,
+        'ram_limit_mb': ramLimitMb,
+      }),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 201) throw ApiException(_err(body, res.statusCode));
+    return AppDeployment.fromJson(body as Map<String, dynamic>);
+  }
+
+  Future<AppDeployment> startDeployment(String id) async {
+    final res = await http.post(
+      _u('/api/deployments/$id/start'),
+      headers: _headers(json: false, auth: true),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+    return AppDeployment.fromJson(body as Map<String, dynamic>);
+  }
+
+  Future<AppDeployment> stopDeployment(String id) async {
+    final res = await http.post(
+      _u('/api/deployments/$id/stop'),
+      headers: _headers(json: false, auth: true),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+    return AppDeployment.fromJson(body as Map<String, dynamic>);
+  }
+
+  Future<List<String>> getDeploymentLogs(String id, {int tail = 100}) async {
+    final res = await http.get(
+      _u('/api/deployments/$id/logs?tail=$tail'),
+      headers: _headers(json: false, auth: true),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+    if (body is List) return body.map((e) => e.toString()).toList();
+    throw ApiException('Unexpected response');
+  }
+
+  Future<CustomDomain> attachDomain(String deploymentId, String domain) async {
+    final res = await http.post(
+      _u('/api/deployments/$deploymentId/domains'),
+      headers: _headers(auth: true),
+      body: jsonEncode({'domain': domain}),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 201) throw ApiException(_err(body, res.statusCode));
+    return CustomDomain.fromJson(body as Map<String, dynamic>);
   }
 
   dynamic _decodeJson(String raw) {

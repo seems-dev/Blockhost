@@ -45,13 +45,19 @@ class RouteTarget:
     server_id: str | None = None
     is_suspended: bool = False
 
-_waking_servers: set[str] = set()
+_waking_servers: dict[str, float] = {}  # server_id → timestamp of last attempt
+_WAKE_COOLDOWN_SECONDS = 60.0
 
 def _sync_trigger_wakeup(server_id: str) -> None:
-    """Synchronous function to wake up a server."""
-    if server_id in _waking_servers:
-        return
-    _waking_servers.add(server_id)
+    """Wake a suspended server directly via DB (proxy has its own DB connection)."""
+    import time as _time
+
+    now = _time.monotonic()
+    last_attempt = _waking_servers.get(server_id, 0)
+    if now - last_attempt < _WAKE_COOLDOWN_SECONDS:
+        return  # Already attempted recently, don't spam
+    _waking_servers[server_id] = now
+
     try:
         from blockhost_backend.api.servers import _do_start_server
         with SessionLocal() as db:
@@ -60,10 +66,11 @@ def _sync_trigger_wakeup(server_id: str) -> None:
                 logger.info("Wake-on-Connect triggered for %s", server_id)
                 _do_start_server(server, db)
                 db.commit()
+                logger.info("Wake-on-Connect completed for %s (state=%s)", server_id, server.state.value)
+            elif server:
+                logger.debug("Wake-on-Connect skipped for %s (state=%s)", server_id, server.state.value)
     except Exception as e:
         logger.error("Wake-on-Connect failed for %s: %s", server_id, e)
-    finally:
-        _waking_servers.discard(server_id)
 
 async def _trigger_wakeup(server_id: str) -> None:
     loop = asyncio.get_running_loop()
@@ -176,6 +183,57 @@ async def _handle_tcp_client(
         logger.info("TCP proxy %d: Server suspended, triggering Wake-on-Connect", proxy_port)
         if route.server_id:
             asyncio.create_task(_trigger_wakeup(route.server_id))
+        
+        # Read the handshake packet to ensure the client is ready to receive a disconnect
+        try:
+            await asyncio.wait_for(client_reader.read(BUFFER_SIZE), timeout=1.0)
+        except (asyncio.TimeoutError, OSError):
+            pass
+
+        # Construct Minecraft Disconnect Packet (Packet ID 0x00 in Login state)
+        import json
+        
+        # Helper to encode VarInt
+        def encode_varint(value: int) -> bytes:
+            encoded = b''
+            while True:
+                temp = value & 0x7F
+                value >>= 7
+                if value != 0:
+                    temp |= 0x80
+                encoded += bytes([temp])
+                if value == 0:
+                    break
+            return encoded
+            
+        def encode_string(value: str) -> bytes:
+            encoded = value.encode('utf-8')
+            return encode_varint(len(encoded)) + encoded
+
+        message = {
+            "text": "",
+            "extra": [
+                {"text": "Server is waking up!\nClick here to view progress: ", "color": "yellow"},
+                {
+                    "text": f"panel.blockhost.app/servers/{route.server_id}",
+                    "color": "aqua",
+                    "clickEvent": {"action": "open_url", "value": f"https://panel.blockhost.app/servers/{route.server_id}"},
+                    "hoverEvent": {"action": "show_text", "value": "Click to open panel"}
+                }
+            ]
+        }
+        
+        # Packet ID 0x00 + String payload
+        payload = b'\x00' + encode_string(json.dumps(message))
+        # Total packet = VarInt(length of payload) + payload
+        packet = encode_varint(len(payload)) + payload
+        
+        try:
+            client_writer.write(packet)
+            await client_writer.drain()
+        except OSError:
+            pass
+            
         client_writer.close()
         return
 

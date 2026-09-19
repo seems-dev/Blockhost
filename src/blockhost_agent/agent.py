@@ -35,6 +35,7 @@ import shutil
 
 from blockhost_backend.api.files import download_file
 from blockhost_backend.runtime.systemd_runtime import SystemdRuntime
+from blockhost_backend.runtime.docker_runtime import DockerRuntime
 from blockhost_backend.runtime.interface import RuntimeStartRequest
 
 logging.basicConfig(
@@ -68,6 +69,11 @@ VERSIONS_ROOT_DIR = Path(
 ).resolve()
 VERSIONS_ROOT_DIR.mkdir(parents=True, exist_ok=True)
 
+DEPLOYMENTS_ROOT_DIR = Path(
+    os.environ.get("DEPLOYMENTS_ROOT_DIR", str(SERVERS_ROOT_DIR.parent / "deployments"))
+).resolve()
+DEPLOYMENTS_ROOT_DIR.mkdir(parents=True, exist_ok=True)
+
 _BINARY_NAMES = ("bedrock_server", "bedrock_server.exe", "bedrock_server_symbols.debug")
 _SO_RE = re.compile(r"^lib.*\.so(?:\..*)?$")
 
@@ -76,6 +82,7 @@ _LOG_STREAM_QUEUE_SIZE = 1000
 
 # Shared systemd runtime instance for this agent
 runtime = SystemdRuntime(servers_root=SERVERS_ROOT_DIR)
+docker_runtime = DockerRuntime()
 
 # Track background tasks for graceful shutdown
 _background_tasks: set[asyncio.Task] = set()
@@ -118,6 +125,7 @@ class StartPayload(BaseModel):
     jdk_path: str | None = None  # NEW
     server_properties_dict: dict[str, str | int | bool] | None = None
     jar_download_url: str | None = None
+    storage_mb: int = 0
 
 
 class CommandPayload(BaseModel):
@@ -126,6 +134,16 @@ class CommandPayload(BaseModel):
 
 class WritePayload(BaseModel):
     content: str
+
+
+class DeploymentStartPayload(BaseModel):
+    docker_image: str
+    internal_port: int
+    env_vars: dict[str, str] = {}
+    volume_path: str | None = None
+    volume_mount_path: str = "/data"
+    ram_limit_mb: int = 512
+    cpu_limit: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +212,19 @@ def start_server(
     _validate_server_id(server_id)
     server_dir = SERVERS_ROOT_DIR / server_id
     server_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Enforce XFS Project Quota if storage limits are provided
+    if payload.storage_mb > 0:
+        try:
+            import subprocess
+            project_id = uuid.UUID(server_id).int & 0xFFFFFFFF
+            quota_bytes = payload.storage_mb * 1024 * 1024
+            subprocess.run(["xfs_quota", "-x", "-c", f"project -s -p {server_dir} {project_id}", "/"], check=False)
+            subprocess.run(["xfs_quota", "-x", "-c", f"limit -p bsoft={quota_bytes} bhard={quota_bytes} {project_id}", "/"], check=False)
+            logger.info("Enforced XFS quota of %sMB for server %s", payload.storage_mb, server_id)
+        except Exception as e:
+            logger.warning("Failed to apply XFS quota for %s: %s", server_id, e)
+
     is_java = bool(payload.jar_download_url) or (payload.executable_path and payload.executable_path.endswith(".jar"))
 
     if payload.server_properties_dict is not None:
@@ -1293,15 +1324,32 @@ def agent_download_file(
     )
 
 
+def _get_dir_size(path: Path) -> int:
+    total = 0
+    try:
+        for entry in os.scandir(path):
+            if entry.is_file(follow_symlinks=False):
+                total += entry.stat().st_size
+            elif entry.is_dir(follow_symlinks=False):
+                total += _get_dir_size(Path(entry.path))
+    except OSError:
+        pass
+    return total
+
+
 @app.post("/agent/servers/{server_id}/files/upload")
 async def agent_upload_file(
     server_id: str,
     path: str,
     allowed_roots: str | None = None,
     allowed_files: str | None = None,
+    storage_limit_mb: int | None = Query(default=None),
     file: UploadFile = File(...),
     _token: str = Depends(verify_token),
 ) -> Any:
+    if storage_limit_mb is None:
+        raise HTTPException(status_code=403, detail="No active subscription: storage limit is undefined.")
+
     _validate_server_id(server_id)
     server_root = SERVERS_ROOT_DIR / server_id
     roots = _parse_allowed_csv(allowed_roots, ALLOWED_ROOTS)
@@ -1313,6 +1361,9 @@ async def agent_upload_file(
         allowed_files=files,
         allow_root_file=False,
     )
+
+    current_dir_size = _get_dir_size(server_root) if server_root.exists() else 0
+    limit_bytes = storage_limit_mb * 1024 * 1024
 
     if target_dir.exists() and not target_dir.is_dir():
         raise HTTPException(status_code=400, detail="Target is not a directory")
@@ -1326,12 +1377,17 @@ async def agent_upload_file(
     target_file = target_dir / filename
     _validate_safe_path(server_root, target_file.relative_to(server_root).as_posix(), allowed_roots=roots, allowed_files=files)
 
+    if target_file.is_file():
+        current_dir_size -= target_file.stat().st_size
+
     fd, tmp_path = tempfile.mkstemp(dir=target_dir, suffix=".upload")
     try:
         total_size = 0
         with os.fdopen(fd, "wb") as buffer:
             while chunk := await file.read(1024 * 1024):
                 total_size += len(chunk)
+                if (current_dir_size + total_size) > limit_bytes:
+                    raise HTTPException(status_code=413, detail="Disk quota exceeded for this server.")
                 if total_size > MAX_UPLOAD_SIZE:
                     raise HTTPException(status_code=413, detail="File too large")
                 buffer.write(chunk)
@@ -1594,6 +1650,141 @@ def agent_delete_mod(
     target.unlink()
     logger.info("Deleted mod %s/%s for server %s", subdir, safe_filename, server_id)
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Deployment Lifecycle (Docker-based PaaS)
+# ---------------------------------------------------------------------------
+
+_build_status: dict[str, str] = {}
+
+class BuildGithubPayload(BaseModel):
+    repo_url: str
+    branch: str = "main"
+
+def _run_github_build(deployment_id: str, repo_url: str, branch: str) -> None:
+    try:
+        _build_status[deployment_id] = "building"
+        docker_runtime.build_from_github(repo_url, branch, deployment_id)
+        _build_status[deployment_id] = "success"
+    except Exception as exc:
+        logger.error("GitHub build failed for %s: %s", deployment_id, exc)
+        _build_status[deployment_id] = "error"
+
+@app.post("/agent/deployments/{deployment_id}/build-github")
+def build_github(
+    deployment_id: str,
+    payload: BuildGithubPayload,
+    background_tasks: BackgroundTasks,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Clone a GitHub repository and build a Docker image in the background."""
+    _validate_server_id(deployment_id)
+    background_tasks.add_task(_run_github_build, deployment_id, payload.repo_url, payload.branch)
+    return {"status": "accepted"}
+
+@app.get("/agent/deployments/{deployment_id}/build-status")
+def get_build_status(
+    deployment_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Return the current GitHub build status."""
+    _validate_server_id(deployment_id)
+    status = _build_status.get(deployment_id, "unknown")
+    return {"status": status}
+
+
+
+@app.post("/agent/deployments/{deployment_id}/start")
+def start_deployment(
+    deployment_id: str,
+    payload: DeploymentStartPayload,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Pull image and start a Docker container for the given deployment."""
+    _validate_server_id(deployment_id)  # reuse UUID validation
+    
+    # Securely derive host volume path from deployment_id
+    safe_volume_path = None
+    if payload.volume_mount_path:
+        dep_dir = (DEPLOYMENTS_ROOT_DIR / deployment_id).resolve()
+        # Prevent path traversal
+        if not dep_dir.is_relative_to(DEPLOYMENTS_ROOT_DIR.resolve()):
+            raise HTTPException(status_code=403, detail="Path traversal detected")
+        dep_dir.mkdir(parents=True, exist_ok=True)
+        safe_volume_path = str(dep_dir)
+        
+    try:
+        result = docker_runtime.start_deployment(
+            deployment_id=deployment_id,
+            docker_image=payload.docker_image,
+            internal_port=payload.internal_port,
+            env_vars=payload.env_vars,
+            volume_path=safe_volume_path,
+            volume_mount_path=payload.volume_mount_path,
+            ram_limit_mb=payload.ram_limit_mb,
+            cpu_limit=payload.cpu_limit,
+        )
+        return {
+            "status": "running",
+            "container_id": result.container_id,
+            "container_name": result.container_name,
+            "host_port": result.host_port,
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/agent/deployments/{deployment_id}/stop")
+def stop_deployment(
+    deployment_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Stop and remove the Docker container for the given deployment."""
+    _validate_server_id(deployment_id)
+    docker_runtime.stop_deployment(deployment_id)
+    return {"status": "ok"}
+
+
+@app.get("/agent/deployments/{deployment_id}/status")
+def get_deployment_status(
+    deployment_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Return the current status of a deployment container."""
+    _validate_server_id(deployment_id)
+    status = docker_runtime.get_status(deployment_id)
+    return {
+        "running": status.running,
+        "container_id": status.container_id,
+        "state": status.state,
+        "host_port": status.host_port,
+        "started_at": status.started_at,
+        "exit_code": status.exit_code,
+    }
+
+
+@app.get("/agent/deployments/{deployment_id}/network-rx")
+def get_deployment_network_rx(
+    deployment_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Return the current network rx bytes of a deployment container."""
+    _validate_server_id(deployment_id)
+    rx_bytes = docker_runtime.get_network_rx_bytes(deployment_id)
+    return {"rx_bytes": rx_bytes}
+
+
+@app.get("/agent/deployments/{deployment_id}/logs")
+def get_deployment_logs(
+    deployment_id: str,
+    tail: int = Query(default=200, ge=1, le=5000),
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Return the last N log lines from the deployment container."""
+    _validate_server_id(deployment_id)
+    lines = docker_runtime.get_logs(deployment_id, tail=tail)
+    return {"lines": lines}
 
 
 # ---------------------------------------------------------------------------

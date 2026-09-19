@@ -534,12 +534,8 @@ def _collect_reserved_ports(
         server_flavor = row.flavor
         if port is None:
             continue
-        if is_bedrock:
-            if server_flavor != ServerFlavor.BEDROCK:
-                continue
-        elif not is_java_flavor(server_flavor):
-            continue
         reserved.add(port)
+        # Bedrock allocates two ports (port and port+1 for IPv6), so reserve the next one too
         if server_flavor == ServerFlavor.BEDROCK and port + 1 <= port_range.end:
             reserved.add(port + 1)
     return reserved
@@ -554,7 +550,6 @@ def _validate_server_port_pairs(
 ) -> None:
     port_map: dict[int, list[str]] = {}
     errors: list[str] = []
-    is_bedrock = flavor == ServerFlavor.BEDROCK
 
     query = select(Server.id, Server.vm_port, Server.flavor).where(Server.vm_port.between(port_range.start, port_range.end))
     if node_id:
@@ -562,12 +557,6 @@ def _validate_server_port_pairs(
     for row in db.execute(query).all():
         server_id, port, server_flavor = row.id, row.vm_port, row.flavor
         if port is None:
-            continue
-
-        if is_bedrock:
-            if server_flavor != ServerFlavor.BEDROCK:
-                continue
-        elif not is_java_flavor(server_flavor):
             continue
 
         if port < port_range.start or port > port_range.end:
@@ -800,19 +789,22 @@ def create_server(
         raise HTTPException(status_code=422, detail=str(e))
 
     # Unpaid servers reserve 0 RAM until a plan is active; still place on freest node.
-    node = select_best_node(db, required_ram_mb=0)
-    if settings.production_mode and not node:
+    node = select_best_node(db)
+    if not node:
+        # All online nodes are full! Try to wake up an offline node.
         from blockhost_backend.services.node_capacity import auto_wakeup_offline_node
-        if auto_wakeup_offline_node(db):
+        woken = auto_wakeup_offline_node(db)
+        if woken:
+            raise HTTPException(
+                status_code=202,
+                detail="Network is scaling up! A new server node is booting for you. Please wait 60 seconds and try creating your server again."
+            )
+        elif settings.production_mode:
             raise HTTPException(
                 status_code=503,
-                detail="Network is scaling up! A new node is booting to handle your server. Please wait 60 seconds and try again.",
+                detail="All server nodes are full and no offline nodes are available to scale up.",
             )
-        else:
-            raise HTTPException(
-                status_code=503,
-                detail="No worker nodes are available (and none can be booted). Check agent registration.",
-            )
+            
     node_id = node.id if node else None
 
     try:
@@ -865,11 +857,40 @@ def create_server(
             status_code=503, detail=f"Failed to setup server config: {e}"
         )
 
-    # Server is created suspended — user must subscribe via Billing, then POST /start.
-    if server.state != ServerState.provisioning:
-        server.state = ServerState.created
-    db.commit()
-    db.refresh(server)
+    # Free Trial Logic: grant a 7-day cardless trial if there's a free plan
+    from blockhost_backend.database.schema import BillingPlan, BillingSubscription, BillingSubscriptionStatus
+    from datetime import timedelta
+    from blockhost_backend.database.schema import utcnow
+    
+    free_plan = db.execute(
+        select(BillingPlan).where(BillingPlan.price == 0, BillingPlan.active == True).limit(1)
+    ).scalar_one_or_none()
+    
+    if free_plan:
+        now = utcnow()
+        trial_sub = BillingSubscription(
+            user_id=user.id,
+            server_id=server.id,
+            plan_id=free_plan.id,
+            starts_at=now,
+            expires_at=now + timedelta(days=7),
+            status=BillingSubscriptionStatus.active,
+        )
+        db.add(trial_sub)
+        db.flush()
+        
+        # Apply limits to mc_config
+        cfg = dict(server.mc_config or {})
+        cfg["billing_plan_id"] = free_plan.id
+        cfg["resource_limits"] = {
+            "ram_mb": free_plan.ram_mb,
+            "cpu_quota_pct": free_plan.cpu_limit,
+            "storage_mb": free_plan.storage_mb,
+            "player_limit": free_plan.player_limit,
+        }
+        server.mc_config = cfg
+        db.commit()
+
     if server.node_id:
         refresh_node_allocated_ram(db, server.node_id)
         db.commit()
@@ -1115,34 +1136,64 @@ def _provision_remote_server(server: Server, server_dir: Path, db: Session, vers
 
 def _do_start_server(server: Server, db: Session) -> None:
     settings = get_settings()
+    
+    from blockhost_backend.services.billing import ensure_active_subscription_for_start, BillingError
+    try:
+        ensure_active_subscription_for_start(db=db, server=server)
+    except BillingError as e:
+        server.state = ServerState.suspended
+        _drop_server_stats_snapshot(str(server.id))
+        raise HTTPException(status_code=402, detail={"error": e.code, "message": e.message})
 
-    # Automatic Failover: if assigned node is offline or starting, detach the server
+    # Automatic Failover: find the right node to start this server on
+    needs_node_assignment = False
+
     if server.node_id:
         node = db.get(Node, server.node_id)
-        if not node or node.status in (NodeState.offline, NodeState.starting):
+        # Check if node is dead
+        is_dead = not node or node.status in (NodeState.offline, NodeState.starting)
+        
+        # Check if node is full
+        is_full = False
+        if node:
+            from blockhost_backend.services.node_capacity import compute_node_allocated_ram_mb
+            active_ram = compute_node_allocated_ram_mb(db, node.id)
+            limits = get_effective_server_resource_limits(db=db, server=server)
+            required_ram = int(limits.get("ram_mb") or 0)
+            if node.total_ram_mb - active_ram < required_ram:
+                is_full = True
+                
+        if is_dead or is_full:
+            logger.info(f"Node {node.name if node else 'Unknown'} is dead or full. Detaching server {server.id} to find a new node.")
             server.node_id = None
             server.vm_ipv4 = None
-            server.vm_port = None
             db.commit()
+            needs_node_assignment = True
+    else:
+        needs_node_assignment = True
 
-    if not server.node_id:
+    if needs_node_assignment:
         limits = get_effective_server_resource_limits(db=db, server=server)
         required_ram = int(limits.get("ram_mb") or 0)
-        node = select_best_node(db, required_ram_mb=required_ram)
-        if node:
-            server.node_id = node.id
-            server.vm_ipv4 = node.ip_address
-            server.state = ServerState.provisioning # Reserve RAM before lock release
-            refresh_node_allocated_ram(db, node.id)
-            # We must re-allocate a fresh port on the new node
+        new_node = select_best_node(db, required_ram_mb=required_ram)
+        if new_node:
             try:
-                server.vm_port = _allocate_port(db=db, flavor=server.flavor, node_id=server.node_id)
+                new_port = _allocate_port(db=db, flavor=server.flavor, node_id=new_node.id)
             except Exception as e:
                 raise HTTPException(status_code=503, detail=f"Failed to allocate port on new node: {e}")
+                
+            server.vm_port = new_port
+            server.node_id = new_node.id
+            server.vm_ipv4 = new_node.ip_address
+            server.state = ServerState.provisioning
+            refresh_node_allocated_ram(db, new_node.id)
             db.commit()
+            logger.info("Assigned server %s to node %s (EFS storage)", server.id, new_node.name)
         elif settings.production_mode:
             from blockhost_backend.services.node_capacity import auto_wakeup_offline_node
             if auto_wakeup_offline_node(db):
+                # Keep the server on its current node (don't set to None!)
+                # Phase 0 or the next retry will handle it once the new node is online.
                 raise HTTPException(
                     status_code=503,
                     detail="Network is scaling up! A new node is booting. Please wait 60 seconds and try again.",
@@ -1150,7 +1201,7 @@ def _do_start_server(server: Server, db: Session) -> None:
             else:
                 raise HTTPException(
                     status_code=503,
-                    detail="Server is not assigned to a worker node. No capacity is currently available.",
+                    detail="No capacity is currently available. Please try again shortly.",
                 )
     is_java = is_java_flavor(server.flavor)
 
@@ -1165,6 +1216,12 @@ def _do_start_server(server: Server, db: Session) -> None:
     except Exception as e:
         detail = "Failed to prepare Java server" if is_java else "Failed to materialize Bedrock server folder"
         raise HTTPException(status_code=503, detail=f"{detail}: {e}")
+
+    # Update activity so Auto-Sleeper doesn't instantly kill it
+    from blockhost_backend.database.schema import utcnow
+    server.last_activity = utcnow()
+    db.add(server)
+    db.commit()
 
     try:
         _start_server_process(server=server, settings=settings, db=db)
@@ -1195,9 +1252,19 @@ def start_server(
     if is_actually_running:
         return ServerActionResponse(id=server.id, state=server.state)
 
-    _do_start_server(server, db)
+    try:
+        from sqlalchemy.exc import IntegrityError
+        _do_start_server(server, db)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Port allocation conflict. Please try again in 2 seconds.")
 
     db.commit()
+    if server.node_id:
+        from blockhost_backend.services.node_capacity import refresh_node_allocated_ram
+        refresh_node_allocated_ram(db, server.node_id)
+        db.commit()
+        
     _drop_server_stats_snapshot(str(server.id))
     _invalidate_server_read_cache(user.id, server.id)
     return ServerActionResponse(id=server.id, state=server.state)
@@ -1213,6 +1280,11 @@ def stop_server(
 
     _stop_server_process(server)
     db.commit()
+    if server.node_id:
+        from blockhost_backend.services.node_capacity import refresh_node_allocated_ram
+        refresh_node_allocated_ram(db, server.node_id)
+        db.commit()
+        
     _drop_server_stats_snapshot(str(server.id))
     _invalidate_server_read_cache(user.id, server.id)
     return ServerActionResponse(id=server.id, state=server.state)
@@ -1277,7 +1349,12 @@ def toggle_server(
     if is_actually_running:
         _stop_server_process(server)
     else:
-        _do_start_server(server, db)
+        try:
+            from sqlalchemy.exc import IntegrityError
+            _do_start_server(server, db)
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="Port allocation conflict. Please try again in 2 seconds.")
 
     db.commit()
     _drop_server_stats_snapshot(str(server.id))
@@ -1518,6 +1595,7 @@ async def console_websocket(
 
         async def receive_commands():
             try:
+                from blockhost_backend.services.rate_limit import _redis_check, _local_check
                 while True:
                     data = await websocket.receive_text()
                     try:
@@ -1525,6 +1603,11 @@ async def console_websocket(
                         if msg.get("type") == "command" and "command" in msg:
                             command = str(msg["command"]).replace("\r", "").replace("\n", " ").strip()
                             if command and len(command) <= 512:
+                                allowed = _redis_check(f"cmd_{user.id}", limit=5, window_seconds=1)
+                                if allowed is None:
+                                    allowed = _local_check(f"cmd_{user.id}", limit=5, window_seconds=1)
+                                if not allowed:
+                                    continue
                                 _ORCHESTRATOR.send_command(server_id, command)
                                 from blockhost_backend.database.schema import utcnow
                                 server.last_activity = utcnow()

@@ -1113,8 +1113,10 @@ class _StatusBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final color = ok ? TranquilTheme.glowCyan : _errorRed;
-    final icon = ok ? Icons.check_circle_outline_rounded : Icons.error_outline_rounded;
+    final isScaling = message.toLowerCase().contains('scaling');
+    final color = isScaling ? _warningAmber : (ok ? TranquilTheme.glowCyan : _errorRed);
+    final icon = isScaling ? Icons.autorenew_rounded : (ok ? Icons.check_circle_outline_rounded : Icons.error_outline_rounded);
+    
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
@@ -1124,11 +1126,13 @@ class _StatusBanner extends StatelessWidget {
       ),
       child: Row(
         children: [
-          Icon(icon, color: color, size: 18),
+          isScaling 
+            ? SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 1.5, color: color))
+            : Icon(icon, color: color, size: 18),
           const SizedBox(width: 10),
           Expanded(
             child: Text(
-              message,
+              isScaling ? message.replaceAll(RegExp(r'\s*\(\d+\)$'), '').trim() : message,
               style: TextStyle(color: color, fontSize: 12, fontFamily: _mono, height: 1.4),
             ),
           ),

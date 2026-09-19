@@ -1,40 +1,67 @@
 import axios from 'axios';
 
 const api = axios.create({
-    baseURL: 'http://52.63.135.144:80',
+  baseURL: 'https://blockhost.sryze.cc',
 });
 
-// Automatically attach JWT token if logged in
 api.interceptors.request.use((config) => {
-    const token = localStorage.getItem('admin_token');
-    if (token) {
-        config.headers.Authorization = `Bearer ${token}`;
-    }
-    return config;
+  const token = localStorage.getItem('admin_token');
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
 });
+
+api.interceptors.response.use(
+  res => res,
+  err => {
+    if (err.response?.status === 401) {
+      localStorage.removeItem('admin_token');
+      window.location.reload();
+    }
+    return Promise.reject(err);
+  }
+);
 
 export const loginAdmin = async (email, password) => {
-    const res = await api.post('/api/auth/login', { email, password });
-    localStorage.setItem('admin_token', res.data.access_token);
-    return res.data;
+  const res = await api.post('/api/auth/login', { email, password });
+  localStorage.setItem('admin_token', res.data.access_token);
+  return res.data;
 };
 
-export const logoutAdmin = () => localStorage.removeItem('admin_token');
+export const logoutAdmin = () => {
+  localStorage.removeItem('admin_token');
+  window.location.reload();
+};
 
+// Dashboard
 export const getStats = () => api.get('/api/admin/stats').then(r => r.data);
-export const getUsers = () => api.get('/api/admin/users').then(r => r.data);
-export const getServers = () => api.get('/api/admin/servers').then(r => r.data);
-export const getTransactions = () => api.get('/api/admin/transactions').then(r => r.data);
 
-export const forceStopServer = (serverId) =>
-    api.post(`/api/admin/servers/${serverId}/force-stop`).then(r => r.data);
-
-export const banUser = (userId) =>
-    api.post(`/api/admin/users/${userId}/ban`).then(r => r.data);
-
+// Users
+export const getUsers = (search = '') => api.get('/api/admin/users', { params: { search, limit: 200 } }).then(r => r.data);
+export const banUser = (userId) => api.post(`/api/admin/users/${userId}/ban`).then(r => r.data);
+export const unbanUser = (userId) => api.post(`/api/admin/users/${userId}/unban`).then(r => r.data);
 export const grantBlockcoins = (userId, amount) =>
-    api.post(`/api/admin/users/${userId}/grant-blockcoins`, null, { params: { amount } }).then(r => r.data);
+  api.post(`/api/admin/users/${userId}/grant-blockcoins`, null, { params: { amount } }).then(r => r.data);
+export const impersonateUser = (userId) =>
+  api.post(`/api/admin/users/${userId}/impersonate`).then(r => r.data);
 
+// Servers
+export const getServers = (params = {}) => api.get('/api/admin/servers', { params }).then(r => r.data);
+export const forceStopServer = (serverId) => api.post(`/api/admin/servers/${serverId}/force-stop`).then(r => r.data);
+export const forceStartServer = (serverId) => api.post(`/api/admin/servers/${serverId}/force-start`).then(r => r.data);
+
+// Nodes
 export const getNodes = () => api.get('/api/admin/nodes').then(r => r.data);
+export const evacuateNode = (nodeId) => api.post(`/api/admin/nodes/${nodeId}/evacuate`).then(r => r.data);
+
+// Deployments (Apps & DBs)
+export const getDeployments = (params = {}) => api.get('/api/admin/deployments', { params }).then(r => r.data);
+export const forceStopDeployment = (deploymentId) => api.post(`/api/admin/deployments/${deploymentId}/force-stop`).then(r => r.data);
+export const forceStartDeployment = (deploymentId) => api.post(`/api/admin/deployments/${deploymentId}/force-start`).then(r => r.data);
+
+// Transactions
+export const getTransactions = (params = {}) => api.get('/api/admin/transactions', { params }).then(r => r.data);
+
+// Audit logs
+export const getAuditLogs = (params = {}) => api.get('/api/admin/audit-logs', { params }).then(r => r.data);
 
 export default api;

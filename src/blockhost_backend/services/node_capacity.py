@@ -14,7 +14,7 @@ from blockhost_backend.orchestrator.resources import get_effective_server_resour
 
 logger = logging.getLogger(__name__)
 
-HEARTBEAT_STALE_SECONDS = 30
+HEARTBEAT_STALE_SECONDS = 120
 
 # Server states that reserve RAM on a node (Active RAM).
 _RAM_RESERVING_STATES = (
@@ -37,7 +37,8 @@ def is_node_heartbeat_fresh(node: Node, *, now=None) -> bool:
 
 
 def compute_node_allocated_ram_mb(db: Session, node_id: uuid.UUID) -> int:
-    """Sum of plan RAM for all servers assigned to this node."""
+    from blockhost_backend.database.schema import AppDeployment, DeploymentState
+    
     total = 0
     servers = db.execute(
         select(Server).where(
@@ -48,6 +49,16 @@ def compute_node_allocated_ram_mb(db: Session, node_id: uuid.UUID) -> int:
     for server in servers:
         limits = get_effective_server_resource_limits(db=db, server=server)
         total += limits["ram_mb"]
+        
+    deployments = db.execute(
+        select(AppDeployment).where(
+            AppDeployment.node_id == node_id,
+            AppDeployment.state.in_([DeploymentState.building, DeploymentState.running])
+        )
+    ).scalars().all()
+    for dep in deployments:
+        total += dep.ram_limit_mb
+        
     return total
 
 
@@ -64,7 +75,7 @@ def refresh_all_nodes_allocated_ram(db: Session) -> None:
 
 
 def select_best_node(db: Session, *, required_ram_mb: int = 0) -> Node | None:
-    """Pick the online, non-draining node with the most free allocated RAM."""
+    """Pick the online, non-draining node with the most free active RAM."""
     now = utcnow()
     candidates = db.execute(
         select(Node).where(
@@ -77,12 +88,42 @@ def select_best_node(db: Session, *, required_ram_mb: int = 0) -> Node | None:
     for node in candidates:
         if not is_node_heartbeat_fresh(node, now=now):
             continue
-        free = node.total_ram_mb - node.used_ram_mb
+            
+        # ONLY calculate the RAM of active servers (running + provisioning)
+        active_servers = db.execute(
+            select(Server).where(
+                Server.node_id == node.id,
+                Server.state.in_([ServerState.running, ServerState.provisioning])
+            )
+        ).scalars().all()
+        
+        active_ram = 0
+        for s in active_servers:
+            limits = get_effective_server_resource_limits(db=db, server=s)
+            active_ram += limits.get("ram_mb", 0)
+            
+        from blockhost_backend.database.schema import AppDeployment, DeploymentState
+        active_deployments = db.execute(
+            select(AppDeployment).where(
+                AppDeployment.node_id == node.id,
+                AppDeployment.state.in_([DeploymentState.building, DeploymentState.running])
+            )
+        ).scalars().all()
+        for dep in active_deployments:
+            active_ram += dep.ram_limit_mb
+            
+        free = node.total_ram_mb - active_ram
+        
         if free < required_ram_mb:
             continue
         if free > best_free:
             best_free = free
             best = node
+
+    # Optional: ensure it has at least 512MB free
+    if best_free < 512:
+        return None
+        
     return best
 
 

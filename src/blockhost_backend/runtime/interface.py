@@ -33,6 +33,7 @@ class RuntimeStartRequest:
     jdk_path: Path | None = None
     server_properties_dict: dict[str, str | int | bool] | None = None
     jar_download_url: str | None = None
+    storage_mb: int = 0
 
 
 # -------------------------

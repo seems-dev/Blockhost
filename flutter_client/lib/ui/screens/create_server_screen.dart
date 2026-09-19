@@ -507,7 +507,8 @@ class _CreateServerScreenState extends State<CreateServerScreen>
   Widget _buildStatusMessage() {
     if (status.isEmpty) return const SizedBox.shrink();
 
-    final isError = status.contains('❌') || status.contains('Please');
+    final isScaling = status.toLowerCase().contains('scaling');
+    final isError = !isScaling && (status.contains('❌') || status.contains('Please'));
     final isSuccess = status.contains('🚀') || status.contains('successfully');
 
     return Container(
@@ -516,46 +517,58 @@ class _CreateServerScreenState extends State<CreateServerScreen>
       decoration: BoxDecoration(
         gradient: LinearGradient(
           colors: [
-            isError
-                ? Colors.red.withOpacity(0.12)
-                : isSuccess
-                    ? _green.withOpacity(0.12)
-                    : _surface,
-            isError
-                ? Colors.red.withOpacity(0.04)
-                : isSuccess
-                    ? _green.withOpacity(0.04)
-                    : _surface,
+            isScaling
+                ? Colors.amber.withOpacity(0.12)
+                : isError
+                    ? Colors.red.withOpacity(0.12)
+                    : isSuccess
+                        ? _green.withOpacity(0.12)
+                        : _surface,
+            isScaling
+                ? Colors.amber.withOpacity(0.04)
+                : isError
+                    ? Colors.red.withOpacity(0.04)
+                    : isSuccess
+                        ? _green.withOpacity(0.04)
+                        : _surface,
           ],
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),
         borderRadius: BorderRadius.circular(12),
         border: Border.all(
-          color: isError
-              ? Colors.red.withOpacity(0.25)
-              : isSuccess
-                  ? _green.withOpacity(0.25)
-                  : _border,
+          color: isScaling
+              ? Colors.amber.withOpacity(0.3)
+              : isError
+                  ? Colors.red.withOpacity(0.25)
+                  : isSuccess
+                      ? _green.withOpacity(0.25)
+                      : _border,
         ),
       ),
       child: Row(
         children: [
-          Icon(
-            isError
-                ? Icons.error_outline_rounded
-                : isSuccess
-                    ? Icons.check_circle_outline_rounded
-                    : Icons.info_outline_rounded,
-            color: isError ? Colors.redAccent : isSuccess ? _green : _muted,
-            size: 18,
-          ),
+          isScaling 
+            ? const SizedBox(
+                width: 14, 
+                height: 14, 
+                child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.amber)
+              )
+            : Icon(
+                isError
+                    ? Icons.error_outline_rounded
+                    : isSuccess
+                        ? Icons.check_circle_outline_rounded
+                        : Icons.info_outline_rounded,
+                color: isError ? Colors.redAccent : isSuccess ? _green : _muted,
+                size: 18,
+              ),
           const SizedBox(width: 10),
           Expanded(
             child: Text(
-              status,
+              isScaling ? status.replaceAll('❌', '').replaceAll(RegExp(r'\s*\(\d+\)$'), '').trim() : status,
               style: TextStyle(
-                color: isError ? Colors.redAccent : isSuccess ? _green : _text,
+                color: isScaling ? Colors.amber : isError ? Colors.redAccent : isSuccess ? _green : _text,
                 fontSize: 13,
                 fontWeight: FontWeight.w500,
               ),

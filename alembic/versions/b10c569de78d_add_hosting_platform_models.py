@@ -85,6 +85,13 @@ def upgrade():
     with op.batch_alter_table('deployment_revisions', schema=None) as batch_op:
         batch_op.create_index(batch_op.f('ix_deployment_revisions_deployment_id'), ['deployment_id'], unique=False)
 
+    from sqlalchemy.dialects import postgresql
+    deploymentkind = postgresql.ENUM('docker_image', 'dockerfile', 'nextjs', 'fastapi', 'static_site', name='deploymentkind')
+    deploymentkind.create(op.get_bind(), checkfirst=True)
+    
+    sourcetype = postgresql.ENUM('github', 'docker_image', 'upload', name='sourcetype')
+    sourcetype.create(op.get_bind(), checkfirst=True)
+
     with op.batch_alter_table('app_deployments', schema=None) as batch_op:
         batch_op.add_column(sa.Column('project_id', sa.Uuid(), nullable=True))
         batch_op.add_column(sa.Column('deployment_kind', sa.Enum('docker_image', 'dockerfile', 'nextjs', 'fastapi', 'static_site', name='deploymentkind'), nullable=False, server_default='docker_image'))

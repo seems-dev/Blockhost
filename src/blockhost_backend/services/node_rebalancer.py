@@ -284,6 +284,26 @@ def _rebalance_cycle() -> None:
                 db.commit()
                 logger.info("[rebalancer] Rescued %d orphaned server(s)", rescued)
 
+        from blockhost_backend.database.schema import AppDeployment
+        orphaned_deps = db.execute(
+            select(AppDeployment).where(
+                (AppDeployment.node_id.is_(None)) | (AppDeployment.node_id.in_(offline_ids))
+            )
+        ).scalars().all() if offline_ids else db.execute(
+            select(AppDeployment).where(AppDeployment.node_id.is_(None))
+        ).scalars().all()
+
+        if orphaned_deps:
+            rescued_deps = 0
+            for dep in orphaned_deps:
+                old = dep.node_id
+                dep.node_id = online_node.id
+                logger.info("[rebalancer] Rescued orphaned deployment %s (was node=%s) → %s", dep.id, old, online_node.name)
+                rescued_deps += 1
+            if rescued_deps:
+                db.commit()
+                logger.info("[rebalancer] Rescued %d orphaned deployment(s)", rescued_deps)
+
         # ── Phase 1: Consolidate running servers ─────────────────────────
         # Goal: If node-2 has 1 running server but node-1 has spare capacity,
         # migrate that server to node-1 so node-2 becomes empty.

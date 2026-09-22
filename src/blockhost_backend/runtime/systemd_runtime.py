@@ -629,6 +629,10 @@ class SystemdRuntime:
                             logger = logging.getLogger(__name__)
                             logger.exception(f"Listener callback failed for server {server_id}: {e}")
             finally:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
                 proc.stdout.close()
                 proc.wait()
                 with self._lock:

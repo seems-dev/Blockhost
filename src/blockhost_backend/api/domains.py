@@ -56,6 +56,7 @@ class DomainOut(BaseModel):
     verification_token: str
     ssl_active: bool
     error_message: str | None = None
+    dns_instructions: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -110,7 +111,14 @@ def attach_custom_domain(
     db.commit()
     db.refresh(domain_rec)
     logger.info("Attached domain %s (token=%s) to deployment %s", payload.domain, token, deployment.id)
-    return DomainOut.model_validate(domain_rec)
+    
+    out = DomainOut.model_validate(domain_rec)
+    import blockhost_backend.config.config_manager
+    settings = blockhost_backend.config.config_manager.get_settings()
+    cname_target = getattr(settings, "public_ingress_domain", getattr(settings, "public_ingress_ipv4", "ingress.example.com"))
+    txt_target = f"blockhost-verify={token}"
+    out.dns_instructions = f"Option 1: Create a CNAME record for {payload.domain} pointing to {cname_target}\nOption 2: Create a TXT record for {payload.domain} containing '{txt_target}'"
+    return out
 
 
 @router.get(
@@ -146,8 +154,18 @@ async def verify_custom_domain(
 
     deployment = _get_deployment_for_user(domain_rec.deployment_id, user, db)
 
-    # Verify DNS A record pointing
-    dns_valid = ingress_service.verify_dns(domain_rec.domain, "13.211.137.42")
+    # Verify DNS
+    settings = blockhost_backend.config.config_manager.get_settings()
+    expected_ip = getattr(settings, "public_ingress_ipv4", "127.0.0.1")
+    expected_cname = getattr(settings, "public_ingress_domain", None)
+    expected_txt = f"blockhost-verify={domain_rec.verification_token}"
+    
+    dns_valid = ingress_service.verify_dns(
+        domain_rec.domain, 
+        expected_ip=expected_ip, 
+        expected_cname=expected_cname, 
+        expected_txt=expected_txt
+    )
     if not dns_valid:
         domain_rec.status = DomainStatus.failed
         domain_rec.error_message = f"DNS record for {domain_rec.domain} does not point to ingress host."
@@ -201,3 +219,25 @@ async def detach_custom_domain(
     db.delete(domain_rec)
     db.commit()
     logger.info("Detached and purged domain %s (id=%s)", domain_rec.domain, domain_id)
+
+
+@router.get(
+    "/domains/{domain_id}/ssl-status",
+)
+async def get_domain_ssl_status(
+    domain_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Return the SSL provisioning status for a domain."""
+    domain_rec = db.get(CustomDomain, domain_id)
+    if not domain_rec:
+        raise HTTPException(status_code=404, detail="Domain not found")
+        
+    _get_deployment_for_user(domain_rec.deployment_id, user, db)
+    
+    return {
+        "domain": domain_rec.domain,
+        "ssl_active": domain_rec.ssl_active,
+        "status": "active" if domain_rec.ssl_active else "pending"
+    }

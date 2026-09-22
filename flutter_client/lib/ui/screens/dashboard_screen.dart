@@ -537,22 +537,40 @@ class _DashboardScreenState extends State<DashboardScreen>
                             itemCount: servers.length,
                             itemBuilder: (context, i) {
                               final s = servers[i] as Map<String, dynamic>;
-                              return Padding(
-                                padding: const EdgeInsets.only(bottom: 12),
-                                child: _ServerCard(
-                                  server: s,
-                                  liveStats: _listStats[s['id'] as String],
-                                  onToggle: () => _toggle(
-                                    s['id'] as String,
-                                    launchWhenRunning:
-                                        (s['state'] as String? ?? '') !=
-                                            'running',
-                                    launchServer: s,
-                                  ),
-                                  onLaunch: () => _launchMinecraft(s),
-                                  onTap: () => _loadDetail(s['id'] as String),
-                                  busy: busy,
-                                ),
+                              return TweenAnimationBuilder<double>(
+                                tween: Tween(begin: 0.0, end: 1.0),
+                                duration: const Duration(milliseconds: 500),
+                                curve: Curves.easeOutCubic,
+                                builder: (context, value, child) {
+                                  // Calculate delay based on index (clamped to max 5 items for fast loading)
+                                  final delay = (i < 5 ? i : 5) * 0.1;
+                                  // Only animate if value > delay, otherwise hide
+                                  final adjustedValue = value > delay ? (value - delay) / (1 - delay) : 0.0;
+                                  
+                                  return Opacity(
+                                    opacity: adjustedValue,
+                                    child: Transform.translate(
+                                      offset: Offset(0, 20 * (1 - adjustedValue)),
+                                      child: Padding(
+                                        padding: const EdgeInsets.only(bottom: 12),
+                                        child: _ServerCard(
+                                          server: s,
+                                          liveStats: _listStats[s['id'] as String],
+                                          onToggle: () => _toggle(
+                                            s['id'] as String,
+                                            launchWhenRunning:
+                                                (s['state'] as String? ?? '') !=
+                                                    'running',
+                                            launchServer: s,
+                                          ),
+                                          onLaunch: () => _launchMinecraft(s),
+                                          onTap: () => _loadDetail(s['id'] as String),
+                                          busy: busy,
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                },
                               );
                             },
                           ),

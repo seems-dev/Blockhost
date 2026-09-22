@@ -87,6 +87,114 @@ docker_runtime = DockerRuntime()
 # Track background tasks for graceful shutdown
 _background_tasks: set[asyncio.Task] = set()
 
+# Health check tracking per deployment
+_deployment_health: dict[str, dict] = {}
+# Structure: { deployment_id: { "status": "healthy"|"unhealthy"|"crash_loop", "restart_count": 0, "last_healthy_at": None, "consecutive_failures": 0 } }
+
+async def _health_check_loop() -> None:
+    """Background loop that checks health of all running deployment containers every 30s."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            containers = docker_runtime.list_managed_containers()
+            for c in containers:
+                dep_id = c.get("deployment_id")
+                if not dep_id or c.get("state") != "running":
+                    continue
+                
+                # Initialize tracking
+                if dep_id not in _deployment_health:
+                    _deployment_health[dep_id] = {
+                        "status": "unknown",
+                        "restart_count": 0,
+                        "last_healthy_at": None,
+                        "consecutive_failures": 0,
+                    }
+                
+                health = _deployment_health[dep_id]
+                
+                # Try to check health via docker inspect
+                try:
+                    container_obj = docker_runtime.client.containers.get(c["name"])
+                    container_obj.reload()
+                    state = container_obj.attrs.get("State", {})
+                    
+                    if state.get("Running"):
+                        restart_count = int(state.get("RestartCount", 0))
+                        health["restart_count"] = restart_count
+                        
+                        # Check if restart count spiked (crash-loop detection)
+                        if restart_count > 3:
+                            health["consecutive_failures"] += 1
+                            if health["consecutive_failures"] >= 3:
+                                health["status"] = "crash_loop"
+                                logger.warning("Deployment %s detected as crash-looping (%d restarts)", dep_id, restart_count)
+                                # Stop the container to prevent resource waste
+                                try:
+                                    docker_runtime.stop_deployment(dep_id)
+                                except Exception:
+                                    pass
+                                continue
+                            else:
+                                health["status"] = "unhealthy"
+                        else:
+                            health["status"] = "healthy"
+                            health["consecutive_failures"] = 0
+                            health["last_healthy_at"] = datetime.now(timezone.utc).isoformat()
+                            
+                            # Quota enforcement: check storage limit
+                            storage_limit_str = container_obj.labels.get("blockhost.storage_limit_mb")
+                            if storage_limit_str:
+                                try:
+                                    storage_limit_mb = int(storage_limit_str)
+                                    dep_dir = (DEPLOYMENTS_ROOT_DIR / dep_id).resolve()
+                                    if dep_dir.is_relative_to(DEPLOYMENTS_ROOT_DIR.resolve()) and dep_dir.exists():
+                                        import subprocess
+                                        result = subprocess.run(["du", "-sb", str(dep_dir)], capture_output=True, text=True, check=True)
+                                        bytes_str = result.stdout.split()[0]
+                                        disk_usage_mb = int(bytes_str) // (1024 * 1024)
+                                        if disk_usage_mb > storage_limit_mb:
+                                            health["status"] = "quota_exceeded"
+                                            logger.warning("Deployment %s exceeded storage quota (%d MB > %d MB). Stopping.", dep_id, disk_usage_mb, storage_limit_mb)
+                                            try:
+                                                docker_runtime.stop_deployment(dep_id)
+                                            except Exception:
+                                                pass
+                                except Exception as e:
+                                    logger.debug("Failed to check storage quota for %s: %s", dep_id, e)
+                    else:
+                        health["status"] = "unhealthy"
+                        health["consecutive_failures"] += 1
+                except Exception as e:
+                    health["status"] = "unhealthy"
+                    health["consecutive_failures"] += 1
+                    
+        except Exception as e:
+            logger.debug("Health check loop error: %s", e)
+
+async def _docker_prune_loop() -> None:
+    """Background loop that cleans up old unused Docker images every 24 hours."""
+    while True:
+        try:
+            logger.info("Running automatic Docker image prune...")
+            import subprocess
+            result = subprocess.run(
+                ["docker", "image", "prune", "-a", "-f", "--filter", "until=24h"],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                logger.info("Docker prune successful: %s", result.stdout.strip())
+            else:
+                logger.error("Docker prune failed: %s", result.stderr.strip())
+        except Exception as e:
+            logger.error("Error running docker prune loop: %s", e)
+        
+        # Sleep for 24 hours
+        await asyncio.sleep(24 * 60 * 60)
+
+from datetime import timezone
+
 
 # ---------------------------------------------------------------------------
 # Dependencies
@@ -144,6 +252,38 @@ class DeploymentStartPayload(BaseModel):
     volume_mount_path: str = "/data"
     ram_limit_mb: int = 512
     cpu_limit: float = 1.0
+    storage_limit_mb: int = 5120
+    project_id: str | None = None
+    health_check_path: str | None = None
+    command: list[str] | str | None = None
+    network_aliases: list[str] | None = None
+
+class DatabaseStartPayload(BaseModel):
+    docker_image: str
+    internal_port: int
+    env_vars: dict[str, str] = {}
+    volume_path: str | None = None
+    volume_mount_path: str = "/var/lib/postgresql/data"
+    ram_limit_mb: int = 512
+    cpu_limit: float = 1.0
+    storage_limit_mb: int = 5120
+    project_id: str | None = None
+    command: list[str] | str | None = None
+    network_aliases: list[str] | None = None
+
+class DatabaseBackupPayload(BaseModel):
+    engine: str
+    username: str = ""
+    password: str = ""
+    database: str = ""
+    s3_key: str
+
+class DatabaseRestorePayload(BaseModel):
+    engine: str
+    username: str = ""
+    password: str = ""
+    database: str = ""
+    s3_key: str
 
 
 # ---------------------------------------------------------------------------
@@ -1657,18 +1797,40 @@ def agent_delete_mod(
 # ---------------------------------------------------------------------------
 
 _build_status: dict[str, str] = {}
+_build_results: dict[str, dict[str, str]] = {}
 
 class BuildGithubPayload(BaseModel):
     repo_url: str
     branch: str = "main"
+    deployment_kind: str = "dockerfile"
+    internal_port: int = 8080
+    install_command: str | None = None
+    build_command: str | None = None
+    start_command: str | None = None
+    output_directory: str | None = None
+    runtime_version: str | None = None
 
-def _run_github_build(deployment_id: str, repo_url: str, branch: str) -> None:
+def _run_github_build(deployment_id: str, payload: BuildGithubPayload) -> None:
     try:
         _build_status[deployment_id] = "building"
-        docker_runtime.build_from_github(repo_url, branch, deployment_id)
+        _build_results.pop(deployment_id, None)
+        image_tag = docker_runtime.build_from_github(
+            payload.repo_url,
+            payload.branch,
+            deployment_id,
+            deployment_kind=payload.deployment_kind,
+            internal_port=payload.internal_port,
+            install_command=payload.install_command,
+            build_command=payload.build_command,
+            start_command=payload.start_command,
+            output_directory=payload.output_directory,
+            runtime_version=payload.runtime_version,
+        )
+        _build_results[deployment_id] = {"image_tag": image_tag}
         _build_status[deployment_id] = "success"
     except Exception as exc:
         logger.error("GitHub build failed for %s: %s", deployment_id, exc)
+        _build_results[deployment_id] = {"error": str(exc)}
         _build_status[deployment_id] = "error"
 
 @app.post("/agent/deployments/{deployment_id}/build-github")
@@ -1680,7 +1842,7 @@ def build_github(
 ) -> Any:
     """Clone a GitHub repository and build a Docker image in the background."""
     _validate_server_id(deployment_id)
-    background_tasks.add_task(_run_github_build, deployment_id, payload.repo_url, payload.branch)
+    background_tasks.add_task(_run_github_build, deployment_id, payload)
     return {"status": "accepted"}
 
 @app.get("/agent/deployments/{deployment_id}/build-status")
@@ -1691,7 +1853,7 @@ def get_build_status(
     """Return the current GitHub build status."""
     _validate_server_id(deployment_id)
     status = _build_status.get(deployment_id, "unknown")
-    return {"status": status}
+    return {"status": status, **_build_results.get(deployment_id, {})}
 
 
 
@@ -1724,6 +1886,11 @@ def start_deployment(
             volume_mount_path=payload.volume_mount_path,
             ram_limit_mb=payload.ram_limit_mb,
             cpu_limit=payload.cpu_limit,
+            storage_limit_mb=payload.storage_limit_mb,
+            project_id=payload.project_id,
+            health_check_path=payload.health_check_path,
+            command=payload.command,
+            network_aliases=payload.network_aliases,
         )
         return {
             "status": "running",
@@ -1743,7 +1910,131 @@ def stop_deployment(
     """Stop and remove the Docker container for the given deployment."""
     _validate_server_id(deployment_id)
     docker_runtime.stop_deployment(deployment_id)
+    _deployment_health.pop(deployment_id, None)
     return {"status": "ok"}
+
+
+@app.post("/agent/deployments/{deployment_id}/delete-volume")
+def delete_deployment_volume(
+    deployment_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Delete the persistent volume directory for a deployment."""
+    _validate_server_id(deployment_id)
+    dep_dir = (DEPLOYMENTS_ROOT_DIR / deployment_id).resolve()
+    if dep_dir.is_relative_to(DEPLOYMENTS_ROOT_DIR.resolve()) and dep_dir.exists():
+        import shutil
+        shutil.rmtree(dep_dir, ignore_errors=True)
+        logger.info("Deleted volume for deployment %s at %s", deployment_id, dep_dir)
+    return {"status": "ok"}
+
+
+@app.get("/agent/deployments/{deployment_id}/volume-size")
+def get_deployment_volume_size(
+    deployment_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Get the size of the persistent volume in bytes."""
+    _validate_server_id(deployment_id)
+    dep_dir = (DEPLOYMENTS_ROOT_DIR / deployment_id).resolve()
+    if not dep_dir.is_relative_to(DEPLOYMENTS_ROOT_DIR.resolve()) or not dep_dir.exists():
+        return {"size_bytes": 0}
+        
+    import subprocess
+    try:
+        result = subprocess.run(["du", "-sb", str(dep_dir)], capture_output=True, text=True, check=True)
+        bytes_str = result.stdout.split()[0]
+        return {"size_bytes": int(bytes_str)}
+    except Exception as e:
+        logger.warning("Failed to get volume size for %s: %s", deployment_id, e)
+        return {"size_bytes": 0}
+
+
+class VolumeSnapshotPayload(BaseModel):
+    s3_key: str
+
+@app.post("/agent/deployments/{deployment_id}/volume-snapshot")
+def create_deployment_volume_snapshot(
+    deployment_id: str,
+    payload: VolumeSnapshotPayload,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Create a tar.gz snapshot of the volume and upload to S3."""
+    _validate_server_id(deployment_id)
+    dep_dir = (DEPLOYMENTS_ROOT_DIR / deployment_id).resolve()
+    if not dep_dir.is_relative_to(DEPLOYMENTS_ROOT_DIR.resolve()) or not dep_dir.exists():
+        raise HTTPException(status_code=404, detail="Volume directory not found")
+
+    import subprocess
+    import tempfile
+    from blockhost_backend.services.s3_storage import upload_file_to_s3
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".tar.gz") as tmp:
+        tar_path = tmp.name
+
+    try:
+        subprocess.run(["tar", "-czf", tar_path, "-C", str(dep_dir), "."], check=True, capture_output=True)
+        upload_file_to_s3(tar_path, payload.s3_key)
+        return {"status": "success", "s3_key": payload.s3_key}
+    except subprocess.CalledProcessError as e:
+        logger.error("Failed to tar volume %s: %s", deployment_id, e.stderr)
+        raise HTTPException(status_code=500, detail="Failed to create snapshot archive")
+    except Exception as e:
+        logger.error("Failed to upload volume snapshot to S3: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to upload snapshot to S3")
+    finally:
+        if os.path.exists(tar_path):
+            os.remove(tar_path)
+
+
+class VolumeRestorePayload(BaseModel):
+    s3_key: str
+
+@app.post("/agent/deployments/{deployment_id}/volume-restore")
+def restore_deployment_volume_snapshot(
+    deployment_id: str,
+    payload: VolumeRestorePayload,
+    _token: str = Depends(verify_token),
+) -> Any:
+    """Download a tar.gz snapshot from S3 and extract it into the volume."""
+    _validate_server_id(deployment_id)
+    dep_dir = (DEPLOYMENTS_ROOT_DIR / deployment_id).resolve()
+    if not dep_dir.is_relative_to(DEPLOYMENTS_ROOT_DIR.resolve()):
+        raise HTTPException(status_code=403, detail="Path traversal detected")
+        
+    dep_dir.mkdir(parents=True, exist_ok=True)
+
+    import subprocess
+    import tempfile
+    import urllib.request
+    from blockhost_backend.services.s3_storage import get_s3_presigned_url
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".tar.gz") as tmp:
+        tar_path = tmp.name
+
+    try:
+        # Get presigned URL for download
+        url = get_s3_presigned_url(payload.s3_key, expiration=3600)
+        urllib.request.urlretrieve(url, tar_path)
+        
+        # Clear existing contents before extraction
+        import shutil
+        for item in os.listdir(dep_dir):
+            item_path = os.path.join(dep_dir, item)
+            if os.path.isfile(item_path) or os.path.islink(item_path):
+                os.remove(item_path)
+            elif os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+                
+        # Extract archive
+        subprocess.run(["tar", "-xzf", tar_path, "-C", str(dep_dir)], check=True, capture_output=True)
+        return {"status": "success"}
+    except Exception as e:
+        logger.error("Failed to restore volume snapshot from %s: %s", payload.s3_key, e)
+        raise HTTPException(status_code=500, detail="Failed to restore volume snapshot")
+    finally:
+        if os.path.exists(tar_path):
+            os.remove(tar_path)
 
 
 @app.get("/agent/deployments/{deployment_id}/status")
@@ -1785,6 +2076,223 @@ def get_deployment_logs(
     _validate_server_id(deployment_id)
     lines = docker_runtime.get_logs(deployment_id, tail=tail)
     return {"lines": lines}
+
+
+@app.websocket("/agent/deployments/{deployment_id}/logs/ws")
+async def ws_deployment_logs(
+    websocket: WebSocket,
+    deployment_id: str,
+    token: str = Query(...),
+):
+    """Stream live logs from the deployment container."""
+    if token not in {AGENT_TOKEN, CONTROL_AGENT_TOKEN}:
+        await websocket.close(code=1008, reason="Invalid token")
+        return
+
+    _validate_server_id(deployment_id)
+    container = docker_runtime._find_active_container(deployment_id)
+    if not container:
+        await websocket.close(code=4004, reason="Container not found or not running")
+        return
+
+    await websocket.accept()
+
+    # Send history first
+    try:
+        lines = docker_runtime.get_logs(deployment_id, tail=200)
+        history_logs = [{"line": line} for line in lines]
+        await websocket.send_json({"type": "history", "logs": history_logs})
+    except Exception as e:
+        logger.warning(f"Failed to fetch log history: {e}")
+
+    queue = asyncio.Queue(maxsize=1000)
+    loop = asyncio.get_running_loop()
+
+    def _tail_logs():
+        try:
+            for line in container.logs(stream=True, tail=0, timestamps=True):
+                decoded = line.decode("utf-8", errors="replace").strip()
+                try:
+                    loop.call_soon_threadsafe(queue.put_nowait, {"line": decoded})
+                except asyncio.QueueFull:
+                    try:
+                        queue.get_nowait()
+                        loop.call_soon_threadsafe(queue.put_nowait, {"line": decoded})
+                    except asyncio.QueueEmpty:
+                        pass
+        except Exception as e:
+            logger.warning(f"Streaming logs failed for {deployment_id}: {e}")
+
+    import threading
+    t = threading.Thread(target=_tail_logs, daemon=True)
+    t.start()
+
+    try:
+        while True:
+            log_entry = await queue.get()
+            await websocket.send_json({"type": "log", "log": log_entry})
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.error(f"WebSocket error for {deployment_id}: {e}")
+
+
+@app.get("/agent/deployments/{deployment_id}/metrics")
+def get_deployment_metrics(
+    deployment_id: str,
+    _token: str = Depends(verify_token),
+) -> Any:
+    _validate_server_id(deployment_id)
+    metrics = docker_runtime.get_metrics(deployment_id)
+    
+    # Calculate disk usage
+    disk_usage_mb = 0
+    dep_dir = (DEPLOYMENTS_ROOT_DIR / deployment_id).resolve()
+    if dep_dir.is_relative_to(DEPLOYMENTS_ROOT_DIR.resolve()) and dep_dir.exists():
+        import subprocess
+        try:
+            result = subprocess.run(["du", "-sb", str(dep_dir)], capture_output=True, text=True, check=True)
+            bytes_str = result.stdout.split()[0]
+            disk_usage_mb = int(bytes_str) // (1024 * 1024)
+        except Exception as e:
+            logger.warning("Failed to get disk usage for %s: %s", deployment_id, e)
+    
+    metrics["disk_usage_mb"] = disk_usage_mb
+    return metrics
+
+
+DATABASES_ROOT_DIR = Path(
+    os.environ.get("DATABASES_ROOT_DIR", str(SERVERS_ROOT_DIR.parent / "databases"))
+).resolve()
+DATABASES_ROOT_DIR.mkdir(parents=True, exist_ok=True)
+
+@app.post("/agent/databases/{db_id}/start")
+def start_database(
+    db_id: str,
+    payload: DatabaseStartPayload,
+    _token: str = Depends(verify_token),
+) -> Any:
+    _validate_server_id(db_id)
+    safe_volume_path = None
+    if payload.volume_mount_path:
+        db_dir = (DATABASES_ROOT_DIR / db_id).resolve()
+        if not db_dir.is_relative_to(DATABASES_ROOT_DIR.resolve()):
+            raise HTTPException(status_code=403, detail="Path traversal detected")
+        db_dir.mkdir(parents=True, exist_ok=True)
+        safe_volume_path = str(db_dir)
+        
+    try:
+        result = docker_runtime.start_deployment(
+            deployment_id=db_id,
+            docker_image=payload.docker_image,
+            internal_port=payload.internal_port,
+            env_vars=payload.env_vars,
+            volume_path=safe_volume_path,
+            volume_mount_path=payload.volume_mount_path,
+            ram_limit_mb=payload.ram_limit_mb,
+            cpu_limit=payload.cpu_limit,
+            storage_limit_mb=payload.storage_limit_mb,
+            project_id=payload.project_id,
+            command=payload.command,
+            network_aliases=payload.network_aliases,
+            is_database=True,
+        )
+        return {
+            "status": "running",
+            "container_id": result.container_id,
+            "container_name": result.container_name,
+            "host_port": result.host_port,
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+@app.post("/agent/databases/{db_id}/stop")
+def stop_database(db_id: str, _token: str = Depends(verify_token)) -> Any:
+    _validate_server_id(db_id)
+    docker_runtime.stop_deployment(db_id)
+    return {"status": "ok"}
+
+@app.delete("/agent/databases/{db_id}/delete")
+def delete_database(db_id: str, _token: str = Depends(verify_token)) -> Any:
+    _validate_server_id(db_id)
+    docker_runtime.stop_deployment(db_id)
+    db_dir = (DATABASES_ROOT_DIR / db_id).resolve()
+    if db_dir.is_relative_to(DATABASES_ROOT_DIR.resolve()) and db_dir.exists():
+        import shutil
+        shutil.rmtree(db_dir, ignore_errors=True)
+    return {"status": "ok"}
+
+@app.post("/agent/databases/{db_id}/backup")
+def backup_database(db_id: str, payload: DatabaseBackupPayload, _token: str = Depends(verify_token)) -> Any:
+    _validate_server_id(db_id)
+    import tempfile
+    from blockhost_backend.services.s3_storage import upload_file_to_s3
+    
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        local_path = tmp.name
+        
+    try:
+        if payload.engine in ("postgres", "postgresql"):
+            cmd = ["pg_dump", f"postgresql://{payload.username}:{payload.password}@127.0.0.1/{payload.database}"]
+        elif payload.engine in ("mysql", "mariadb"):
+            cmd = ["mysqldump", "-u", payload.username, f"-p{payload.password}", payload.database]
+        elif payload.engine == "redis":
+            cmd = ["redis-cli", "-a", payload.password, "--rdb", "/dev/stdout"] if payload.password else ["redis-cli", "--rdb", "/dev/stdout"]
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported engine: {payload.engine}")
+
+        logger.info("Starting backup for %s (%s)", db_id, payload.engine)
+        exit_code = docker_runtime.run_docker_exec(db_id, cmd, stdout_file=local_path)
+        if exit_code != 0:
+            raise RuntimeError(f"Backup command failed with exit code {exit_code}")
+            
+        logger.info("Uploading backup to %s", payload.s3_key)
+        upload_file_to_s3(local_path, payload.s3_key)
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error("Backup failed for %s: %s", db_id, e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        import os
+        if os.path.exists(local_path):
+            os.remove(local_path)
+
+@app.post("/agent/databases/{db_id}/restore")
+def restore_database(db_id: str, payload: DatabaseRestorePayload, _token: str = Depends(verify_token)) -> Any:
+    _validate_server_id(db_id)
+    import tempfile
+    from blockhost_backend.services.s3_storage import download_file_from_s3
+    
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        local_path = tmp.name
+        
+    try:
+        logger.info("Downloading backup from %s", payload.s3_key)
+        download_file_from_s3(payload.s3_key, local_path)
+        
+        if payload.engine in ("postgres", "postgresql"):
+            cmd = ["psql", f"postgresql://{payload.username}:{payload.password}@127.0.0.1/{payload.database}"]
+        elif payload.engine in ("mysql", "mariadb"):
+            cmd = ["mysql", "-u", payload.username, f"-p{payload.password}", payload.database]
+        elif payload.engine == "redis":
+            raise HTTPException(status_code=400, detail="Redis restore must be done manually via volume replace for now.")
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported engine: {payload.engine}")
+
+        logger.info("Restoring backup for %s (%s)", db_id, payload.engine)
+        exit_code = docker_runtime.run_docker_exec(db_id, cmd, stdin_file=local_path)
+        if exit_code != 0:
+            raise RuntimeError(f"Restore command failed with exit code {exit_code}")
+            
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error("Restore failed for %s: %s", db_id, e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        import os
+        if os.path.exists(local_path):
+            os.remove(local_path)
+
 
 
 # ---------------------------------------------------------------------------
@@ -1873,6 +2381,8 @@ async def heartbeat_task() -> None:
                                     "cpu_usage_percent": cpu,
                                     "cpu_cores": psutil.cpu_count(),
                                     "running_servers": runtime.get_all_running_player_counts(),
+                                    "running_deployments": docker_runtime.list_managed_containers(),
+                                    "deployment_health": dict(_deployment_health),
                                 },
                             }
                         )
@@ -1902,6 +2412,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     task = asyncio.create_task(heartbeat_task())
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+
+    health_task = asyncio.create_task(_health_check_loop())
+    _background_tasks.add(health_task)
+    health_task.add_done_callback(_background_tasks.discard)
+
+    prune_task = asyncio.create_task(_docker_prune_loop())
+    _background_tasks.add(prune_task)
+    prune_task.add_done_callback(_background_tasks.discard)
 
     yield
 

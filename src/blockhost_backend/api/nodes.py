@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from blockhost_backend.api.deps import get_admin_user
 from blockhost_backend.config.config_manager import get_settings
 from blockhost_backend.database.db import SessionLocal, get_db
-from blockhost_backend.database.schema import Node, NodeState, Server, ServerState, User, utcnow
+from blockhost_backend.database.schema import Node, NodeState, Server, ServerState, User, utcnow, AppDeployment, DeploymentState, HealthStatus
 import httpx
 from blockhost_backend.services.node_auth import (
     generate_agent_token,
@@ -256,6 +256,36 @@ async def node_agent_websocket(
                 
                 # Now that states are reconciled, refresh RAM
                 refresh_node_allocated_ram(db, node_obj.id)
+                
+                # Process deployment health status from agent
+                deployment_health = stats.get("deployment_health", {})
+                for dep_id_str, health_data in deployment_health.items():
+                    try:
+                        dep_uuid = uuid.UUID(dep_id_str)
+                        dep = db.get(AppDeployment, dep_uuid)
+                        if dep and dep.node_id == node_obj.id:
+                            h_status = health_data.get("status", "unknown")
+                            if h_status == "healthy":
+                                dep.health_status = HealthStatus.healthy
+                            elif h_status == "unhealthy":
+                                dep.health_status = HealthStatus.unhealthy
+                            elif h_status == "crash_loop":
+                                dep.health_status = HealthStatus.crash_loop
+                                dep.state = DeploymentState.crash_loop
+                            elif h_status == "quota_exceeded":
+                                dep.health_status = HealthStatus.quota_exceeded
+                                dep.state = DeploymentState.quota_exceeded
+                            dep.restart_count = health_data.get("restart_count", 0)
+                            last_healthy = health_data.get("last_healthy_at")
+                            if last_healthy:
+                                from datetime import datetime, timezone
+                                try:
+                                    dep.last_healthy_at = datetime.fromisoformat(last_healthy)
+                                except (ValueError, TypeError):
+                                    pass
+                    except (ValueError, Exception) as e:
+                        logger.debug("Failed to process deployment health for %s: %s", dep_id_str, e)
+                
                 db.commit()
 
     except WebSocketDisconnect:
@@ -352,6 +382,7 @@ def list_nodes(
             "status": n.status,
             "approved": n.approved,
             "has_agent_token": bool(n.agent_token_hash),
+            "tier": n.tier.value if n.tier else "shared",
             "ram_mb": n.total_ram_mb,
             "used_ram_mb": n.used_ram_mb,
             "heartbeat_fresh": is_node_heartbeat_fresh(n),
@@ -377,6 +408,7 @@ def get_node(
         "status": node.status,
         "approved": node.approved,
         "has_agent_token": bool(node.agent_token_hash),
+        "tier": node.tier.value if node.tier else "shared",
         "total_ram_mb": node.total_ram_mb,
         "used_ram_mb": node.used_ram_mb,
         "cpu_usage_percent": node.cpu_usage_percent,

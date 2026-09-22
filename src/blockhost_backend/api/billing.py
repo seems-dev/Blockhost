@@ -30,6 +30,7 @@ from blockhost_backend.database.schema import (
     User,
     ProcessedWebhookEvent,
     AppDeployment,
+    DatabaseInstance,
 )
 from blockhost_backend.services.provisioning import provision_resource
 from blockhost_backend.services.billing import (
@@ -42,6 +43,47 @@ from blockhost_backend.services.billing import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/billing", tags=["billing"])
+
+
+def _resource_id_from_custom_data(resource_type: str, custom_data: dict) -> str | None:
+    if resource_type == "minecraft_server":
+        return custom_data.get("server_id")
+    if resource_type == "app_deployment":
+        return custom_data.get("deployment_id")
+    if resource_type == "database_instance":
+        return custom_data.get("database_id")
+    return None
+
+
+def _get_billable_resource(db: Session, resource_type: str, resource_id: uuid.UUID):
+    if resource_type == "minecraft_server":
+        return db.get(Server, resource_id)
+    if resource_type == "app_deployment":
+        return db.get(AppDeployment, resource_id)
+    if resource_type == "database_instance":
+        return db.get(DatabaseInstance, resource_id)
+    return None
+
+
+def _resource_owner_id(resource) -> uuid.UUID | None:
+    if isinstance(resource, DatabaseInstance):
+        return resource.project.owner_id if resource.project else None
+    return getattr(resource, "owner_id", None)
+
+
+def _resource_belongs_to_user(resource, user: User) -> bool:
+    return _resource_owner_id(resource) == user.id
+
+
+def _custom_data_for_resource(resource_type: str, resource_id: uuid.UUID) -> dict:
+    custom_data = {"resource_type": resource_type}
+    if resource_type == "minecraft_server":
+        custom_data["server_id"] = str(resource_id)
+    elif resource_type == "app_deployment":
+        custom_data["deployment_id"] = str(resource_id)
+    elif resource_type == "database_instance":
+        custom_data["database_id"] = str(resource_id)
+    return custom_data
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +491,7 @@ async def paddle_webhook(request: Request, background_tasks: BackgroundTasks, db
         custom_data = data.get("custom_data", {})
         
         resource_type = custom_data.get("resource_type", "minecraft_server")
-        resource_id_str = custom_data.get("deployment_id") if resource_type == "app_deployment" else custom_data.get("server_id")
+        resource_id_str = _resource_id_from_custom_data(resource_type, custom_data)
         
         if not subscription_id or not resource_id_str:
             db.commit()
@@ -462,18 +504,18 @@ async def paddle_webhook(request: Request, background_tasks: BackgroundTasks, db
             return {"status": "ok"}
             
         # Get resource
-        resource = None
-        if resource_type == "minecraft_server":
-            resource = db.get(Server, resource_id)
-        elif resource_type == "app_deployment":
-            resource = db.get(AppDeployment, resource_id)
+        resource = _get_billable_resource(db, resource_type, resource_id)
             
         if not resource:
             logger.warning("Paddle webhook: %s %s not found.", resource_type, resource_id)
             db.commit()
             return {"status": "ok"}
             
-        owner_id = resource.owner_id
+        owner_id = _resource_owner_id(resource)
+        if owner_id is None:
+            logger.warning("Paddle webhook: %s %s has no owner.", resource_type, resource_id)
+            db.commit()
+            return {"status": "ok"}
             
         sub = db.execute(
             select(BillingSubscription).where(
@@ -504,6 +546,9 @@ async def paddle_webhook(request: Request, background_tasks: BackgroundTasks, db
             if resource_type == "minecraft_server":
                 resource.state = ServerState.suspended
             elif resource_type == "app_deployment":
+                from blockhost_backend.database.schema import DeploymentState
+                resource.state = DeploymentState.stopped
+            elif resource_type == "database_instance":
                 from blockhost_backend.database.schema import DeploymentState
                 resource.state = DeploymentState.stopped
                 
@@ -544,7 +589,7 @@ async def paddle_webhook(request: Request, background_tasks: BackgroundTasks, db
     elif event_type == "transaction.completed":
         custom_data = data.get("custom_data", {})
         resource_type = custom_data.get("resource_type", "minecraft_server")
-        resource_id_str = custom_data.get("deployment_id") if resource_type == "app_deployment" else custom_data.get("server_id")
+        resource_id_str = _resource_id_from_custom_data(resource_type, custom_data)
         
         subscription_id = data.get("subscription_id")
         
@@ -558,11 +603,7 @@ async def paddle_webhook(request: Request, background_tasks: BackgroundTasks, db
             db.commit()
             return {"status": "ok"}
             
-        resource = None
-        if resource_type == "minecraft_server":
-            resource = db.get(Server, resource_id)
-        elif resource_type == "app_deployment":
-            resource = db.get(AppDeployment, resource_id)
+        resource = _get_billable_resource(db, resource_type, resource_id)
             
         if resource:
             if subscription_id:
@@ -591,7 +632,7 @@ async def paddle_webhook(request: Request, background_tasks: BackgroundTasks, db
                         from datetime import timedelta
                         now = utcnow()
                         sub = BillingSubscription(
-                            user_id=resource.owner_id,
+                            user_id=_resource_owner_id(resource),
                             plan_id=plan.id,
                             status=BillingSubscriptionStatus.active,
                             provider_subscription_id=subscription_id,
@@ -626,7 +667,7 @@ async def paddle_webhook(request: Request, background_tasks: BackgroundTasks, db
                     amount = Decimal("0")
                     
                 tx = BillingTransaction(
-                    user_id=resource.owner_id,
+                    user_id=_resource_owner_id(resource),
                     server_id=resource_id if resource_type == "minecraft_server" else None,
                     resource_type=resource_type,
                     resource_id=resource_id,
@@ -662,15 +703,17 @@ async def generate_paddle_checkout_unified(
     settings = get_settings()
     
     # Validate resource exists and belongs to user
-    if resource_type == "minecraft_server":
-        resource = db.get(Server, resource_id)
-    elif resource_type == "app_deployment":
-        resource = db.get(AppDeployment, resource_id)
-    else:
-        raise HTTPException(status_code=400, detail="Invalid resource type")
-        
-    if not resource or resource.owner_id != user.id:
+    resource = _get_billable_resource(db, resource_type, resource_id)
+    if resource is None:
+        if resource_type not in {"minecraft_server", "app_deployment", "database_instance"}:
+            raise HTTPException(status_code=400, detail="Invalid resource type")
         raise HTTPException(status_code=404, detail="Resource not found")
+
+    if not _resource_belongs_to_user(resource, user):
+        raise HTTPException(status_code=404, detail="Resource not found")
+
+    if resource_type not in {"minecraft_server", "app_deployment", "database_instance"}:
+        raise HTTPException(status_code=400, detail="Invalid resource type")
         
     plan = db.get(BillingPlan, plan_id)
     if not plan or not plan.active:
@@ -688,13 +731,7 @@ async def generate_paddle_checkout_unified(
         logger.error("Invalid paddle_price_id derived: %s", paddle_price_id)
         raise HTTPException(status_code=500, detail="Invalid Paddle price configuration.")
         
-    custom_data = {
-        "resource_type": resource_type
-    }
-    if resource_type == "minecraft_server":
-        custom_data["server_id"] = str(resource.id)
-    elif resource_type == "app_deployment":
-        custom_data["deployment_id"] = str(resource.id)
+    custom_data = _custom_data_for_resource(resource_type, resource.id)
     
     async with httpx.AsyncClient() as client:
         response = await client.post(

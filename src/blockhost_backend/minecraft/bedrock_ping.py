@@ -17,12 +17,31 @@ class BedrockPingResult:
     payload: str
 
 
-def bedrock_unconnected_ping(*, host: str, port: int, timeout_seconds: float = 1.0) -> BedrockPingResult:
-    """
-    Query a Bedrock server using RakNet unconnected ping/pong.
+import asyncio
 
-    This powers the same basic info Minecraft clients show in the server list:
-    MOTD, protocol, version, players, etc.
+class _BedrockPingProtocol(asyncio.DatagramProtocol):
+    def __init__(self):
+        self.transport = None
+        self.future = asyncio.get_running_loop().create_future()
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        if not self.future.done():
+            self.future.set_result(data)
+
+    def error_received(self, exc):
+        if not self.future.done():
+            self.future.set_exception(exc)
+
+    def connection_lost(self, exc):
+        if not self.future.done():
+            self.future.set_exception(exc if exc else Exception("Connection lost"))
+
+async def bedrock_unconnected_ping(*, host: str, port: int, timeout_seconds: float = 1.0) -> BedrockPingResult:
+    """
+    Query a Bedrock server using RakNet unconnected ping/pong asynchronously.
     """
     client_guid = random.getrandbits(64)
     timestamp_ms = int(time.time() * 1000)
@@ -35,17 +54,26 @@ def bedrock_unconnected_ping(*, host: str, port: int, timeout_seconds: float = 1
         ]
     )
 
+    loop = asyncio.get_running_loop()
     start = time.perf_counter()
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.settimeout(timeout_seconds)
-        sock.sendto(packet, (host, port))
-        data, _addr = sock.recvfrom(2048)
+    
+    transport = None
+    try:
+        transport, protocol = await loop.create_datagram_endpoint(
+            lambda: _BedrockPingProtocol(),
+            remote_addr=(host, port)
+        )
+        transport.sendto(packet)
+        data = await asyncio.wait_for(protocol.future, timeout=timeout_seconds)
+    finally:
+        if transport:
+            transport.close()
+
     latency_ms = max(0, int((time.perf_counter() - start) * 1000))
 
     if not data or data[0] != 0x1C:  # ID_UNCONNECTED_PONG
         raise ValueError("Unexpected response from Bedrock server")
 
-    # 0x1c + time(8) + server_guid(8) + magic(16) + payload_len(2) + payload(N)
     if len(data) < 1 + 8 + 8 + 16 + 2:
         raise ValueError("Short response from Bedrock server")
 

@@ -4,12 +4,20 @@ class CustomDomain {
     required this.deploymentId,
     required this.domain,
     required this.status,
+    this.verificationToken,
+    this.sslActive = false,
+    this.errorMessage,
+    this.dnsInstructions,
   });
 
   final String id;
   final String deploymentId;
   final String domain;
   final String status;
+  final String? verificationToken;
+  final bool sslActive;
+  final String? errorMessage;
+  final String? dnsInstructions;
 
   factory CustomDomain.fromJson(Map<String, dynamic> json) {
     return CustomDomain(
@@ -17,6 +25,10 @@ class CustomDomain {
       deploymentId: json['deployment_id'] as String,
       domain: json['domain'] as String,
       status: json['status'] as String,
+      verificationToken: json['verification_token'] as String?,
+      sslActive: json['ssl_active'] as bool? ?? false,
+      errorMessage: json['error_message'] as String?,
+      dnsInstructions: json['dns_instructions'] as String?,
     );
   }
 }
@@ -25,6 +37,7 @@ class AppDeployment {
   AppDeployment({
     required this.id,
     required this.ownerId,
+    this.projectId,
     this.nodeId,
     required this.name,
     required this.dockerImage,
@@ -41,10 +54,12 @@ class AppDeployment {
     required this.createdAt,
     required this.updatedAt,
     this.customDomains = const [],
+    this.publicUrl,
   });
 
   final String id;
   final String ownerId;
+  final String? projectId;
   final String? nodeId;
   final String name;
   final String dockerImage;
@@ -61,11 +76,13 @@ class AppDeployment {
   final DateTime createdAt;
   final DateTime updatedAt;
   final List<CustomDomain> customDomains;
+  final String? publicUrl;
 
   factory AppDeployment.fromJson(Map<String, dynamic> json) {
     return AppDeployment(
       id: json['id'] as String,
       ownerId: json['owner_id'] as String,
+      projectId: json['project_id'] as String?,
       nodeId: json['node_id'] as String?,
       name: json['name'] as String,
       dockerImage: json['docker_image'] as String,
@@ -81,6 +98,7 @@ class AppDeployment {
       lastNetworkRx: json['last_network_rx'] as int?,
       createdAt: DateTime.parse(json['created_at'] as String),
       updatedAt: DateTime.parse(json['updated_at'] as String),
+      publicUrl: json['public_url'] as String?,
       customDomains: (json['custom_domains'] as List? ?? [])
           .map((e) => CustomDomain.fromJson(e as Map<String, dynamic>))
           .toList(),

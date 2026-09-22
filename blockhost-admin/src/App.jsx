@@ -136,6 +136,11 @@ function AdminLayout({ children }) {
 
   return (
     <div className="admin-layout">
+      {/* Background Grids and Ambient Glass Mesh Orbs */}
+      <div className="absolute inset-0 bg-grid-pattern opacity-30 pointer-events-none z-0" />
+      <div className="absolute top-0 left-1/4 w-[750px] h-[520px] mesh-orb-emerald pointer-events-none z-0" />
+      <div className="absolute bottom-10 right-10 w-[450px] h-[450px] mesh-orb-cyan pointer-events-none z-0" />
+      
       <Sidebar
         collapsed={collapsed}
         onCollapse={() => setCollapsed(c => !c)}
@@ -172,11 +177,14 @@ function LoginPage({ onLogin }) {
   return (
     <div style={{
       width: '100vw', height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
-      background: 'var(--bg-base)',
+      background: 'var(--bg-base)', position: 'relative', overflow: 'hidden'
     }}>
-      <div style={{
-        background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: 12,
-        padding: 36, width: 360, boxShadow: '0 16px 48px rgba(0,0,0,0.4)',
+      {/* Background Grids and Ambient Glass Mesh Orbs */}
+      <div className="absolute inset-0 bg-grid-pattern opacity-30 pointer-events-none" />
+      <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] mesh-orb-emerald pointer-events-none" />
+      
+      <div className="glass-panel" style={{
+        borderRadius: 16, padding: 40, width: 380, zIndex: 10
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 28 }}>
           <Shield size={22} color="var(--accent)" />

@@ -9,7 +9,7 @@ from datetime import timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from blockhost_backend.database.schema import Node, NodeState, Server, ServerState, utcnow
+from blockhost_backend.database.schema import Node, NodeState, NodeTier, Server, ServerState, utcnow
 from blockhost_backend.orchestrator.resources import get_effective_server_resource_limits
 
 logger = logging.getLogger(__name__)
@@ -74,12 +74,13 @@ def refresh_all_nodes_allocated_ram(db: Session) -> None:
         refresh_node_allocated_ram(db, node_id)
 
 
-def select_best_node(db: Session, *, required_ram_mb: int = 0) -> Node | None:
+def select_best_node(db: Session, *, required_ram_mb: int = 0, required_tier: NodeTier = NodeTier.shared) -> Node | None:
     """Pick the online, non-draining node with the most free active RAM."""
     now = utcnow()
     candidates = db.execute(
         select(Node).where(
             Node.status == NodeState.online,
+            Node.tier == required_tier,
         ).with_for_update()
     ).scalars().all()
 
@@ -163,7 +164,7 @@ def auto_wakeup_offline_node(db: Session) -> bool:
 
 
 def suspend_running_servers_on_node(db: Session, node_id: uuid.UUID) -> list[uuid.UUID]:
-    """Stop running processes and suspend servers on a failed node."""
+    """Stop running processes and suspend servers and deployments on a failed node."""
     running_servers = db.execute(
         select(Server).where(
             Server.node_id == node_id,
@@ -174,11 +175,12 @@ def suspend_running_servers_on_node(db: Session, node_id: uuid.UUID) -> list[uui
     if not running_servers:
         return []
 
-    from blockhost_backend.orchestrator.lifecycle_manager import get_server_lifecycle_orchestrator
+    from blockhost_backend.orchestrator.lifecycle_manager import get_server_lifecycle_orchestrator, get_deployment_lifecycle_orchestrator
     from blockhost_backend.orchestrator.runtime_cache import (
         invalidate_node_runtime_cache,
         invalidate_server_runtime_cache,
     )
+    from blockhost_backend.database.schema import AppDeployment, DeploymentState
 
     orchestrator = get_server_lifecycle_orchestrator()
     suspended_ids: list[uuid.UUID] = []
@@ -192,6 +194,23 @@ def suspend_running_servers_on_node(db: Session, node_id: uuid.UUID) -> list[uui
             db.add(server)
         suspended_ids.append(server.id)
         invalidate_server_runtime_cache(server.id)
+
+    # Suspend active deployments
+    active_deployments = db.execute(
+        select(AppDeployment).where(
+            AppDeployment.node_id == node_id,
+            AppDeployment.state.in_([DeploymentState.running, DeploymentState.building]),
+        )
+    ).scalars().all()
+    
+    dep_orchestrator = get_deployment_lifecycle_orchestrator()
+    for dep in active_deployments:
+        try:
+            dep_orchestrator.stop_deployment(dep)
+        except Exception:
+            logger.exception("Failed to stop deployment %s during node failover", dep.id)
+            dep.state = DeploymentState.suspended
+            db.add(dep)
 
     invalidate_node_runtime_cache(node_id)
     return suspended_ids

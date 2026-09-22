@@ -227,7 +227,7 @@ def _server_to_detail(server: Server, owner: User | None = None) -> ServerDetail
     )
 
 
-def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
+async def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
     settings = get_settings()
     host = server.vm_ipv4 or settings.minecraft_public_host
     port = server.vm_port or settings.bedrock_port_range_start
@@ -311,7 +311,7 @@ def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
             else:
                 # Local node: ping directly
                 try:
-                    pong = bedrock_unconnected_ping(
+                    pong = await bedrock_unconnected_ping(
                         host="127.0.0.1", port=port, timeout_seconds=1.0,
                     )
                     parsed = parse_bedrock_pong_payload(pong.payload)
@@ -348,7 +348,7 @@ def _compute_server_stats(server: Server, db: Session) -> BedrockServerStats:
             start = time.monotonic()
             protocol = get_protocol_version(server.mc_version) if server.mc_version else None
             ping_host = "127.0.0.1" if not server.node_id else host
-            java_pong = java_server_ping(
+            java_pong = await java_server_ping(
                 host=ping_host,
                 port=port,
                 timeout_seconds=1.0,
@@ -435,7 +435,10 @@ def _refresh_server_stats_snapshot(server_id: str) -> None:
             server = db.get(Server, server_uuid)
             if not server:
                 return
-            _store_server_stats_snapshot(server_id, _compute_server_stats(server, db))
+            
+            import asyncio
+            stats = asyncio.run(_compute_server_stats(server, db))
+            _store_server_stats_snapshot(server_id, stats)
         finally:
             db.close()
     finally:
@@ -445,7 +448,7 @@ def _refresh_server_stats_snapshot(server_id: str) -> None:
             pass
 
 
-def _get_server_stats_snapshot(
+async def _get_server_stats_snapshot(
     server: Server,
     db: Session,
     background_tasks: BackgroundTasks | None = None,
@@ -455,10 +458,7 @@ def _get_server_stats_snapshot(
     if cached_stats is not None:
         return cached_stats
 
-    # Cold cache must compute real stats. Caching a placeholder here causes the
-    # panel to show data briefly, then replace it with empty values for the
-    # 5-second stats TTL.
-    stats = _compute_server_stats(server, db)
+    stats = await _compute_server_stats(server, db)
     _store_server_stats_snapshot(server_id, stats)
     return stats
 
@@ -1505,14 +1505,14 @@ def update_server_properties(
 
 
 @router.get("/{server_id}/stats", response_model=BedrockServerStats)
-def get_server_stats(
+async def get_server_stats(
     server_id: str,
     background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> BedrockServerStats:
     server = _get_server_for_user(server_id, user, db)
-    return _get_server_stats_snapshot(server, db, background_tasks)
+    return await _get_server_stats_snapshot(server, db, background_tasks)
 
 
 

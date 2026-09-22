@@ -10,24 +10,23 @@ const Color _cardBg = Color(0xFF1C1C24);
 const Color _accent = Color(0xFF06B6D4);
 const Color _textGreen = Color(0xFF00E676);
 
-class ServerConsoleScreen extends StatefulWidget {
-  const ServerConsoleScreen({
+class DeploymentConsoleScreen extends StatefulWidget {
+  const DeploymentConsoleScreen({
     super.key,
     required this.state,
-    required this.serverId,
-    required this.worldName,
+    required this.deploymentId,
+    required this.appName,
   });
 
   final AppState state;
-  final String serverId;
-  final String worldName;
+  final String deploymentId;
+  final String appName;
 
   @override
-  State<ServerConsoleScreen> createState() => _ServerConsoleScreenState();
+  State<DeploymentConsoleScreen> createState() => _DeploymentConsoleScreenState();
 }
 
-class _ServerConsoleScreenState extends State<ServerConsoleScreen> {
-  final _inputCtrl = TextEditingController();
+class _DeploymentConsoleScreenState extends State<DeploymentConsoleScreen> {
   final ScrollController _scrollCtrl = ScrollController();
   
   WebSocketChannel? _channel;
@@ -44,7 +43,7 @@ class _ServerConsoleScreenState extends State<ServerConsoleScreen> {
   void _connect() {
     if (!mounted) return;
     try {
-      final uri = widget.state.api.getConsoleWebSocketUri(widget.serverId);
+      final uri = widget.state.api.getDeploymentConsoleWebSocketUri(widget.deploymentId);
       _channel = WebSocketChannel.connect(uri);
       setState(() => _connected = true);
       
@@ -124,20 +123,8 @@ class _ServerConsoleScreenState extends State<ServerConsoleScreen> {
   void dispose() {
     _reconnectTimer?.cancel();
     _channel?.sink.close();
-    _inputCtrl.dispose();
     _scrollCtrl.dispose();
     super.dispose();
-  }
-
-  void _sendCommand() {
-    final cmd = _inputCtrl.text.trim();
-    if (cmd.isEmpty || !_connected || _channel == null) return;
-    
-    _channel!.sink.add(jsonEncode({
-      'type': 'command',
-      'command': cmd,
-    }));
-    _inputCtrl.clear();
   }
 
   String _formatTs(String? ts) {
@@ -204,7 +191,7 @@ class _ServerConsoleScreenState extends State<ServerConsoleScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text('Server Console', style: TextStyle(color: Colors.white, fontSize: 26, fontWeight: FontWeight.bold)),
+                      const Text('Live App Logs', style: TextStyle(color: Colors.white, fontSize: 26, fontWeight: FontWeight.bold)),
                       const SizedBox(height: 8),
                       Row(
                         children: [
@@ -212,7 +199,7 @@ class _ServerConsoleScreenState extends State<ServerConsoleScreen> {
                           Container(
                             padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                             decoration: BoxDecoration(color: _accent.withOpacity(0.1), borderRadius: BorderRadius.circular(4)),
-                            child: Text(widget.worldName.toUpperCase(), style: const TextStyle(color: _accent, fontSize: 12, fontWeight: FontWeight.bold)),
+                            child: Text(widget.appName.toUpperCase(), style: const TextStyle(color: _accent, fontSize: 12, fontWeight: FontWeight.bold)),
                           )
                         ],
                       ),
@@ -330,45 +317,7 @@ class _ServerConsoleScreenState extends State<ServerConsoleScreen> {
                                 ),
                               ),
                               
-                              // Input
-                              Container(
-                                padding: const EdgeInsets.all(12),
-                                color: Colors.black.withOpacity(0.3),
-                                child: Row(
-                                  children: [
-                                    Expanded(
-                                      child: TextField(
-                                        controller: _inputCtrl,
-                                        style: const TextStyle(color: _textGreen, fontFamily: 'monospace', shadows: [Shadow(color: _textGreen, blurRadius: 2)]),
-                                        decoration: InputDecoration(
-                                          hintText: 'Enter command...',
-                                          hintStyle: TextStyle(color: _textGreen.withOpacity(0.5)),
-                                          filled: true,
-                                          fillColor: Colors.black.withOpacity(0.5),
-                                          contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: _accent.withOpacity(0.3))),
-                                          enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: _accent.withOpacity(0.3))),
-                                          focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: _accent)),
-                                        ),
-                                        onSubmitted: (_) => _sendCommand(),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Container(
-                                      decoration: BoxDecoration(
-                                        color: _connected ? _accent.withOpacity(0.1) : Colors.white10,
-                                        borderRadius: BorderRadius.circular(8),
-                                        border: Border.all(color: _connected ? _accent.withOpacity(0.5) : Colors.transparent),
-                                      ),
-                                      child: IconButton(
-                                        onPressed: _connected ? _sendCommand : null,
-                                        icon: const Icon(Icons.send_rounded),
-                                        color: _connected ? _accent : Colors.white54,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
+                              // Input removed for deployments
                             ],
                           ),
                         ),
@@ -396,9 +345,7 @@ class _ServerConsoleScreenState extends State<ServerConsoleScreen> {
                         mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                         children: [
                           _ConsoleNavItem(icon: Icons.dashboard_rounded, label: 'DASHBOARD', onTap: () => Navigator.of(context).pop()),
-                          const _ConsoleNavItem(icon: Icons.terminal_rounded, label: 'CONSOLE', selected: true),
-                          _ConsoleNavItem(icon: Icons.folder_outlined, label: 'MARKETPLACE', onTap: () {}),
-                          _ConsoleNavItem(icon: Icons.settings_outlined, label: 'SETTINGS', onTap: () {}),
+                          const _ConsoleNavItem(icon: Icons.terminal_rounded, label: 'LOGS', selected: true),
                         ],
                       ),
                     ),

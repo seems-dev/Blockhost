@@ -11,12 +11,8 @@ class _AppTemplate {
 }
 
 final _templates = [
-  _AppTemplate('Postgres 16', 'postgres:16', 5432),
-  _AppTemplate('Redis', 'redis:latest', 6379),
-  _AppTemplate('Nginx Web Server', 'nginx:latest', 80),
-  _AppTemplate('Node.js 18', 'node:18', 3000),
   _AppTemplate('GitHub Repository', '', 80),
-  _AppTemplate('Custom', '', 80),
+  _AppTemplate('Custom Docker Image', '', 80),
 ];
 
 class CreateDeploymentScreen extends StatefulWidget {
@@ -33,8 +29,12 @@ class _CreateDeploymentScreenState extends State<CreateDeploymentScreen> {
   final _portCtrl = TextEditingController();
   final _githubRepoCtrl = TextEditingController();
   final _githubBranchCtrl = TextEditingController(text: 'main');
+  final _installCmdCtrl = TextEditingController();
+  final _buildCmdCtrl = TextEditingController();
+  final _startCmdCtrl = TextEditingController();
 
   _AppTemplate _selectedTemplate = _templates.first;
+  String _selectedFramework = 'dockerfile';
   int _selectedRamMb = 512;
   bool _isLoading = false;
 
@@ -45,9 +45,11 @@ class _CreateDeploymentScreenState extends State<CreateDeploymentScreen> {
   }
 
   void _applyTemplate() {
-    if (_selectedTemplate.label != 'Custom' && _selectedTemplate.label != 'GitHub Repository') {
+    _portCtrl.text = _selectedTemplate.port.toString();
+    if (_selectedTemplate.label != 'Custom Docker Image' && _selectedTemplate.label != 'GitHub Repository') {
       _imageCtrl.text = _selectedTemplate.image;
-      _portCtrl.text = _selectedTemplate.port.toString();
+    } else if (_selectedTemplate.label == 'GitHub Repository') {
+      _imageCtrl.clear();
     }
   }
 
@@ -69,13 +71,19 @@ class _CreateDeploymentScreenState extends State<CreateDeploymentScreen> {
 
     setState(() => _isLoading = true);
     try {
+      final project = await widget.state.api.getOrCreateDefaultProject();
       await widget.state.api.createDeployment(
         name: name,
+        deploymentKind: isGithub ? _selectedFramework : null,
         dockerImage: isGithub ? null : image,
-        internalPort: port,
+        internalPort: port > 0 ? port : null,
         ramLimitMb: _selectedRamMb,
         githubRepoUrl: isGithub ? githubRepo : null,
         githubBranch: isGithub ? githubBranch : null,
+        installCommand: isGithub && _installCmdCtrl.text.isNotEmpty ? _installCmdCtrl.text : null,
+        buildCommand: isGithub && _buildCmdCtrl.text.isNotEmpty ? _buildCmdCtrl.text : null,
+        startCommand: isGithub && _startCmdCtrl.text.isNotEmpty ? _startCmdCtrl.text : null,
+        projectId: project.id,
       );
       if (mounted) {
         Navigator.pop(context, true);
@@ -144,11 +152,70 @@ class _CreateDeploymentScreenState extends State<CreateDeploymentScreen> {
                             _buildTextField('GitHub Repository URL', _githubRepoCtrl, 'e.g., https://github.com/user/repo'),
                             const SizedBox(height: 16),
                             _buildTextField('Branch', _githubBranchCtrl, 'e.g., main'),
+                            const SizedBox(height: 16),
+                            const Text('Framework', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                            const SizedBox(height: 8),
+                            DropdownButtonFormField<String>(
+                              value: _selectedFramework,
+                              dropdownColor: const Color(0xFF161622),
+                              decoration: _inputDeco(),
+                              items: const [
+                                DropdownMenuItem(value: 'dockerfile', child: Text('Dockerfile (Default)', style: TextStyle(color: Colors.white))),
+                                DropdownMenuItem(value: 'nextjs', child: Text('Next.js', style: TextStyle(color: Colors.white))),
+                                DropdownMenuItem(value: 'fastapi', child: Text('FastAPI (Python)', style: TextStyle(color: Colors.white))),
+                                DropdownMenuItem(value: 'static_site', child: Text('React / Static HTML', style: TextStyle(color: Colors.white))),
+                              ],
+                              onChanged: (v) {
+                                if (v != null) {
+                                  setState(() {
+                                    _selectedFramework = v;
+                                    if (v == 'nextjs') {
+                                      _installCmdCtrl.text = 'npm install';
+                                      _buildCmdCtrl.text = 'npm run build';
+                                      _startCmdCtrl.text = 'npm start';
+                                      _portCtrl.text = '3000';
+                                    } else if (v == 'fastapi') {
+                                      _installCmdCtrl.text = 'pip install -r requirements.txt';
+                                      _buildCmdCtrl.text = '';
+                                      _startCmdCtrl.text = 'uvicorn main:app --host 0.0.0.0 --port \$PORT';
+                                      _portCtrl.text = '8000';
+                                    } else if (v == 'static_site') {
+                                      _installCmdCtrl.text = 'npm install';
+                                      _buildCmdCtrl.text = 'npm run build';
+                                      _startCmdCtrl.text = '';
+                                      _portCtrl.text = '80';
+                                    } else {
+                                      _installCmdCtrl.text = '';
+                                      _buildCmdCtrl.text = '';
+                                      _startCmdCtrl.text = '';
+                                      _portCtrl.text = '';
+                                    }
+                                  });
+                                }
+                              },
+                            ),
+                            const SizedBox(height: 16),
+                            ExpansionTile(
+                              title: const Text('Advanced Build Settings', style: TextStyle(color: Colors.white, fontSize: 14)),
+                              iconColor: const Color(0xFF06B6D4),
+                              collapsedIconColor: Colors.white54,
+                              tilePadding: EdgeInsets.zero,
+                              children: [
+                                  _buildTextField('Install Command (Optional)', _installCmdCtrl, 'e.g., npm install'),
+                                  const SizedBox(height: 12),
+                                  _buildTextField('Build Command (Optional)', _buildCmdCtrl, 'e.g., npm run build'),
+                                  const SizedBox(height: 12),
+                                  _buildTextField('Start Command (Optional)', _startCmdCtrl, 'e.g., npm start'),
+                                  const SizedBox(height: 8),
+                                ],
+                              ),
                           ] else ...[
-                            _buildTextField('Docker Image', _imageCtrl, 'e.g., postgres:16', enabled: _selectedTemplate.label == 'Custom'),
+                            _buildTextField('Docker Image', _imageCtrl, 'e.g., ghcr.io/acme/app:latest', enabled: _selectedTemplate.label == 'Custom Docker Image'),
                           ],
-                          const SizedBox(height: 16),
-                          _buildTextField('Internal Port', _portCtrl, 'e.g., 5432', keyboardType: TextInputType.number, enabled: _selectedTemplate.label == 'Custom' || _selectedTemplate.label == 'GitHub Repository'),
+                          if (_selectedTemplate.label == 'Custom Docker Image' || _selectedTemplate.label == 'GitHub Repository') ...[
+                            const SizedBox(height: 16),
+                            _buildTextField('Internal Port', _portCtrl, 'e.g., 5432', keyboardType: TextInputType.number),
+                          ],
                           const SizedBox(height: 16),
                           const Text('RAM Limit', style: TextStyle(color: Colors.white70, fontSize: 12)),
                           const SizedBox(height: 8),

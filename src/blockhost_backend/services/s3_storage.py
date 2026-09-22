@@ -125,3 +125,20 @@ def delete_s3_object(s3_key: str) -> bool:
 def delete_migration_snapshot(server_id: str) -> bool:
     """Remove the migration zip for a server (best-effort)."""
     return delete_s3_object(s3_key_for_server(server_id))
+
+def list_s3_objects(prefix: str) -> list[str]:
+    """List all object keys under a given prefix."""
+    if not is_s3_configured():
+        return []
+    client = get_s3_client()
+    bucket = get_bucket_name()
+    results = []
+    try:
+        paginator = client.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get('Contents', []):
+                results.append(obj['Key'])
+    except ClientError as e:
+        logger.warning("Failed to list s3://%s/%s: %s", bucket, prefix, e)
+    return results
+

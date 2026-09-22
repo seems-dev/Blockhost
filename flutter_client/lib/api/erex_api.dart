@@ -4,7 +4,9 @@ import 'package:http/http.dart' as http;
 
 import '../models/backup_models.dart';
 import '../models/ban_models.dart';
+import '../models/server_models.dart';
 import '../models/deployment_models.dart';
+import '../models/database_models.dart';
 import '../models/mod_models.dart';
 
 class ApiException implements Exception {
@@ -37,6 +39,15 @@ class ErexApi {
   Uri getConsoleWebSocketUri(String serverId) {
     final wsBase = baseUrl.replaceFirst('http', 'ws');
     final uri = Uri.parse('$wsBase/api/servers/$serverId/console/ws');
+    if (accessToken != null && accessToken!.isNotEmpty) {
+      return uri.replace(queryParameters: {'token': accessToken});
+    }
+    return uri;
+  }
+
+  Uri getDeploymentConsoleWebSocketUri(String deploymentId) {
+    final wsBase = baseUrl.replaceFirst('http', 'ws');
+    final uri = Uri.parse('$wsBase/api/deployments/$deploymentId/logs/ws');
     if (accessToken != null && accessToken!.isNotEmpty) {
       return uri.replace(queryParameters: {'token': accessToken});
     }
@@ -807,22 +818,32 @@ class ErexApi {
 
   Future<AppDeployment> createDeployment({
     required String name,
+    String? deploymentKind,
     String? dockerImage,
-    required int internalPort,
+    int? internalPort,
     required int ramLimitMb,
     String? githubRepoUrl,
     String? githubBranch,
+    String? installCommand,
+    String? buildCommand,
+    String? startCommand,
+    String? projectId,
   }) async {
     final res = await http.post(
       _u('/api/deployments'),
       headers: _headers(auth: true),
       body: jsonEncode({
         'name': name,
+        if (deploymentKind != null) 'deployment_kind': deploymentKind,
         'docker_image': dockerImage,
-        'internal_port': internalPort,
+        if (internalPort != null) 'internal_port': internalPort,
         'ram_limit_mb': ramLimitMb,
         if (githubRepoUrl != null) 'github_repo_url': githubRepoUrl,
         if (githubBranch != null) 'github_branch': githubBranch,
+        if (installCommand != null) 'install_command': installCommand,
+        if (buildCommand != null) 'build_command': buildCommand,
+        if (startCommand != null) 'start_command': startCommand,
+        if (projectId != null) 'project_id': projectId,
       }),
     );
     final body = _decodeJson(res.body);
@@ -850,6 +871,27 @@ class ErexApi {
     return AppDeployment.fromJson(body as Map<String, dynamic>);
   }
 
+  Future<Map<String, String>> getEnvVars(String id, {bool decrypt = false}) async {
+    final res = await http.get(
+      _u('/api/deployments/$id/env?reveal=$decrypt'),
+      headers: _headers(json: false, auth: true),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+    final env = body['env_vars'] as Map<String, dynamic>? ?? {};
+    return env.map((k, v) => MapEntry(k, v.toString()));
+  }
+
+  Future<void> updateEnvVars(String id, Map<String, String> envVars) async {
+    final res = await http.put(
+      _u('/api/deployments/$id/env'),
+      headers: _headers(auth: true),
+      body: jsonEncode(envVars),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+  }
+
   Future<List<String>> getDeploymentLogs(String id, {int tail = 100}) async {
     final res = await http.get(
       _u('/api/deployments/$id/logs?tail=$tail'),
@@ -858,7 +900,200 @@ class ErexApi {
     final body = _decodeJson(res.body);
     if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
     if (body is List) return body.map((e) => e.toString()).toList();
+    if (body is Map && body['lines'] is List) {
+      return (body['lines'] as List).map((e) => e.toString()).toList();
+    }
     throw ApiException('Unexpected response');
+  }
+
+  // --- Volume Snapshots ---
+  Future<List<Map<String, dynamic>>> getVolumeSnapshots(String id) async {
+    final res = await http.get(
+      _u('/api/apps/$id/volume/snapshots'),
+      headers: _headers(json: false, auth: true),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+    if (body is List) return body.cast<Map<String, dynamic>>();
+    throw ApiException('Unexpected response format');
+  }
+
+  Future<void> createVolumeSnapshot(String id) async {
+    final res = await http.post(
+      _u('/api/apps/$id/volume/snapshot'),
+      headers: _headers(auth: true),
+      body: jsonEncode({}),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+  }
+
+  Future<void> restoreVolumeSnapshot(String id, String s3Key) async {
+    final res = await http.post(
+      _u('/api/apps/$id/volume/restore'),
+      headers: _headers(auth: true),
+      body: jsonEncode({'s3_key': s3Key}),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+  }
+
+  // --- Metrics ---
+  Future<Map<String, dynamic>> getDeploymentMetrics(String id) async {
+    final res = await http.get(
+      _u('/api/apps/$id/metrics'),
+      headers: _headers(json: false, auth: true),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+    if (body is Map<String, dynamic>) return body;
+    return body as Map<String, dynamic>;
+  }
+
+  // --- Custom Domains ---
+  Future<List<CustomDomain>> getCustomDomains(String id) async {
+    final res = await http.get(
+      _u('/api/deployments/$id/domains'),
+      headers: _headers(json: false, auth: true),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+    if (body is List) {
+      return body.map((e) => CustomDomain.fromJson(e as Map<String, dynamic>)).toList();
+    }
+    throw ApiException('Unexpected response');
+  }
+
+  Future<CustomDomain> verifyCustomDomain(String domainId) async {
+    final res = await http.post(
+      _u('/api/domains/$domainId/verify'),
+      headers: _headers(auth: true),
+      body: jsonEncode({}),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+    return CustomDomain.fromJson(body as Map<String, dynamic>);
+  }
+
+  Future<void> removeCustomDomain(String domainId) async {
+    final res = await http.delete(
+      _u('/api/domains/$domainId'),
+      headers: _headers(auth: true),
+    );
+    if (res.statusCode == 204) return;
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+  }
+
+  // --- Projects ---
+  Future<List<HostingProject>> getProjects() async {
+    final res = await http.get(
+      _u('/api/projects'),
+      headers: _headers(json: false, auth: true),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+    if (body is List) {
+      return body.map((e) => HostingProject.fromJson(e as Map<String, dynamic>)).toList();
+    }
+    throw ApiException('Unexpected response');
+  }
+
+  Future<HostingProject> createProject(String name) async {
+    final res = await http.post(
+      _u('/api/projects'),
+      headers: _headers(auth: true),
+      body: jsonEncode({'name': name}),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 201) throw ApiException(_err(body, res.statusCode));
+    return HostingProject.fromJson(body as Map<String, dynamic>);
+  }
+
+  Future<HostingProject> getOrCreateDefaultProject() async {
+    final projects = await getProjects();
+    if (projects.isNotEmpty) return projects.first;
+    return createProject('Default Project');
+  }
+
+  // --- Databases ---
+  Future<List<DatabaseInstance>> getDatabases() async {
+    final res = await http.get(
+      _u('/api/databases'),
+      headers: _headers(json: false, auth: true),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+    if (body is List) {
+      return body.map((e) => DatabaseInstance.fromJson(e as Map<String, dynamic>)).toList();
+    }
+    throw ApiException('Unexpected response');
+  }
+
+  Future<DatabaseInstance> createDatabase({
+    required String name,
+    required String engine,
+    required String version,
+    required int ramLimitMb,
+    required String projectId,
+  }) async {
+    final res = await http.post(
+      _u('/api/databases'),
+      headers: _headers(auth: true),
+      body: jsonEncode({
+        'name': name,
+        'engine': engine,
+        'version': version,
+        'ram_limit_mb': ramLimitMb,
+        'project_id': projectId,
+      }),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 201) throw ApiException(_err(body, res.statusCode));
+    return DatabaseInstance.fromJson(body as Map<String, dynamic>);
+  }
+
+  Future<DatabaseInstance> startDatabase(String id) async {
+    final res = await http.post(
+      _u('/api/databases/$id/start'),
+      headers: _headers(json: false, auth: true),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+    return DatabaseInstance.fromJson(body as Map<String, dynamic>);
+  }
+
+  Future<DatabaseInstance> stopDatabase(String id) async {
+    final res = await http.post(
+      _u('/api/databases/$id/stop'),
+      headers: _headers(json: false, auth: true),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
+    return DatabaseInstance.fromJson(body as Map<String, dynamic>);
+  }
+
+  Future<void> deleteDatabase(String id) async {
+    final res = await http.delete(
+      _u('/api/databases/$id'),
+      headers: _headers(json: false, auth: true),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 204) throw ApiException(_err(body, res.statusCode));
+  }
+
+  Future<void> connectDatabaseToApp({
+    required String projectId,
+    required String databaseId,
+    required String appId,
+  }) async {
+    final res = await http.post(
+      _u('/api/projects/$projectId/connect-database'),
+      headers: _headers(auth: true),
+      body: jsonEncode({'database_id': databaseId, 'app_id': appId}),
+    );
+    final body = _decodeJson(res.body);
+    if (res.statusCode != 200) throw ApiException(_err(body, res.statusCode));
   }
 
   Future<CustomDomain> attachDomain(String deploymentId, String domain) async {

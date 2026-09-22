@@ -149,26 +149,80 @@ class IngressService:
             return True
 
     @staticmethod
-    def verify_dns(domain: str, expected_ip: str) -> bool:
-        """Verify that *domain* A-record resolves to *expected_ip*."""
-        logger.info("Verifying DNS A record for %s against target IP %s", domain, expected_ip)
-        
-        # In non-production or test mode, bypass live DNS resolution for local/test domains
+    def default_app_domain(deployment_id: str, base_domain: str | None = None) -> str | None:
+        base = (base_domain or os.getenv("PUBLIC_APP_BASE_DOMAIN") or "").strip().strip(".")
+        if not base:
+            return None
+        return f"{deployment_id[:12]}.{base}"
+
+    @staticmethod
+    def default_app_url(deployment_id: str, base_domain: str | None = None) -> str | None:
+        domain = IngressService.default_app_domain(deployment_id, base_domain)
+        return f"https://{domain}" if domain else None
+
+    @staticmethod
+    def dns_diagnostics(
+        domain: str,
+        expected_ip: str | None = None,
+        expected_cname: str | None = None,
+        expected_txt: str | None = None,
+    ) -> dict[str, Any]:
+        diagnostics: dict[str, Any] = {
+            "domain": domain,
+            "expected": {
+                "a": expected_ip,
+                "cname": expected_cname,
+                "txt": expected_txt,
+            },
+            "records": {"a": [], "cname": [], "txt": []},
+            "checks": {"a": False, "cname": False, "txt": False},
+            "valid": False,
+            "errors": [],
+        }
+
         if domain.endswith(".test") or domain.endswith(".local") or os.getenv("TESTING") == "1":
-            logger.info("Test/Local domain detected (%s) — passing DNS check", domain)
-            return True
+            diagnostics["valid"] = True
+            diagnostics["checks"]["testing_override"] = True
+            return diagnostics
 
         try:
-            answers = dns.resolver.resolve(domain, 'A')
-            for rdata in answers:
-                if str(rdata) == expected_ip:
-                    logger.info("DNS verification successful for %s", domain)
-                    return True
-            logger.warning("DNS verification failed for %s. Found: %s", domain, [str(r) for r in answers])
-            return False
+            answers = dns.resolver.resolve(domain, "A")
+            diagnostics["records"]["a"] = [str(rdata) for rdata in answers]
+            diagnostics["checks"]["a"] = bool(expected_ip and expected_ip in diagnostics["records"]["a"])
         except Exception as exc:
-            logger.warning("DNS lookup failed for %s: %s", domain, exc)
-            return False
+            diagnostics["errors"].append(f"A lookup failed: {exc}")
+
+        try:
+            answers = dns.resolver.resolve(domain, "CNAME")
+            diagnostics["records"]["cname"] = [str(rdata).rstrip(".") for rdata in answers]
+            expected = expected_cname.rstrip(".") if expected_cname else None
+            diagnostics["checks"]["cname"] = bool(expected and expected in diagnostics["records"]["cname"])
+        except Exception as exc:
+            diagnostics["errors"].append(f"CNAME lookup failed: {exc}")
+
+        try:
+            answers = dns.resolver.resolve(domain, "TXT")
+            txt_records: list[str] = []
+            for rdata in answers:
+                txt_records.extend(part.decode("utf-8", errors="replace") for part in getattr(rdata, "strings", []))
+            diagnostics["records"]["txt"] = txt_records
+            diagnostics["checks"]["txt"] = bool(expected_txt and expected_txt in txt_records)
+        except Exception as exc:
+            diagnostics["errors"].append(f"TXT lookup failed: {exc}")
+
+        diagnostics["valid"] = any(diagnostics["checks"].values())
+        return diagnostics
+
+    @staticmethod
+    def verify_dns(domain: str, expected_ip: str | None = None, expected_cname: str | None = None, expected_txt: str | None = None) -> bool:
+        """Verify that *domain* A-record resolves to *expected_ip*, or CNAME to *expected_cname*, or TXT contains *expected_txt*."""
+        logger.info("Verifying DNS for %s (IP=%s, CNAME=%s, TXT=%s)", domain, expected_ip, expected_cname, expected_txt)
+        diagnostics = IngressService.dns_diagnostics(domain, expected_ip, expected_cname, expected_txt)
+        if diagnostics["valid"]:
+            logger.info("DNS verification successful for %s: %s", domain, diagnostics["checks"])
+            return True
+        logger.warning("DNS verification failed for %s. No matching records found.", domain)
+        return False
 
 
 ingress_service = IngressService()

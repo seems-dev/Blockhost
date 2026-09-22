@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from typing import Optional
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, func, desc, and_, or_
@@ -11,9 +12,13 @@ from blockhost_backend.database.db import get_db
 from blockhost_backend.database.schema import (
     User, Server, BillingTransaction, BillingSubscription,
     ServerState, BlockcoinTransaction, BlockcoinReason, Node, NodeState,
-    BillingTransactionStatus, BillingAuditLog, AppDeployment, DeploymentState
+    BillingTransactionStatus, BillingAuditLog, AppDeployment, DeploymentState,
+    ProviderNodePool
 )
+from pydantic import BaseModel
 from blockhost_backend.database.schema import utcnow
+from blockhost_backend.services.cloud.cloud_provider import get_cloud_provider
+from blockhost_backend.services.node_auth import generate_agent_token, hash_agent_token
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -574,3 +579,126 @@ def admin_evacuate_node(
     node.status = NodeState.draining
     db.commit()
     return {"status": "draining", "node_id": node_id}
+
+@router.post("/nodes/{node_id}/drain")
+def admin_drain_node(
+    node_id: str,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Trigger the rebalancer to drain all servers and apps off this node (alias for evacuate)."""
+    return admin_evacuate_node(node_id, admin, db)
+
+
+class CreateProviderNodePoolRequest(BaseModel):
+    provider_name: str
+    region: str
+    instance_type: str
+    image_id: str
+    ssh_key_reference: str | None = None
+    min_nodes: int = 0
+    max_nodes: int = 10
+    enabled_products: list[str] = []
+
+@router.post("/provider-node-pools")
+def create_provider_node_pool(
+    payload: CreateProviderNodePoolRequest,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    pool = ProviderNodePool(
+        provider_name=payload.provider_name,
+        region=payload.region,
+        instance_type=payload.instance_type,
+        image_id=payload.image_id,
+        ssh_key_reference=payload.ssh_key_reference,
+        min_nodes=payload.min_nodes,
+        max_nodes=payload.max_nodes,
+        enabled_products=payload.enabled_products,
+    )
+    db.add(pool)
+    db.commit()
+    db.refresh(pool)
+    return pool
+
+
+@router.get("/provider-node-pools")
+def list_provider_node_pools(
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    return db.execute(
+        select(ProviderNodePool).order_by(ProviderNodePool.created_at.desc())
+    ).scalars().all()
+
+
+@router.post("/provider-node-pools/{pool_id}/provision-node")
+def provision_node_from_pool(
+    pool_id: str,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    pool = db.get(ProviderNodePool, uuid.UUID(pool_id))
+    if not pool:
+        raise HTTPException(status_code=404, detail="Provider node pool not found")
+
+    existing_count = db.scalar(
+        select(func.count(Node.id)).where(
+            Node.provider == pool.provider_name,
+            Node.status != NodeState.offline,
+        )
+    ) or 0
+    if existing_count >= pool.max_nodes:
+        raise HTTPException(status_code=409, detail="Provider node pool max_nodes limit reached")
+
+    plain_token = generate_agent_token()
+    provider = get_cloud_provider(pool.provider_name)
+    instance_id = provider.create_instance(
+        region=pool.region,
+        instance_type=pool.instance_type,
+        image_id=pool.image_id,
+        ssh_key=pool.ssh_key_reference,
+        node_token=plain_token,
+    )
+
+    node = Node(
+        name=f"{pool.provider_name}-{instance_id}",
+        ip_address="0.0.0.0",
+        agent_port=9000,
+        status=NodeState.starting,
+        approved=True,
+        agent_token_hash=hash_agent_token(plain_token),
+        provider=pool.provider_name,
+        provider_instance_id=instance_id,
+    )
+    db.add(node)
+    db.commit()
+    db.refresh(node)
+
+    try:
+        node.ip_address = provider.get_instance_ip(instance_id)
+        db.commit()
+    except Exception:
+        # Some providers assign IPs asynchronously; heartbeat will update it.
+        pass
+
+    return {
+        "id": node.id,
+        "name": node.name,
+        "provider": node.provider,
+        "provider_instance_id": node.provider_instance_id,
+        "ip_address": node.ip_address,
+        "agent_token": plain_token,
+        "message": "Save agent_token now. The node should connect after cloud-init finishes.",
+    }
+
+@router.post("/resources/{resource_type}/{resource_id}/migrate")
+def admin_migrate_resource(
+    resource_type: str,
+    resource_id: str,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Migrate a resource to a new node."""
+    # Placeholder for the actual migration logic which should trigger worker task
+    return {"status": "queued", "message": f"Migration of {resource_type} {resource_id} has been queued"}

@@ -32,6 +32,10 @@ class Settings(BaseSettings):
 
     minecraft_public_host: str = ""
     minecraft_port: int = 19132
+    public_api_url: str = ""
+    public_app_base_domain: str = ""
+    public_ingress_domain: str = ""
+    public_ingress_ipv4: str = ""
 
     # Local Bedrock runtime (direct process spawning).
     # These paths are resolved relative to the backend working directory.
@@ -68,6 +72,10 @@ class Settings(BaseSettings):
 
     worker_agent_url: str = "http://localhost:9000"
     worker_agent_token: str = "change-me-in-dev"
+    require_billing_for_apps: bool = False
+    require_billing_for_databases: bool = False
+    max_apps_per_user: int = 10
+    max_databases_per_user: int = 10
 
     # Runtime Binaries Registry
     runtime_binaries_dir: str = "runtime_binaries"
@@ -105,6 +113,13 @@ class Settings(BaseSettings):
     aws_region: str = "ap-southeast-2"
     s3_backup_bucket_name: str = ""
     aws_agent_sg_id: str = ""  # Security Group ID for Egress firewall
+
+    # Optional VPS provider credentials for managed node pools.
+    hetzner_api_key: str = ""
+    contabo_client_id: str = ""
+    contabo_client_secret: str = ""
+    contabo_api_user: str = ""
+    contabo_api_password: str = ""
 
     # Game Proxy – stable player-facing addresses across node migrations
     proxy_enabled: bool = False

@@ -1,12 +1,12 @@
-# BlockHost Architecture
+# Blockhost: The Next-Gen Platform as a Service (PaaS)
 
-BlockHost is a modern, distributed Minecraft hosting service designed for extreme scalability, dynamic load balancing, and cost efficiency. It orchestrates a fleet of bare-metal or cloud instances (EC2), dynamically routing player traffic and shuffling Minecraft servers in the background to pack servers tightly and shut down idle hardware.
+Blockhost is a modern, highly scalable platform designed to host **Docker Web Apps, Databases, and Minecraft Servers** on an optimized fleet of bare-metal and cloud instances. It brings Heroku-like simplicity to developers while maintaining the extreme resource efficiency and auto-sleeping capabilities required for massive scale gaming.
 
 ---
 
 ## 🏗️ High-Level Architecture
 
-The system is split into three primary layers, completely decoupled from one another:
+The system is completely decoupled into three scalable layers:
 
 ```mermaid
 graph TD
@@ -18,121 +18,74 @@ graph TD
     classDef db fill:#f3e5f5,stroke:#9c27b0,stroke-width:2px;
 
     %% Nodes
-    Player[🎮 Players (Minecraft Client)]:::client
-    Proxy[🚀 Game Proxy (Dedicated EC2)]:::proxy
+    Dev[👨‍💻 Developers & Gamers]:::client
+    Traefik[🌐 App Proxy / Load Balancer]:::proxy
+    GameProxy[🎮 Game Proxy (UDP/TCP)]:::proxy
     
-    subgraph Control Plane [⚙️ Control Plane (Docker Stack)]
+    subgraph Control Plane [⚙️ Control Plane (FastAPI + Celery)]
         API[FastAPI Backend]:::control
-        Worker[Background Worker / Rebalancer]:::control
+        Worker[Rebalancer / Allocator]:::control
         DB[(PostgreSQL)]:::db
-        Redis[(Redis Cache/Lock)]:::db
+        Redis[(Redis Cache)]:::db
     end
 
-    subgraph Agent Fleet [🖥️ Worker Nodes (Dynamic EC2s)]
-        NodeA[Node A - Systemd Agent]:::node
-        NodeB[Node B - Systemd Agent]:::node
+    subgraph Agent Fleet [🖥️ Worker Nodes (Dynamic VMs/Bare-metal)]
+        NodeA[Shared Tier - Agent]:::node
+        NodeB[Dedicated NVMe - Agent]:::node
+        EFS[(Amazon EFS Shared Storage)]:::db
     end
-    
-    S3[(Amazon S3 World Backups)]:::db
 
     %% Connections
-    Player -- "TCP/UDP via Stable Proxy Port" --> Proxy
-    Proxy -- "Reads Routing Table" --> DB
-    Proxy -- "Forwards Packets" --> NodeA
-    Proxy -- "Forwards Packets" --> NodeB
+    Dev -- "HTTP/HTTPS (Web Apps)" --> Traefik
+    Dev -- "TCP/UDP (Gaming)" --> GameProxy
     
-    NodeA -- "Heartbeats (IP/Stats)" --> API
-    NodeB -- "Heartbeats (IP/Stats)" --> API
+    Traefik -- "Proxies Traffic" --> NodeA
+    Traefik -- "Proxies Traffic" --> NodeB
+    GameProxy -- "Forwards Packets" --> NodeA
+    
+    NodeA -- "Agent Heartbeats" --> API
+    NodeB -- "Agent Heartbeats" --> API
     
     Worker -- "Orchestrates & Monitors" --> DB
-    Worker -- "Triggers Migrations" --> NodeA
-    Worker -- "Triggers Migrations" --> NodeB
+    Worker -- "Auto-Scales / Evacuates" --> NodeA
+    Worker -- "Auto-Scales / Evacuates" --> NodeB
     
-    NodeA -- "Uploads/Downloads Worlds" --> S3
-    NodeB -- "Uploads/Downloads Worlds" --> S3
-    
-    API --- DB
-    API --- Redis
-    Worker --- DB
+    NodeA --- EFS
+    NodeB --- EFS
 ```
+
+---
+
+## 🚀 Key Features
+
+### 1. Unified PaaS for Apps & Gaming
+Deploy anything instantly. Whether it's a **Next.js frontend, a Python FastAPI backend, a PostgreSQL Database, or a PaperMC server**, Blockhost handles the provisioning. 
+- **Sticky Deployments:** Web apps are treated as mission-critical workloads. They run 24/7 with 100% stickiness to their node for maximum uptime.
+- **Disposable Gaming:** Minecraft servers are treated as ephemeral. The orchestrator dynamically shuffles them between nodes in the background to pack servers tightly and optimize costs.
+
+### 2. The Tier System (Shared vs Dedicated)
+- **Shared Tier:** Cost-efficient nodes designed for hobby projects, basic static sites, and small gaming groups.
+- **Dedicated Tier:** High-performance nodes equipped with NVMe drives and dedicated CPU threads for production databases and high-traffic applications.
+
+### 3. Persistent EFS Storage & Automated Quotas
+Every deployment automatically receives a secure, persistent storage volume mounted via Amazon EFS (or local NFS equivalents). 
+- If a Node crashes, the Control Plane instantly reassigns the deployment to a healthy Node, which seamlessly remounts the exact same EFS volume.
+- **Automated Quotas:** The Agent actively monitors disk usage (`du`). If a user exceeds their database storage limit (e.g., 5GB), the Agent halts their container and flags a `quota_exceeded` status.
+
+### 4. Scale-to-Zero & Infrastructure Autoscaling
+Blockhost minimizes cloud provider costs intelligently:
+- **Node Overflow:** If a node reaches 85% Active RAM, the Rebalancer automatically halts new deployments to that server. If no servers are available, the Control Plane hits your Cloud Provider API to boot up a fresh bare-metal node.
+- **Auto-Shutdown:** If all Minecraft servers are asleep and zero Web Apps are running on a specific node, the Rebalancer evacuates any suspended data and completely terminates the underlying EC2/VPS instance to save money.
 
 ---
 
 ## 🧩 Core Components
 
-### 1. The Game Proxy (The Traffic Cop)
-Players never connect directly to the underlying worker nodes. Every server is assigned a static `proxy_port` (e.g., `30001`). 
-- The Game Proxy runs on a dedicated, lightweight VM (e.g., `t3.nano`) using **Host Networking** for ultra-fast RakNet (Bedrock) UDP routing.
-- It constantly polls the Postgres database for routing updates.
-- If a server is migrated to a new EC2 instance, the Proxy hot-swaps the route in memory. The very next packet is forwarded to the new IP address—**seamlessly, with zero downtime or proxy restarts.**
+### 1. The Control Plane
+The brains of the operation, written in **Python (FastAPI)** and backed by **PostgreSQL**. It serves the web dashboard, processes agent heartbeats, provisions Node infrastructure, and executes complex background rebalancing loops.
 
-### 2. The Control Plane
-The brains of the operation. It runs as a Docker Compose stack containing:
-- **FastAPI Backend:** Serves the frontend web app, handles user requests, and receives agent heartbeats.
-- **Postgres Database:** The ultimate source of truth. Stores node states, server billing plans, and the active network routing table.
-- **Background Worker:** A dedicated process that runs the Node Rebalancer, Disk Health Monitors, and Backup Schedulers.
+### 2. The Agent Worker (`blockhost-agent`)
+A lightweight `systemd` Python daemon running on every worker node. It translates Control Plane commands into direct Docker Engine and host OS operations (e.g., pulling images, configuring memory constraints, tracking Minecraft log states, and enforcing disk quotas).
 
-### 3. The Agent Nodes (Worker Fleet)
-The physical machines (e.g., EC2 instances) that actually run the Minecraft worlds.
-- The `blockhost-agent` runs as a native Linux `systemd` service.
-- When an EC2 boots, Linux automatically starts the agent, which immediately sends an HTTP heartbeat to the Control Plane saying *"I'm online!"*.
-- **Resource Limits:** The agent dynamically creates `systemd` slices (`MemoryMax=`) for each server based on the user's billing plan. If a server attempts to use more RAM than it paid for, the Linux kernel forcefully restricts it via OOM (Out Of Memory) limits, preventing noisy neighbors from crashing the node.
-
----
-
-## ⚖️ The Node Rebalancer (Auto-Scaling & Load Balancing)
-
-To minimize AWS EC2 costs, the Background Worker runs a highly intelligent **Rebalancer** every 120 seconds. It evaluates the network and executes one of four scenarios:
-
-```mermaid
-flowchart TD
-    Start[Rebalancer Cycle] --> CheckEmpty{Are any nodes<br/>100% empty?}
-    CheckEmpty -- Yes --> ShutDown[🔌 Scenario 0: Auto-Shutdown<br/>Power off EC2 instance]
-    CheckEmpty -- No --> Check0Running{Nodes with<br/>0 running servers?}
-    
-    Check0Running -- Yes --> Evacuate[🚚 Scenario 1: Evacuate Empty Nodes<br/>Migrate suspended servers to pack them tightly]
-    Check0Running -- No --> CheckOverload{Any node > 85% Active RAM?}
-    
-    CheckOverload -- Yes --> Overflow[🛡️ Scenario 2: Overflow Protection<br/>Migrate an active server to a quieter node]
-    CheckOverload -- No --> CheckAllIdle{Are ALL nodes<br/>under 50% load?}
-    
-    CheckAllIdle -- Yes --> Consolidate[📦 Scenario 3: Consolidation<br/>Pack servers from emptiest node to fullest node]
-    CheckAllIdle -- No --> End[Sleep for 120s]
-    
-    ShutDown --> End
-    Evacuate --> End
-    Overflow --> End
-    Consolidate --> End
-```
-
-### 1. Evacuate Empty Nodes & Overselling
-If a node has **0 running servers** but still holds suspended server files, the Rebalancer flags it for evacuation. It migrates one suspended server off the node every 2 minutes. **Crucially, it bypasses RAM capacity limits on the target node during this phase,** allowing the system to tightly pack hundreds of suspended servers onto a single machine.
-
-### 2. Auto-Shutdown
-Once the evacuation phase finishes and a node has **0 running AND 0 suspended servers**, the Rebalancer talks to the Cloud Provider API (AWS) and shuts off the physical machine to save money. If all servers in the network are suspended, the system will scale down to **exactly 1 node** and stay there.
-
-### 3. Overflow Protection (Active RAM)
-When a user clicks "Start", the system only checks **Active RAM** (the RAM used by currently running servers). If starting a server pushes a node's Active RAM too high, the Rebalancer will instantly kick in and shed load by migrating a running server to a quieter node. 
-
----
-
-## 💤 The Overselling Architecture (Auto-Sleep & Wake-on-Connect)
-
-To maintain extreme profitability, BlockHost utilizes a sophisticated "Overselling" and caching architecture. By safely overselling RAM at a 10:1 ratio, a single EC2 instance can host hundreds of paying users seamlessly.
-
-### 1. Heartbeat Player Tracking
-The Agent (`blockhost-agent`) continuously monitors the systemd `journalctl` logs of all running Minecraft servers to track exactly how many players are online in real-time. This player count is bundled into the Agent's 5-second WebSocket heartbeat. This eliminates the need for the Control Plane to spam the network with hundreds of RakNet pings.
-
-### 2. The Auto-Sleeper (NVMe Hot Cache)
-A background worker continuously scans the database. If a server has `0` players online for **15 minutes**, it is marked as `suspended`. 
-- The Agent performs a graceful local `systemctl stop`.
-- **Crucially: The world files are NOT uploaded to S3.** They remain on the local NVMe drive. 
-- This acts as a high-speed "Hot Cache". If the player returns a few hours later, the server boots locally in under 20 seconds.
-
-### 3. Wake-on-Connect (The Proxy Magic)
-The Game Proxy intercepts connections for `suspended` servers and triggers a Wake API call, allowing players to start their server just by trying to join it in Minecraft:
-- **For Java (TCP):** The Proxy uses the **"Drop and Retry"** method. It hits the Wake API and immediately drops the TCP connection. The player's client shows "Connection Refused" and forces them to click retry, buying the node 15-20 seconds to boot the server in the background.
-- **For Bedrock (UDP):** The Proxy intercepts the Unconnected Ping and returns a spoofed RakNet Pong (`Server Waking Up... (0/0 players)`). The player's server list stays online and stalls while the server boots.
-
-### 4. Rebalancer Garbage Collection (S3 Cold Storage)
-If *every* server on a node goes to sleep (e.g., at 4:00 AM), the node's Active RAM drops to 0%. The Node Rebalancer's **Consolidation** cycle will detect this totally idle node. It will migrate the sleeping servers to a busier node, **uploading them to Amazon S3 Cold Storage** in the process, and finally shut down the empty EC2 instance entirely.
+### 3. The Client UI
+A beautiful, highly interactive cross-platform dashboard built with **Flutter**. Users can view live server logs, manage their custom domains (`url_launcher` integrated), view memory charts, and deploy apps with a single click.

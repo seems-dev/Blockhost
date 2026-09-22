@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from blockhost_backend.api.deps import get_current_user
+from blockhost_backend.config.config_manager import get_settings
 from blockhost_backend.database.db import get_db
 from blockhost_backend.database.schema import AppDeployment, CustomDomain, DeploymentState, DomainStatus, Node, User
 from blockhost_backend.services.ingress import ingress_service
@@ -113,8 +114,7 @@ def attach_custom_domain(
     logger.info("Attached domain %s (token=%s) to deployment %s", payload.domain, token, deployment.id)
     
     out = DomainOut.model_validate(domain_rec)
-    import blockhost_backend.config.config_manager
-    settings = blockhost_backend.config.config_manager.get_settings()
+    settings = get_settings()
     cname_target = getattr(settings, "public_ingress_domain", getattr(settings, "public_ingress_ipv4", "ingress.example.com"))
     txt_target = f"blockhost-verify={token}"
     out.dns_instructions = f"Option 1: Create a CNAME record for {payload.domain} pointing to {cname_target}\nOption 2: Create a TXT record for {payload.domain} containing '{txt_target}'"
@@ -155,7 +155,7 @@ async def verify_custom_domain(
     deployment = _get_deployment_for_user(domain_rec.deployment_id, user, db)
 
     # Verify DNS
-    settings = blockhost_backend.config.config_manager.get_settings()
+    settings = get_settings()
     expected_ip = getattr(settings, "public_ingress_ipv4", "127.0.0.1")
     expected_cname = getattr(settings, "public_ingress_domain", None)
     expected_txt = f"blockhost-verify={domain_rec.verification_token}"

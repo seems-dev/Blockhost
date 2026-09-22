@@ -354,9 +354,8 @@ def _safe_rmtree(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
 
-
         try:
-            parent.rmdir()
+            path.parent.rmdir()
         except OSError:
             pass
 

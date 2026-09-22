@@ -1,6 +1,6 @@
 import uuid
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from fastapi import BackgroundTasks
@@ -272,7 +272,8 @@ def test_systemd_runtime_get_stats_queries_systemd_properties_separately():
     ]
 
 
-def test_get_server_stats_snapshot_computes_real_stats_on_cold_cache():
+@pytest.mark.anyio
+async def test_get_server_stats_snapshot_computes_real_stats_on_cold_cache():
     from blockhost_backend.api.schemas import BedrockServerStats
     from blockhost_backend.api.servers import _get_server_stats_snapshot
 
@@ -289,9 +290,9 @@ def test_get_server_stats_snapshot_computes_real_stats_on_cold_cache():
     )
 
     with patch("blockhost_backend.api.servers._cached_server_stats_snapshot", return_value=None), \
-         patch("blockhost_backend.api.servers._compute_server_stats", return_value=real_stats) as compute, \
+         patch("blockhost_backend.api.servers._compute_server_stats", new_callable=AsyncMock, return_value=real_stats) as compute, \
          patch("blockhost_backend.api.servers._store_server_stats_snapshot") as store:
-        stats = _get_server_stats_snapshot(server, db, BackgroundTasks())
+        stats = await _get_server_stats_snapshot(server, db, BackgroundTasks())
 
     assert stats is real_stats
     compute.assert_called_once_with(server, db)

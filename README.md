@@ -18,21 +18,21 @@ graph TD
     classDef db fill:#f3e5f5,stroke:#9c27b0,stroke-width:2px;
 
     %% Nodes
-    Dev[👨‍💻 Developers & Gamers]:::client
-    Traefik[🌐 App Proxy / Load Balancer]:::proxy
-    GameProxy[🎮 Game Proxy (UDP/TCP)]:::proxy
+    Dev["👨‍💻 Developers & Gamers"]:::client
+    Traefik["🌐 App Proxy / Load Balancer"]:::proxy
+    GameProxy["🎮 Game Proxy (UDP/TCP)"]:::proxy
     
-    subgraph Control Plane [⚙️ Control Plane (FastAPI + Celery)]
-        API[FastAPI Backend]:::control
-        Worker[Rebalancer / Allocator]:::control
-        DB[(PostgreSQL)]:::db
-        Redis[(Redis Cache)]:::db
+    subgraph controlPlane ["⚙️ Control Plane (FastAPI + Celery)"]
+        API["FastAPI Backend"]:::control
+        Worker["Rebalancer / Allocator"]:::control
+        DB[("PostgreSQL")]:::db
+        Redis[("Redis Cache")]:::db
     end
 
-    subgraph Agent Fleet [🖥️ Worker Nodes (Dynamic VMs/Bare-metal)]
-        NodeA[Shared Tier - Agent]:::node
-        NodeB[Dedicated NVMe - Agent]:::node
-        EFS[(Amazon EFS Shared Storage)]:::db
+    subgraph agentFleet ["🖥️ Worker Nodes (Dynamic VMs/Bare-metal)"]
+        NodeA["Shared Tier - Agent"]:::node
+        NodeB["Dedicated NVMe - Agent"]:::node
+        EFS[("Amazon EFS Shared Storage")]:::db
     end
 
     %% Connections

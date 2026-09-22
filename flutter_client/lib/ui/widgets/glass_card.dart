@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import '../theme/tranquil_theme.dart';
 import '../../services/audio_service.dart';
 
-class GlassCard extends StatelessWidget {
+class GlassCard extends StatefulWidget {
   const GlassCard({
     super.key,
     required this.child,
@@ -20,19 +20,30 @@ class GlassCard extends StatelessWidget {
   final VoidCallback? onTap;
 
   @override
+  State<GlassCard> createState() => _GlassCardState();
+}
+
+class _GlassCardState extends State<GlassCard> {
+  bool _isHovering = false;
+
+  @override
   Widget build(BuildContext context) {
     Widget card = ClipRRect(
       borderRadius: BorderRadius.circular(12),
       child: BackdropFilter(
         filter: ImageFilter.blur(sigmaX: TranquilTheme.blurSigma, sigmaY: TranquilTheme.blurSigma),
-        child: Container(
-          padding: padding,
-          decoration: TranquilTheme.glassDecoration(isSelected: isSelected),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOutCubic,
+          padding: widget.padding,
+          decoration: TranquilTheme.glassDecoration(
+            isSelected: widget.isSelected || _isHovering,
+          ),
           child: Stack(
             clipBehavior: Clip.none,
             children: [
-              child,
-              if (isSelected) ...[
+              widget.child,
+              if (widget.isSelected) ...[
                 Positioned(top: -4, left: -4, child: _buildCornerDot()),
                 Positioned(top: -4, right: -4, child: _buildCornerDot()),
                 Positioned(bottom: -4, left: -4, child: _buildCornerDot()),
@@ -44,19 +55,35 @@ class GlassCard extends StatelessWidget {
       ),
     );
 
-    if (onTap != null) {
+    if (widget.onTap != null) {
       card = GestureDetector(
         onTap: () {
           AudioService.playClick();
-          onTap!();
+          widget.onTap!();
         },
         behavior: HitTestBehavior.opaque,
+        child: MouseRegion(
+          onEnter: (_) => setState(() => _isHovering = true),
+          onExit: (_) => setState(() => _isHovering = false),
+          cursor: SystemMouseCursors.click,
+          child: AnimatedScale(
+            scale: _isHovering ? 1.01 : 1.0,
+            duration: const Duration(milliseconds: 150),
+            curve: Curves.easeOutCubic,
+            child: card,
+          ),
+        ),
+      );
+    } else {
+      card = MouseRegion(
+        onEnter: (_) => setState(() => _isHovering = true),
+        onExit: (_) => setState(() => _isHovering = false),
         child: card,
       );
     }
 
-    if (margin != EdgeInsets.zero) {
-      card = Padding(padding: margin, child: card);
+    if (widget.margin != EdgeInsets.zero) {
+      card = Padding(padding: widget.margin, child: card);
     }
 
     return card;
@@ -69,7 +96,7 @@ class GlassCard extends StatelessWidget {
       decoration: BoxDecoration(
         color: TranquilTheme.glowCyan,
         shape: BoxShape.circle,
-        boxShadow: [
+        boxShadow: const [
           BoxShadow(color: TranquilTheme.glowCyan, blurRadius: 4, spreadRadius: 1)
         ],
       ),

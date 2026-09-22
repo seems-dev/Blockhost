@@ -24,10 +24,7 @@ from blockhost_backend.api import versions as versions_routes
 from blockhost_backend.api.software import router as software_router
 from blockhost_backend.config.config_manager import get_cors_origins, get_settings
 from blockhost_backend.database.db import get_db
-from blockhost_backend.services.background_workers import (
-    should_run_workers_in_api,
-    start_background_workers,
-)
+
 from blockhost_backend.services.health import check_system_health
 from blockhost_backend.services.startup import bootstrap_application_data, bootstrap_database
 
@@ -36,8 +33,6 @@ from blockhost_backend.services.startup import bootstrap_application_data, boots
 async def lifespan(app: FastAPI):
     bootstrap_database()
     bootstrap_application_data()
-    if should_run_workers_in_api():
-        start_background_workers()
     yield
 
 
@@ -83,10 +78,30 @@ def create_app() -> FastAPI:
     app.include_router(mods_routes.router)
     app.include_router(software_router)
 
+    from blockhost_backend.api import domains as domains_routes
+    from blockhost_backend.api import internal as internal_routes
+    from blockhost_backend.api import wake_proxy as wake_proxy_routes
+    from blockhost_backend.api import deployments as deployments_routes
+    from blockhost_backend.api import databases as databases_routes
+    from blockhost_backend.api import databases_backups as databases_backups_routes
+    from blockhost_backend.api import projects as projects_routes
+    from blockhost_backend.api import volumes as volumes_routes
+    from blockhost_backend.api import templates as templates_routes
+    
+    app.include_router(deployments_routes.router)
+    app.include_router(deployments_routes.legacy_router)
+    app.include_router(databases_routes.router)
+    app.include_router(databases_backups_routes.router)
+    app.include_router(projects_routes.router)
+    app.include_router(domains_routes.router)
+    app.include_router(volumes_routes.router)
+    app.include_router(templates_routes.router)
+    app.include_router(internal_routes.router, prefix="/api")
+    app.include_router(wake_proxy_routes.router, prefix="/api")
+
     return app
 
 
 app = create_app()
-
 
 

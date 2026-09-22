@@ -20,7 +20,57 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy.types import JSON
+import os
+from sqlalchemy.types import JSON, TypeDecorator
+from cryptography.fernet import Fernet
+
+try:
+    ENCRYPTION_KEY = os.environ.get("DB_ENCRYPTION_KEY", "").strip()
+    fernet = Fernet(ENCRYPTION_KEY.encode()) if ENCRYPTION_KEY else None
+except Exception:
+    fernet = None
+
+class EncryptedString(TypeDecorator):
+    impl = String
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is not None and fernet:
+            return fernet.encrypt(value.encode()).decode()
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is not None and fernet:
+            return fernet.decrypt(value.encode()).decode()
+        return value
+
+
+import json as _json
+
+class EncryptedJSON(TypeDecorator):
+    """Encrypts a Python dict/list as a JSON string at rest using Fernet."""
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        json_str = _json.dumps(value)
+        if fernet:
+            return fernet.encrypt(json_str.encode()).decode()
+        return json_str
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return {}
+        try:
+            if fernet:
+                decrypted = fernet.decrypt(value.encode()).decode()
+                return _json.loads(decrypted)
+            return _json.loads(value)
+        except Exception:
+            return {}
+
 
 
 def utcnow() -> datetime:
@@ -125,6 +175,11 @@ class NodeState(str, enum.Enum):
     starting = "starting"
 
 
+class NodeTier(str, enum.Enum):
+    shared = "shared"
+    dedicated = "dedicated"
+
+
 class ServerFlavor(str, enum.Enum):
     BEDROCK = "bedrock"
     JAVA_VANILLA = "java_vanilla"
@@ -135,6 +190,72 @@ class ServerFlavor(str, enum.Enum):
     NEOFORGE = "neoforge"
 
 
+class DeploymentState(str, enum.Enum):
+    created = "created"
+    building = "building"
+    running = "running"
+    suspended = "suspended"
+    stopped = "stopped"
+    error = "error"
+    crash_loop = "crash_loop"
+    quota_exceeded = "quota_exceeded"
+
+
+class HealthStatus(str, enum.Enum):
+    unknown = "unknown"
+    healthy = "healthy"
+    unhealthy = "unhealthy"
+    crash_loop = "crash_loop"
+    quota_exceeded = "quota_exceeded"
+
+
+class RevisionTrigger(str, enum.Enum):
+    manual = "manual"
+    env_change = "env_change"
+    rollback = "rollback"
+    github_push = "github_push"
+
+
+
+class DeploymentKind(str, enum.Enum):
+    docker_image = "docker_image"
+    dockerfile = "dockerfile"
+    nextjs = "nextjs"
+    fastapi = "fastapi"
+    static_site = "static_site"
+
+class SourceType(str, enum.Enum):
+    github = "github"
+    docker_image = "docker_image"
+    upload = "upload"
+
+class DatabaseEngine(str, enum.Enum):
+    postgresql = "postgresql"
+    mysql = "mysql"
+    mariadb = "mariadb"
+    redis = "redis"
+
+class DomainStatus(str, enum.Enum):
+    pending_dns = "pending_dns"
+    active = "active"
+    failed = "failed"
+
+
+
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    owner_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+    owner: Mapped["User"] = relationship(back_populates="projects")
+    deployments: Mapped[list["AppDeployment"]] = relationship(back_populates="project")
+    databases: Mapped[list["DatabaseInstance"]] = relationship(back_populates="project")
 
 class User(Base):
     __tablename__ = "users"
@@ -163,6 +284,9 @@ class User(Base):
 
     refresh_tokens: Mapped[list["RefreshToken"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     servers: Mapped[list["Server"]] = relationship(back_populates="owner", cascade="all, delete-orphan")
+    deployments: Mapped[list["AppDeployment"]] = relationship(back_populates="owner", cascade="all, delete-orphan")
+    projects: Mapped[list["Project"]] = relationship(back_populates="owner", cascade="all, delete-orphan")
+
 
 
 class RefreshToken(Base):
@@ -260,6 +384,7 @@ class BillingPlan(Base):
     price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     duration_days: Mapped[int] = mapped_column(Integer, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    provider_price_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     subscriptions: Mapped[list["BillingSubscription"]] = relationship(back_populates="plan")
 
@@ -269,13 +394,16 @@ class BillingSubscription(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
-    server_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=False)
+    server_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=True)
+    resource_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resource_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, index=True, nullable=True)
     plan_id: Mapped[str] = mapped_column(String(64), ForeignKey("plans.id"), index=True, nullable=False)
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
     status: Mapped[BillingSubscriptionStatus] = mapped_column(
         Enum(BillingSubscriptionStatus), index=True, nullable=False, default=BillingSubscriptionStatus.active
     )
+    provider_subscription_id: Mapped[str | None] = mapped_column(String(128), unique=True, index=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
 
@@ -287,7 +415,9 @@ class BillingTransaction(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
-    server_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=False)
+    server_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=True)
+    resource_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resource_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, index=True, nullable=True)
     subscription_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("subscriptions.id"), nullable=True)
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     provider_order_id: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
@@ -313,11 +443,22 @@ class BillingAuditLog(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
-    server_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=False)
+    server_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("servers.id"), index=True, nullable=True)
+    resource_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resource_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, index=True, nullable=True)
     transaction_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("transactions.id"), nullable=True)
     action: Mapped[str] = mapped_column(String(64), nullable=False)
     details: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class ProcessedWebhookEvent(Base):
+    __tablename__ = "processed_webhook_events"
+
+    event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    processed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
 class Ban(Base):
@@ -496,6 +637,8 @@ class Node(Base):
     approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     agent_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    tier: Mapped[NodeTier] = mapped_column(Enum(NodeTier), nullable=False, default=NodeTier.shared)
+
     provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
     provider_instance_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
@@ -508,6 +651,7 @@ class Node(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
     servers: Mapped[list["Server"]] = relationship(back_populates="node")
+    deployments: Mapped[list["AppDeployment"]] = relationship(back_populates="node")
 
 
 class RuntimeBinary(Base):
@@ -525,4 +669,162 @@ class RuntimeBinary(Base):
     checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     installed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class AppDeployment(Base):
+    __tablename__ = "app_deployments"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    owner_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), index=True, nullable=False)
+    node_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("nodes.id"), index=True, nullable=True)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("projects.id"), index=True, nullable=True)
+
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    
+    deployment_kind: Mapped[DeploymentKind] = mapped_column(Enum(DeploymentKind), nullable=False, default=DeploymentKind.docker_image)
+    source_type: Mapped[SourceType] = mapped_column(Enum(SourceType), nullable=False, default=SourceType.docker_image)
+    
+    docker_image: Mapped[str] = mapped_column(String(512), nullable=False)
+    internal_port: Mapped[int] = mapped_column(Integer, nullable=False)
+    host_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    state: Mapped[DeploymentState] = mapped_column(
+        Enum(DeploymentState), nullable=False, default=DeploymentState.created
+    )
+
+    env_vars: Mapped[dict] = mapped_column(EncryptedJSON, nullable=False, default=dict)
+    volume_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    volume_mount_path: Mapped[str] = mapped_column(String(512), nullable=False, default="/data")
+    container_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    ram_limit_mb: Mapped[int] = mapped_column(Integer, nullable=False, default=512)
+    cpu_limit: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    storage_limit_mb: Mapped[int] = mapped_column(Integer, nullable=False, default=5120)
+    last_network_rx: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    deploy_webhook_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    template_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    github_repo_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    github_branch: Mapped[str] = mapped_column(String(128), nullable=False, default="main")
+
+    build_command: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    start_command: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    install_command: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    output_directory: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    runtime_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    health_check_path: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    startup_timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=120)
+
+    restart_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_healthy_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    health_status: Mapped[HealthStatus] = mapped_column(Enum(HealthStatus), nullable=False, default=HealthStatus.unknown)
+
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+    owner: Mapped[User] = relationship(back_populates="deployments")
+    node: Mapped["Node"] = relationship(back_populates="deployments")
+    custom_domains: Mapped[list["CustomDomain"]] = relationship(back_populates="deployment", cascade="all, delete-orphan")
+    project: Mapped["Project | None"] = relationship(back_populates="deployments")
+    revisions: Mapped[list["DeploymentRevision"]] = relationship(back_populates="deployment", cascade="all, delete-orphan")
+
+    @property
+    def node_ip(self) -> str | None:
+        if self.node:
+            return self.node.ip_address
+        return None
+
+class CustomDomain(Base):
+    __tablename__ = "custom_domains"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    deployment_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("app_deployments.id"), index=True, nullable=False)
+
+    domain: Mapped[str] = mapped_column(String(253), unique=True, index=True, nullable=False)
+    status: Mapped[DomainStatus] = mapped_column(
+        Enum(DomainStatus), nullable=False, default=DomainStatus.pending_dns
+    )
+    verification_token: Mapped[str] = mapped_column(String(64), nullable=False, default=lambda: uuid.uuid4().hex)
+    ssl_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+    deployment: Mapped[AppDeployment] = relationship(back_populates="custom_domains")
+
+class DatabaseInstance(Base):
+    __tablename__ = "database_instances"
+    
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("projects.id"), index=True, nullable=False)
+    node_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("nodes.id"), index=True, nullable=True)
+    
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    engine: Mapped[DatabaseEngine] = mapped_column(Enum(DatabaseEngine), nullable=False)
+    version: Mapped[str] = mapped_column(String(32), nullable=False)
+    
+    db_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    db_username: Mapped[str] = mapped_column(String(64), nullable=False)
+    db_password: Mapped[str] = mapped_column(EncryptedString(255), nullable=False)
+    
+    internal_hostname: Mapped[str] = mapped_column(String(128), nullable=False)
+    internal_port: Mapped[int] = mapped_column(Integer, nullable=False)
+    
+    ram_limit_mb: Mapped[int] = mapped_column(Integer, nullable=False, default=512)
+    cpu_limit: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    storage_limit_mb: Mapped[int] = mapped_column(Integer, nullable=False, default=1024)
+    volume_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    
+    template_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    
+    state: Mapped[DeploymentState] = mapped_column(Enum(DeploymentState), nullable=False, default=DeploymentState.created)
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+    project: Mapped["Project"] = relationship(back_populates="databases")
+    node: Mapped["Node"] = relationship()
+
+
+class DeploymentRevision(Base):
+    __tablename__ = "deployment_revisions"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    deployment_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("app_deployments.id"), index=True, nullable=False)
+    
+    image_tag: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[DeploymentState] = mapped_column(Enum(DeploymentState), nullable=False, default=DeploymentState.created)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    trigger: Mapped[RevisionTrigger] = mapped_column(Enum(RevisionTrigger), nullable=False, default=RevisionTrigger.manual)
+    
+    build_logs: Mapped[str | None] = mapped_column(Text, nullable=True)
+    runtime_logs: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    env_snapshot: Mapped[dict | None] = mapped_column(EncryptedJSON, nullable=True)
+    
+    deployed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    
+    deployment: Mapped["AppDeployment"] = relationship(back_populates="revisions")
+
+
+class ProviderNodePool(Base):
+    __tablename__ = "provider_node_pools"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    provider_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    region: Mapped[str] = mapped_column(String(64), nullable=False)
+    instance_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    image_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    ssh_key_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    
+    min_nodes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_nodes: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    enabled_products: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)

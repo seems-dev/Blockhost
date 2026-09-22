@@ -51,6 +51,7 @@ class _LoginScreenState extends State<LoginScreen> {
   String status = '';
   bool busy = false;
   bool _obscure = true;
+  bool _isSignUp = false;
   
   /// When non-null, the login screen shows the OTP verification overlay
   /// for this email address (triggered by an unverified-email login attempt).
@@ -248,19 +249,31 @@ class _LoginScreenState extends State<LoginScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
-                      'Sign In',
-                      style: TextStyle(color: _text, fontSize: 24, fontWeight: FontWeight.bold),
+                    Text(
+                      _isSignUp ? 'Create Account' : 'Sign In',
+                      style: const TextStyle(color: _text, fontSize: 24, fontWeight: FontWeight.bold),
                     ),
                     const SizedBox(height: 4),
-                    const Text(
-                      'Welcome back. Enter your credentials.',
-                      style: TextStyle(color: TranquilTheme.textMuted, fontSize: 12, fontFamily: _mono),
+                    Text(
+                      _isSignUp ? 'Welcome to EREX. Please register.' : 'Welcome back. Enter your credentials.',
+                      style: const TextStyle(color: TranquilTheme.textMuted, fontSize: 12, fontFamily: _mono),
                     ),
                     const SizedBox(height: 28),
 
+                    if (_isSignUp) ...[
+                      const _FieldLabel('Nickname'),
+                      const SizedBox(height: 8),
+                      _TermField(
+                        controller: nickname,
+                        hint: 'Your username',
+                        prefixIcon: Icons.person_outline_rounded,
+                        keyboardType: TextInputType.name,
+                      ),
+                      const SizedBox(height: 20),
+                    ],
+
                     // Email
-                    _FieldLabel('Email Address'),
+                    const _FieldLabel('Email Address'),
                     const SizedBox(height: 8),
                     _TermField(
                       controller: email,
@@ -274,7 +287,7 @@ class _LoginScreenState extends State<LoginScreen> {
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        _FieldLabel('Password'),
+                        const _FieldLabel('Password'),
                         GestureDetector(
                           onTap: () {},
                           child: const Text(
@@ -303,12 +316,22 @@ class _LoginScreenState extends State<LoginScreen> {
 
                     // Sign In button
                     GlowingButton(
-                      label: 'Sign In  →',
+                      label: _isSignUp ? 'Sign Up  →' : 'Sign In  →',
                       busy: busy,
-                      onTap: () => _run(() => widget.state.api.login(
-                        email: email.text,
-                        password: password.text,
-                      )),
+                      onTap: () {
+                        if (_isSignUp) {
+                          _run(() => widget.state.api.signup(
+                            email: email.text,
+                            password: password.text,
+                            nickname: nickname.text,
+                          ));
+                        } else {
+                          _run(() => widget.state.api.login(
+                            email: email.text,
+                            password: password.text,
+                          ));
+                        }
+                      },
                     ),
 
                     const SizedBox(height: 24),
@@ -338,16 +361,15 @@ class _LoginScreenState extends State<LoginScreen> {
 
               // Create account
               Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                const Text("Don't have an account? ", style: TextStyle(color: _muted, fontSize: 13)),
+                Text(_isSignUp ? "Already have an account? " : "Don't have an account? ", style: const TextStyle(color: _muted, fontSize: 13)),
                 GestureDetector(
-                  onTap: () => _run(() => widget.state.api.signup(
-                    email: email.text,
-                    password: password.text,
-                    nickname: nickname.text,
-                  )),
-                  child: const Text(
-                    'Create Account',
-                    style: TextStyle(color: TranquilTheme.glowCyan, fontWeight: FontWeight.bold, fontSize: 13),
+                  onTap: () => setState(() {
+                    _isSignUp = !_isSignUp;
+                    status = '';
+                  }),
+                  child: Text(
+                    _isSignUp ? 'Sign In' : 'Create Account',
+                    style: const TextStyle(color: TranquilTheme.glowCyan, fontWeight: FontWeight.bold, fontSize: 13),
                   ),
                 ),
               ]),

@@ -138,6 +138,7 @@ class ServerLifecycleOrchestrator:
                 jdk_path=self._resolve_jdk_path(server=server, settings=settings, db=db),
                 server_properties_dict=server_properties_dict,
                 jar_download_url=jar_download_url,
+                storage_mb=limits.get("storage_mb", 0),
             )
         )
 

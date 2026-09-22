@@ -440,27 +440,45 @@ class _DashboardScreenState extends State<DashboardScreen>
 
             // ── Resource status bar ─────────────────────────────────────────
             if (status.isNotEmpty)
-              Container(
-                margin: const EdgeInsets.fromLTRB(20, 12, 20, 0),
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: Colors.redAccent.withOpacity(.08),
-                  border: Border.all(color: Colors.redAccent.withOpacity(.3)),
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: Row(
-                  children: [
-                    const Icon(Icons.warning_amber_rounded,
-                        color: Colors.redAccent, size: 14),
-                    const SizedBox(width: 8),
-                    Expanded(
-                        child: Text(status,
-                            style: const TextStyle(
-                                color: Colors.redAccent,
-                                fontSize: 11,
-                                fontFamily: _mono))),
-                  ],
-                ),
+              Builder(
+                builder: (context) {
+                  final isScaling = status.toLowerCase().contains('scaling');
+                  final bgColor = isScaling ? Colors.amber.withOpacity(.08) : Colors.redAccent.withOpacity(.08);
+                  final borderColor = isScaling ? Colors.amber.withOpacity(.3) : Colors.redAccent.withOpacity(.3);
+                  final textColor = isScaling ? Colors.amber : Colors.redAccent;
+                  final icon = isScaling ? Icons.autorenew_rounded : Icons.warning_amber_rounded;
+                  
+                  return Container(
+                    margin: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: bgColor,
+                      border: Border.all(color: borderColor),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Row(
+                      children: [
+                        isScaling 
+                          ? SizedBox(
+                              width: 14, 
+                              height: 14, 
+                              child: CircularProgressIndicator(strokeWidth: 1.5, color: textColor)
+                            )
+                          : Icon(icon, color: textColor, size: 14),
+                        const SizedBox(width: 8),
+                        Expanded(
+                            child: Text(
+                                isScaling 
+                                  ? status.replaceAll(RegExp(r'\s*\(\d+\)$'), '') 
+                                  : status,
+                                style: TextStyle(
+                                    color: textColor,
+                                    fontSize: 11,
+                                    fontFamily: _mono))),
+                      ],
+                    ),
+                  );
+                }
               ),
 
             Expanded(
@@ -519,22 +537,40 @@ class _DashboardScreenState extends State<DashboardScreen>
                             itemCount: servers.length,
                             itemBuilder: (context, i) {
                               final s = servers[i] as Map<String, dynamic>;
-                              return Padding(
-                                padding: const EdgeInsets.only(bottom: 12),
-                                child: _ServerCard(
-                                  server: s,
-                                  liveStats: _listStats[s['id'] as String],
-                                  onToggle: () => _toggle(
-                                    s['id'] as String,
-                                    launchWhenRunning:
-                                        (s['state'] as String? ?? '') !=
-                                            'running',
-                                    launchServer: s,
-                                  ),
-                                  onLaunch: () => _launchMinecraft(s),
-                                  onTap: () => _loadDetail(s['id'] as String),
-                                  busy: busy,
-                                ),
+                              return TweenAnimationBuilder<double>(
+                                tween: Tween(begin: 0.0, end: 1.0),
+                                duration: const Duration(milliseconds: 500),
+                                curve: Curves.easeOutCubic,
+                                builder: (context, value, child) {
+                                  // Calculate delay based on index (clamped to max 5 items for fast loading)
+                                  final delay = (i < 5 ? i : 5) * 0.1;
+                                  // Only animate if value > delay, otherwise hide
+                                  final adjustedValue = value > delay ? (value - delay) / (1 - delay) : 0.0;
+                                  
+                                  return Opacity(
+                                    opacity: adjustedValue,
+                                    child: Transform.translate(
+                                      offset: Offset(0, 20 * (1 - adjustedValue)),
+                                      child: Padding(
+                                        padding: const EdgeInsets.only(bottom: 12),
+                                        child: _ServerCard(
+                                          server: s,
+                                          liveStats: _listStats[s['id'] as String],
+                                          onToggle: () => _toggle(
+                                            s['id'] as String,
+                                            launchWhenRunning:
+                                                (s['state'] as String? ?? '') !=
+                                                    'running',
+                                            launchServer: s,
+                                          ),
+                                          onLaunch: () => _launchMinecraft(s),
+                                          onTap: () => _loadDetail(s['id'] as String),
+                                          busy: busy,
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                },
                               );
                             },
                           ),

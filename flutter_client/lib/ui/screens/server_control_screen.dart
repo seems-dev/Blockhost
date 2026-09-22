@@ -620,43 +620,30 @@ class _GlassSection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      decoration: BoxDecoration(
-        color: _surfaceGlass,
-        border: Border.all(color: _borderGlow),
-        borderRadius: BorderRadius.circular(16),
-      ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(16),
-        child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 4, sigmaY: 4),
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Icon(icon, color: TranquilTheme.glowCyan, size: 16),
-                    const SizedBox(width: 8),
-                    Text(
-                      title,
-                      style: TextStyle(
-                        color: TranquilTheme.glowCyan,
-                        fontSize: 10,
-                        fontWeight: FontWeight.bold,
-                        letterSpacing: 1.5,
-                        fontFamily: _mono,
-                      ),
-                    ),
-                  ],
+    return GlassCard(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, color: TranquilTheme.glowCyan, size: 16),
+              const SizedBox(width: 8),
+              Text(
+                title,
+                style: TextStyle(
+                  color: TranquilTheme.glowCyan,
+                  fontSize: 10,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1.5,
+                  fontFamily: _mono,
                 ),
-                const SizedBox(height: 14),
-                child,
-              ],
-            ),
+              ),
+            ],
           ),
-        ),
+          const SizedBox(height: 14),
+          child,
+        ],
       ),
     );
   }
@@ -757,39 +744,60 @@ class _GlassPrimaryButton extends StatefulWidget {
 
 class _GlassPrimaryButtonState extends State<_GlassPrimaryButton> {
   bool _pressed = false;
+  bool _hovering = false;
 
   @override
   Widget build(BuildContext context) {
     final disabled = widget.onTap == null;
-    final bg = disabled ? widget.color.withOpacity(0.2) : widget.color.withOpacity(0.15);
 
-    return GestureDetector(
-      onTapDown: disabled ? null : (_) => setState(() => _pressed = true),
-      onTapUp: disabled ? null : (_) => setState(() => _pressed = false),
-      onTapCancel: disabled ? null : () => setState(() => _pressed = false),
-      onTap: widget.onTap,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 80),
-        transform: Matrix4.identity()..translate(0.0, _pressed ? 2.0 : 0.0),
-        padding: const EdgeInsets.symmetric(vertical: 13),
-        decoration: BoxDecoration(
-          color: bg,
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: widget.color.withOpacity(0.3)),
-          boxShadow: _pressed || disabled
-              ? []
-              : [BoxShadow(color: widget.color.withOpacity(0.2), offset: const Offset(0, 4), blurRadius: 12)],
-        ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(widget.icon, size: 17, color: widget.color),
-            const SizedBox(width: 10),
-            Text(
-              widget.label,
-              style: TextStyle(color: widget.color, fontSize: 13, fontWeight: FontWeight.w700, fontFamily: _mono),
-            ),
-          ],
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hovering = true),
+      onExit: (_) => setState(() => _hovering = false),
+      cursor: disabled ? SystemMouseCursors.basic : SystemMouseCursors.click,
+      child: GestureDetector(
+        onTapDown: disabled ? null : (_) => setState(() => _pressed = true),
+        onTapUp: disabled ? null : (_) => setState(() => _pressed = false),
+        onTapCancel: disabled ? null : () => setState(() => _pressed = false),
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          curve: Curves.easeOutCubic,
+          transform: Matrix4.identity()..scale(_pressed ? 0.96 : (_hovering && !disabled ? 1.02 : 1.0)),
+          padding: const EdgeInsets.symmetric(vertical: 14),
+          decoration: BoxDecoration(
+            gradient: disabled 
+                ? null 
+                : widget.color == TranquilTheme.glowCyan 
+                    ? TranquilTheme.buttonGradient 
+                    : LinearGradient(colors: [widget.color.withOpacity(0.8), widget.color]),
+            color: disabled ? widget.color.withOpacity(0.2) : null,
+            borderRadius: BorderRadius.circular(12),
+            boxShadow: _pressed || disabled
+                ? []
+                : [
+                    BoxShadow(
+                      color: widget.color.withOpacity(_hovering ? 0.4 : 0.2), 
+                      offset: const Offset(0, 4), 
+                      blurRadius: _hovering ? 16 : 8,
+                    )
+                  ],
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(widget.icon, size: 18, color: disabled ? widget.color.withOpacity(0.5) : Colors.white),
+              const SizedBox(width: 10),
+              Text(
+                widget.label,
+                style: TextStyle(
+                  color: disabled ? widget.color.withOpacity(0.5) : Colors.white, 
+                  fontSize: 14, 
+                  fontWeight: FontWeight.w700, 
+                  letterSpacing: 0.5,
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -1113,8 +1121,10 @@ class _StatusBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final color = ok ? TranquilTheme.glowCyan : _errorRed;
-    final icon = ok ? Icons.check_circle_outline_rounded : Icons.error_outline_rounded;
+    final isScaling = message.toLowerCase().contains('scaling');
+    final color = isScaling ? _warningAmber : (ok ? TranquilTheme.glowCyan : _errorRed);
+    final icon = isScaling ? Icons.autorenew_rounded : (ok ? Icons.check_circle_outline_rounded : Icons.error_outline_rounded);
+    
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
@@ -1124,11 +1134,13 @@ class _StatusBanner extends StatelessWidget {
       ),
       child: Row(
         children: [
-          Icon(icon, color: color, size: 18),
+          isScaling 
+            ? SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 1.5, color: color))
+            : Icon(icon, color: color, size: 18),
           const SizedBox(width: 10),
           Expanded(
             child: Text(
-              message,
+              isScaling ? message.replaceAll(RegExp(r'\s*\(\d+\)$'), '').trim() : message,
               style: TextStyle(color: color, fontSize: 12, fontFamily: _mono, height: 1.4),
             ),
           ),

@@ -354,15 +354,8 @@ def _safe_rmtree(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
 
-
-def _cleanup_backup_staging(staging: Path | None) -> None:
-    if not staging:
-        return
-
-    _safe_rmtree(staging)
-    for parent in (staging.parent, staging.parent.parent):
         try:
-            parent.rmdir()
+            path.parent.rmdir()
         except OSError:
             pass
 

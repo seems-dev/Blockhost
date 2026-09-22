@@ -1,33 +1,216 @@
-import React, { useState } from 'react';
-import { BrowserRouter, Routes, Route, NavLink, Navigate } from 'react-router-dom';
+import React, { useState, useEffect, useCallback } from 'react';
+import { BrowserRouter, Routes, Route, NavLink, useLocation } from 'react-router-dom';
+import {
+  LayoutDashboard, Server, Users, Network, CreditCard,
+  ScrollText, LogOut, Menu, X, RefreshCw, Shield,
+  ChevronLeft, AppWindow
+} from 'lucide-react';
 import Dashboard from './pages/Dashboard';
 import Servers from './pages/Servers';
 import Transactions from './pages/Transactions';
-import Users from './pages/Users';
+import UsersPage from './pages/Users';
 import Nodes from './pages/Nodes';
+import AuditLogs from './pages/AuditLogs';
+import Deployments from './pages/Deployments';
 import { loginAdmin, logoutAdmin } from './api';
 
-function AdminLayout({ children }) {
-  return (
-    <div className="flex h-screen">
-      {/* Sidebar */}
-      <div className="w-64 bg-slate-900 border-r border-slate-700 p-6">
-        <h1 className="text-xl font-bold text-cyan-400 mb-10">BlockHost Admin</h1>
-        <nav className="flex flex-col gap-4">
-          <NavLink to="/" className={({ isActive }) => isActive ? "text-cyan-400 font-bold" : "text-slate-400 hover:text-white"}>📊 Dashboard</NavLink>
-          <NavLink to="/users" className={({ isActive }) => isActive ? "text-cyan-400 font-bold" : "text-slate-400 hover:text-white"}>👥 Users</NavLink>
-          <NavLink to="/servers" className={({ isActive }) => isActive ? "text-cyan-400 font-bold" : "text-slate-400 hover:text-white"}>🖥️ Servers</NavLink>
-          <NavLink to="/nodes" className={({ isActive }) => isActive ? "text-cyan-400 font-bold" : "text-slate-400 hover:text-white"}>🌐 Nodes</NavLink>
-          <NavLink to="/transactions" className={({ isActive }) => isActive ? "text-cyan-400 font-bold" : "text-slate-400 hover:text-white"}>
-            💰 Transactions
-          </NavLink>
-          <button onClick={logoutAdmin} className="text-left text-red-400 hover:text-red-300 mt-10">🚪 Logout</button>
-        </nav>
-      </div>
+const NAV = [
+  { to: '/',            icon: LayoutDashboard, label: 'Overview' },
+  { to: '/nodes',       icon: Network,         label: 'Nodes' },
+  { to: '/users',       icon: Users,           label: 'Users' },
+  { to: '/servers',     icon: Server,          label: 'Minecraft' },
+  { to: '/deployments', icon: AppWindow,       label: 'Apps & DBs' },
+  { to: '/transactions',icon: CreditCard,      label: 'Billing' },
+  { to: '/audit',       icon: ScrollText,      label: 'Audit Logs' },
+];
 
-      {/* Main Content */}
-      <div className="flex-1 p-8 overflow-y-auto">
-        {children}
+function Sidebar({ collapsed, onCollapse, mobileOpen, onMobileClose }) {
+  const loc = useLocation();
+  return (
+    <>
+      {/* Mobile overlay */}
+      {mobileOpen && (
+        <div
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 99 }}
+          onClick={onMobileClose}
+        />
+      )}
+      <aside
+        className={`sidebar ${collapsed ? 'collapsed' : ''} ${mobileOpen ? 'open' : ''}`}
+        style={{ zIndex: 100 }}
+      >
+        {/* Logo */}
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: collapsed ? 'center' : 'space-between',
+          padding: '14px 14px 10px', borderBottom: '1px solid var(--border)', flexShrink: 0,
+        }}>
+          {!collapsed && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Shield size={18} color="var(--accent)" />
+              <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)', letterSpacing: '-0.02em' }}>
+                Erex Admin
+              </span>
+            </div>
+          )}
+          <button
+            className="btn btn-ghost btn-xs"
+            onClick={onCollapse}
+            style={{ padding: 4 }}
+            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            <ChevronLeft size={14} style={{ transform: collapsed ? 'rotate(180deg)' : 'none', transition: '0.2s' }} />
+          </button>
+        </div>
+
+        {/* Nav */}
+        <nav style={{ padding: '10px 8px', flex: 1, overflow: 'hidden' }}>
+          {NAV.map(({ to, icon: Icon, label }) => {
+            const isActive = to === '/' ? loc.pathname === '/' : loc.pathname.startsWith(to);
+            return (
+              <NavLink
+                key={to} to={to}
+                className={`nav-item ${isActive ? 'active' : ''}`}
+                onClick={onMobileClose}
+                title={collapsed ? label : undefined}
+              >
+                <Icon size={16} className="nav-icon" style={{ flexShrink: 0 }} />
+                {!collapsed && <span>{label}</span>}
+              </NavLink>
+            );
+          })}
+        </nav>
+
+        {/* Logout */}
+        <div style={{ padding: '10px 8px', borderTop: '1px solid var(--border)' }}>
+          <button
+            className="nav-item"
+            onClick={logoutAdmin}
+            style={{ width: '100%', background: 'none', border: 'none', justifyContent: collapsed ? 'center' : 'flex-start' }}
+            title={collapsed ? 'Logout' : undefined}
+          >
+            <LogOut size={15} style={{ color: 'var(--red)', flexShrink: 0 }} />
+            {!collapsed && <span style={{ color: 'var(--red)' }}>Logout</span>}
+          </button>
+        </div>
+      </aside>
+    </>
+  );
+}
+
+function Topbar({ onMobileMenuOpen, lastRefresh }) {
+  const loc = useLocation();
+  const page = NAV.find(n => n.to === '/' ? loc.pathname === '/' : loc.pathname.startsWith(n.to));
+  const fmtTime = lastRefresh ? new Date(lastRefresh).toLocaleTimeString() : null;
+
+  return (
+    <div className="topbar">
+      <button className="btn btn-ghost btn-sm" style={{ display: 'none' }} id="mobile-menu-btn" onClick={onMobileMenuOpen}>
+        <Menu size={16} />
+      </button>
+      <button
+        className="btn btn-ghost btn-sm"
+        style={{ padding: 6 }}
+        onClick={onMobileMenuOpen}
+      >
+        <Menu size={15} />
+      </button>
+      {page && (
+        <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>
+          {page.label}
+        </span>
+      )}
+      <div style={{ flex: 1 }} />
+      {fmtTime && (
+        <span style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
+          <RefreshCw size={11} /> Updated {fmtTime}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function AdminLayout({ children }) {
+  const [collapsed, setCollapsed] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const [lastRefresh] = useState(Date.now());
+
+  return (
+    <div className="admin-layout">
+      {/* Background Grids and Ambient Glass Mesh Orbs */}
+      <div className="absolute inset-0 bg-grid-pattern opacity-30 pointer-events-none z-0" />
+      <div className="absolute top-0 left-1/4 w-[750px] h-[520px] mesh-orb-emerald pointer-events-none z-0" />
+      <div className="absolute bottom-10 right-10 w-[450px] h-[450px] mesh-orb-cyan pointer-events-none z-0" />
+      
+      <Sidebar
+        collapsed={collapsed}
+        onCollapse={() => setCollapsed(c => !c)}
+        mobileOpen={mobileOpen}
+        onMobileClose={() => setMobileOpen(false)}
+      />
+      <div className="main-content">
+        <Topbar onMobileMenuOpen={() => setMobileOpen(true)} lastRefresh={lastRefresh} />
+        <div className="page-content animate-fade-in">
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LoginPage({ onLogin }) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setLoading(true); setError('');
+    try {
+      await loginAdmin(e.target.email.value, e.target.password.value);
+      onLogin();
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Login failed. Check credentials.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{
+      width: '100vw', height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: 'var(--bg-base)', position: 'relative', overflow: 'hidden'
+    }}>
+      {/* Background Grids and Ambient Glass Mesh Orbs */}
+      <div className="absolute inset-0 bg-grid-pattern opacity-30 pointer-events-none" />
+      <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] mesh-orb-emerald pointer-events-none" />
+      
+      <div className="glass-panel" style={{
+        borderRadius: 16, padding: 40, width: 380, zIndex: 10
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 28 }}>
+          <Shield size={22} color="var(--accent)" />
+          <div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--text-primary)' }}>Erex Admin</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Mission Control</div>
+          </div>
+        </div>
+        <form onSubmit={handleSubmit}>
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: 'block', fontSize: 12, color: 'var(--text-secondary)', marginBottom: 5 }}>Email</label>
+            <input name="email" type="email" required className="search-input" style={{ paddingLeft: 12 }} placeholder="admin@erex.gg" />
+          </div>
+          <div style={{ marginBottom: 20 }}>
+            <label style={{ display: 'block', fontSize: 12, color: 'var(--text-secondary)', marginBottom: 5 }}>Password</label>
+            <input name="password" type="password" required className="search-input" style={{ paddingLeft: 12 }} placeholder="••••••••" />
+          </div>
+          {error && (
+            <div style={{ color: 'var(--red)', fontSize: 12, marginBottom: 14, padding: '8px 12px', background: 'var(--red-bg)', borderRadius: 6 }}>
+              {error}
+            </div>
+          )}
+          <button type="submit" className="btn btn-primary" disabled={loading} style={{ width: '100%', padding: '9px 16px', justifyContent: 'center' }}>
+            {loading ? 'Signing in…' : 'Sign in'}
+          </button>
+        </form>
       </div>
     </div>
   );
@@ -36,26 +219,7 @@ function AdminLayout({ children }) {
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(!!localStorage.getItem('admin_token'));
 
-  const handleLogin = async (e) => {
-    e.preventDefault();
-    const email = e.target.email.value;
-    const password = e.target.password.value;
-    await loginAdmin(email, password);
-    setIsLoggedIn(true);
-  };
-
-  if (!isLoggedIn) {
-    return (
-      <div className="flex h-screen items-center justify-center">
-        <form onSubmit={handleLogin} className="bg-slate-800 p-8 rounded-lg border border-slate-700 w-96">
-          <h2 className="text-2xl font-bold mb-6 text-center">Admin Login</h2>
-          <input name="email" type="email" placeholder="Admin Email" className="w-full p-3 mb-4 bg-slate-700 rounded outline-none" required />
-          <input name="password" type="password" placeholder="Password" className="w-full p-3 mb-6 bg-slate-700 rounded outline-none" required />
-          <button type="submit" className="w-full bg-cyan-600 hover:bg-cyan-700 text-white font-bold p-3 rounded">Login</button>
-        </form>
-      </div>
-    );
-  }
+  if (!isLoggedIn) return <LoginPage onLogin={() => setIsLoggedIn(true)} />;
 
   return (
     <BrowserRouter>
@@ -63,10 +227,11 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/servers" element={<Servers />} />
+          <Route path="/deployments" element={<Deployments />} />
           <Route path="/transactions" element={<Transactions />} />
-          <Route path="/users" element={<Users />} />
+          <Route path="/users" element={<UsersPage />} />
           <Route path="/nodes" element={<Nodes />} />
-          {/* Add routes for /transactions later */}
+          <Route path="/audit" element={<AuditLogs />} />
         </Routes>
       </AdminLayout>
     </BrowserRouter>

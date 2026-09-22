@@ -151,6 +151,7 @@ class SystemdRuntime:
             "--property", f"CPUQuota={request.cpu_quota_pct}%",
             "--property", "MemoryAccounting=yes",
             "--property", "CPUAccounting=yes",
+            "--property", "IPAccounting=yes",
             "--property", "TasksMax=512",
             "--property", "Restart=on-failure",
             "--property", "StartLimitBurst=3",
@@ -628,6 +629,10 @@ class SystemdRuntime:
                             logger = logging.getLogger(__name__)
                             logger.exception(f"Listener callback failed for server {server_id}: {e}")
             finally:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
                 proc.stdout.close()
                 proc.wait()
                 with self._lock:

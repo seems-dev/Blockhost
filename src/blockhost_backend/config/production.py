@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from blockhost_backend.config.config_manager import Settings
 
 _FORBIDDEN_SECRETS = frozenset(
@@ -28,6 +30,9 @@ def validate_production_settings(settings: Settings) -> None:
 
     if settings.worker_agent_token in _FORBIDDEN_SECRETS or len(settings.worker_agent_token) < 32:
         errors.append("WORKER_AGENT_TOKEN must be set to a strong secret (32+ characters)")
+
+    if not os.environ.get("DB_ENCRYPTION_KEY"):
+        errors.append("DB_ENCRYPTION_KEY must be set to a stable Fernet key in production")
 
     if not settings.smtp_host or not (settings.smtp_from_email or settings.smtp_user):
         errors.append("SMTP_HOST and SMTP_FROM_EMAIL/SMTP_USER must be set for email verification")

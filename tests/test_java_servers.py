@@ -1,6 +1,6 @@
 import uuid
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from fastapi import BackgroundTasks
@@ -19,6 +19,7 @@ from blockhost_backend.runtime.interface import RuntimeStartRequest
 
 def test_create_java_server_logic():
     db = Mock()
+    db.execute.return_value.scalar_one.return_value = 0
     user = Mock(spec=User)
     user.id = uuid.uuid4()
 
@@ -37,10 +38,13 @@ def test_create_java_server_logic():
          patch("blockhost_backend.api.servers._server_to_out"), \
          patch("blockhost_backend.minecraft.software_provider.resolve_jar_url") as mock_resolve, \
          patch("blockhost_backend.api.servers._guard_disk_for_operation"), \
+         patch("blockhost_backend.api.servers.refresh_node_allocated_ram"), \
          patch("blockhost_backend.minecraft.binary_manager.ensure_binary_installed") as mock_ensure:
 
         mock_alloc.return_value = 25565
-        mock_select.return_value = None
+        mock_node = Mock()
+        mock_node.id = uuid.uuid4()
+        mock_select.return_value = mock_node
         mock_dirs.return_value = (Path("/tmp/v"), Path("/tmp/s"), Path("/tmp/l"))
         mock_resolve.return_value = "http://example.com/server.jar"
         mock_bin = Mock()
@@ -178,12 +182,8 @@ def test_java_port_allocation_ignores_bedrock_servers():
     bind.dialect.name = "sqlite"
     db.get_bind.return_value = bind
 
-    bedrock_row = MagicMock()
-    bedrock_row.id = "bedrock-1"
-    bedrock_row.vm_port = 19132
-    bedrock_row.flavor = ServerFlavor.BEDROCK
-
-    db.execute.return_value.all.return_value = [bedrock_row]
+    # The query filters by Server.vm_port.between(25565, 25665), so bedrock port 19132 is not returned
+    db.execute.return_value.all.return_value = []
 
     with patch("blockhost_backend.api.servers.get_settings") as mock_settings, \
          patch("blockhost_backend.api.servers.pick_free_tcp_port", return_value=25565) as mock_pick:
@@ -272,7 +272,8 @@ def test_systemd_runtime_get_stats_queries_systemd_properties_separately():
     ]
 
 
-def test_get_server_stats_snapshot_computes_real_stats_on_cold_cache():
+@pytest.mark.anyio
+async def test_get_server_stats_snapshot_computes_real_stats_on_cold_cache():
     from blockhost_backend.api.schemas import BedrockServerStats
     from blockhost_backend.api.servers import _get_server_stats_snapshot
 
@@ -289,9 +290,9 @@ def test_get_server_stats_snapshot_computes_real_stats_on_cold_cache():
     )
 
     with patch("blockhost_backend.api.servers._cached_server_stats_snapshot", return_value=None), \
-         patch("blockhost_backend.api.servers._compute_server_stats", return_value=real_stats) as compute, \
+         patch("blockhost_backend.api.servers._compute_server_stats", new_callable=AsyncMock, return_value=real_stats) as compute, \
          patch("blockhost_backend.api.servers._store_server_stats_snapshot") as store:
-        stats = _get_server_stats_snapshot(server, db, BackgroundTasks())
+        stats = await _get_server_stats_snapshot(server, db, BackgroundTasks())
 
     assert stats is real_stats
     compute.assert_called_once_with(server, db)

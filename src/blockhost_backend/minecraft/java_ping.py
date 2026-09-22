@@ -1,23 +1,23 @@
-import socket
+import asyncio
 import json
 import struct
 
-def java_server_ping(
+async def java_server_ping(
     host: str,
     port: int,
     timeout_seconds: float = 1.0,
     protocol_version: int | None = None,
 ) -> dict:
     """
-    Very basic Server List Ping for Minecraft Java.
+    Very basic Server List Ping for Minecraft Java asynchronously.
     """
     try:
-        with socket.create_connection((host, port), timeout=timeout_seconds) as s:
-            # Send Handshake
-            # Packet ID 0, Protocol -1, Host, Port, Next State 1
-            # We will just do a legacy ping for simplicity, or a modern handshake.
-            # Modern handshake is easier if we use struct.
-            
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), 
+            timeout=timeout_seconds
+        )
+        
+        try:
             def write_varint(val: int) -> bytes:
                 out = b""
                 while True:
@@ -30,12 +30,10 @@ def java_server_ping(
                         break
                 return out
 
-            def read_varint(s: socket.socket) -> int:
+            async def read_varint(reader: asyncio.StreamReader) -> int:
                 val = 0
                 for i in range(5):
-                    b = s.recv(1)
-                    if not b:
-                        raise ValueError("Socket closed")
+                    b = await asyncio.wait_for(reader.readexactly(1), timeout=timeout_seconds)
                     b = b[0]
                     val |= (b & 0x7F) << (7 * i)
                     if not (b & 0x80):
@@ -55,27 +53,26 @@ def java_server_ping(
             handshake += write_varint(1) # Next state: status
             
             p1 = write_varint(len(handshake)) + handshake
-            s.sendall(p1)
+            writer.write(p1)
             
             # Request packet
             req = write_varint(0x00)
             p2 = write_varint(len(req)) + req
-            s.sendall(p2)
+            writer.write(p2)
+            await writer.drain()
             
             # Read response
-            length = read_varint(s)
-            packet_id = read_varint(s)
+            length = await read_varint(reader)
+            packet_id = await read_varint(reader)
             if packet_id != 0x00:
                 raise ValueError("Invalid packet id")
                 
-            json_len = read_varint(s)
-            data = b""
-            while len(data) < json_len:
-                chunk = s.recv(json_len - len(data))
-                if not chunk:
-                    break
-                data += chunk
-                
+            json_len = await read_varint(reader)
+            data = await asyncio.wait_for(reader.readexactly(json_len), timeout=timeout_seconds)
             return json.loads(data.decode("utf-8"))
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            
     except Exception:
         return {}

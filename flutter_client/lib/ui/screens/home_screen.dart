@@ -9,6 +9,8 @@ import 'dashboard_screen.dart';
 import 'create_server_screen.dart';
 import 'plans_screen.dart';
 import 'settings_screen.dart';
+import 'deployments_screen.dart';
+import 'databases_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key, required this.state});
@@ -42,7 +44,8 @@ class _HomeScreenState extends State<HomeScreen> {
       hasToken
           ? DashboardScreen(state: widget.state)
           : LoginScreen(state: widget.state, onLoggedIn: () => setState(() => index = 0)),
-      CreateServerScreen(state: widget.state, onCreated: _goToDashboard),
+      DeploymentsScreen(state: widget.state),
+      DatabasesScreen(state: widget.state),
       PlansScreen(state: widget.state, onPlanChanged: () => setState(() {})),
       SettingsScreen(state: widget.state, onAuthChanged: () => setState(() => index = 0)),
     ];
@@ -91,9 +94,10 @@ class _BottomNav extends StatelessWidget {
         mainAxisAlignment: MainAxisAlignment.spaceEvenly,
         children: [
           _NavItem(icon: Icons.view_agenda_rounded, label: 'Servers',  index: 0, selectedIndex: selectedIndex, onTap: onTap),
-          _NavItem(icon: Icons.terminal_rounded,    label: 'Console',  index: 1, selectedIndex: selectedIndex, onTap: onTap),
-          _NavItem(icon: Icons.folder_outlined,     label: 'Files',    index: 2, selectedIndex: selectedIndex, onTap: onTap),
-          _NavItem(icon: Icons.settings_outlined,   label: 'Settings', index: 3, selectedIndex: selectedIndex, onTap: onTap),
+          _NavItem(icon: Icons.apps_rounded,        label: 'Apps',     index: 1, selectedIndex: selectedIndex, onTap: onTap),
+          _NavItem(icon: Icons.storage_rounded,     label: 'DBs',      index: 2, selectedIndex: selectedIndex, onTap: onTap),
+          _NavItem(icon: Icons.shopping_cart_outlined,label: 'Plans',  index: 3, selectedIndex: selectedIndex, onTap: onTap),
+          _NavItem(icon: Icons.settings_outlined,   label: 'Settings', index: 4, selectedIndex: selectedIndex, onTap: onTap),
         ],
       ),
     );

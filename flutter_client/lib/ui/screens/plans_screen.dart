@@ -5,7 +5,7 @@ import '../../state/app_state.dart';
 import '../theme/tranquil_theme.dart';
 import '../widgets/glass_card.dart';
 import '../widgets/glowing_button.dart';
-import 'package:razorpay_flutter/razorpay_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 
 class PlansScreen extends StatelessWidget {
@@ -22,7 +22,7 @@ class PlansScreen extends StatelessWidget {
   final VoidCallback? onPlanUpgraded;
   final VoidCallback? onPlanChanged;
 
-  // NEW: This will eventually call your API and open Razorpay
+  // NEW: This will eventually call your API and open Paddle checkout
   Future<void> _selectPlan(BuildContext context, _Plan plan) async {
     final scaffoldMessenger = ScaffoldMessenger.of(context);
     debugPrint('PlansScreen: _selectPlan called for plan ${plan.id}, serverId=$serverId');
@@ -47,88 +47,35 @@ class PlansScreen extends StatelessWidget {
     ));
 
     try {
-      debugPrint('PlansScreen: calling createUpgradeOrder on backend');
-      // 1. Create order on backend
-      final order = await state.api.createUpgradeOrder(
+      debugPrint('PlansScreen: calling generatePaddleCheckout on backend');
+      // 1. Generate checkout on backend
+      final checkoutData = await state.api.generatePaddleCheckout(
         serverId: serverId!,
-        targetPlanId: plan.id,
+        planId: plan.id,
       );
 
-      final orderId = order['provider_order_id'];
-      debugPrint('PlansScreen: backend order created successfully. orderId=$orderId');
+      final checkoutUrl = checkoutData['checkout_url'];
+      if (checkoutUrl == null) throw Exception('No checkout URL returned.');
+
+      debugPrint('PlansScreen: backend checkout generated successfully. url=$checkoutUrl');
       
-      // 2. Initialize Razorpay
-      final razorpay = Razorpay();
-
-      razorpay.on(Razorpay.EVENT_PAYMENT_SUCCESS, (PaymentSuccessResponse response) async {
-        razorpay.clear();
-        try {
-          // 3. Verify on backend
-          await state.api.verifyPayment(
-            providerOrderId: response.orderId!,
-            providerPaymentId: response.paymentId!,
-            signature: response.signature!,
-          );
-          
-          if (context.mounted) {
-            scaffoldMessenger.showSnackBar(SnackBar(
-              backgroundColor: Colors.green.shade800,
-              content: const Text('Payment successful! Server upgraded.',
-                  style: TextStyle(color: Colors.white, fontFamily: 'monospace', fontSize: 12)),
-            ));
-            onPlanUpgraded?.call();
-            Navigator.of(context).pop();
-          }
-        } catch (e) {
-          if (context.mounted) {
-            scaffoldMessenger.showSnackBar(SnackBar(
-              backgroundColor: Colors.red.shade900,
-              content: Text('Failed to verify payment: $e',
-                  style: const TextStyle(color: Colors.white, fontFamily: 'monospace', fontSize: 12)),
-            ));
-          }
-        }
-      });
-
-      razorpay.on(Razorpay.EVENT_PAYMENT_ERROR, (PaymentFailureResponse response) {
-        razorpay.clear();
-        if (context.mounted) {
-          scaffoldMessenger.showSnackBar(SnackBar(
-            backgroundColor: Colors.red.shade900,
-            content: Text('Payment failed: ${response.message}',
-                style: const TextStyle(color: Colors.white, fontFamily: 'monospace', fontSize: 12)),
-          ));
-        }
-      });
-
-      razorpay.on(Razorpay.EVENT_EXTERNAL_WALLET, (ExternalWalletResponse response) {
-        razorpay.clear();
+      // 2. Open URL
+      final uri = Uri.parse(checkoutUrl.toString());
+      if (await canLaunchUrl(uri)) {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
         if (context.mounted) {
           scaffoldMessenger.showSnackBar(SnackBar(
             backgroundColor: TranquilTheme.deepWater,
-            content: Text('External wallet selected: ${response.walletName}',
-                style: const TextStyle(color: Colors.white, fontFamily: 'monospace', fontSize: 12)),
+            content: const Text('Complete the payment in your browser. The server will upgrade automatically when payment is finished.',
+                style: TextStyle(color: Colors.white, fontFamily: 'monospace', fontSize: 12)),
+            duration: const Duration(seconds: 5),
           ));
+          onPlanUpgraded?.call();
+          Navigator.of(context).pop();
         }
-      });
-
-      // 4. Open Razorpay Checkout
-      var options = {
-        'key': 'rzp_test_T69ehXcllvB6zI', // Hardcoded as agreed
-        'amount': (double.parse(order['amount'].toString()) * 100).toInt(), // paise
-        'name': 'Erex',
-        'description': 'Server Upgrade: ${plan.name}',
-        'order_id': orderId,
-        'prefill': {
-          'contact': '',
-          'email': '',
-        },
-        'theme': {
-          'color': '#00E5FF' // TranquilTheme.glowCyan hex
-        }
-      };
-
-      razorpay.open(options);
+      } else {
+        throw Exception('Could not launch $checkoutUrl');
+      }
 
     } catch (e) {
       if (context.mounted) {
